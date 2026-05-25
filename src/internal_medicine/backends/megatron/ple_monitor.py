@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 class PLEHealthMonitor(Probe):
+    METRIC_PREFIX = "ple_health"
+
     def __init__(
         self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False, gate_sparsity_threshold=0.01
     ):
@@ -86,10 +88,20 @@ class PLEHealthMonitor(Probe):
             return []
         result = []
         for local_idx, layer in enumerate(layers):
-            global_idx = self.pp_rank * len(layers) + local_idx
+            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
             if hasattr(layer, "ple") and not isinstance(layer.ple, IdentityOp):
                 result.append((global_idx, layer.ple))
         return result
+
+    def _resolve_layer_idx(self, layer: nn.Module, local_idx: int, num_local_layers: int) -> int:
+        for attr in ("layer_idx", "layer_index", "idx"):
+            value = getattr(layer, attr, None)
+            if isinstance(value, int):
+                return value
+        layer_number = getattr(layer, "layer_number", None)
+        if isinstance(layer_number, int):
+            return layer_number - 1 if layer_number > 0 else layer_number
+        return self.pp_rank * num_local_layers + local_idx
 
     def _make_token_ple_hook(self):
         num_layers = self._num_layers
@@ -172,14 +184,7 @@ class PLEHealthMonitor(Probe):
                         gate_stats = compute_gate_stats(gate_out, act_fn, threshold)
                         metrics["gate_activation_mean"] = gate_stats["gate_activation_mean"].item()
                         metrics["gate_sparsity"] = gate_stats["gate_sparsity"].item()
-                    log_dict = {}
-                    for name, val in metrics.items():
-                        if self.log_per_layer:
-                            log_dict[f"ple_health/layer_{layer_idx}/{name}"] = val
-                        if self.log_global:
-                            log_dict[f"ple_health/global_{name}"] = val
-                    if log_dict:
-                        training_logs.update(**log_dict)
+                    self._record_metrics(layer_idx, metrics)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[PLEMonitor] Layer {layer_idx} hook error: {e}")

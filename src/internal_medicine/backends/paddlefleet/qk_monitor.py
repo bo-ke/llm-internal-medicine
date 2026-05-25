@@ -11,7 +11,6 @@ import paddle
 import paddle.nn as nn
 
 from ...core.base_monitor import Probe
-from ...core.training_logs import training_logs
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +126,10 @@ def compute_qk_stats_paddle(q: paddle.Tensor, k: paddle.Tensor, causal: bool = T
 
 
 class PaddleQKStatsMonitor(Probe):
+    METRIC_PREFIX = "qk_stats"
+    MAX_AGGREGATED = {"max", "entropy_max"}
+    MIN_AGGREGATED = {"entropy_min"}
+
     def __init__(self, causal=True, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
@@ -173,11 +176,21 @@ class PaddleQKStatsMonitor(Probe):
         if layers is None:
             return []
         for local_idx, layer in enumerate(layers):
-            global_idx = self.pp_rank * len(layers) + local_idx
+            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
             attn = getattr(layer, "self_attn", None) or getattr(layer, "self_attention", None)
             if attn is not None:
                 attention_layers.append((global_idx, attn))
         return attention_layers
+
+    def _resolve_layer_idx(self, layer: nn.Layer, local_idx: int, num_local_layers: int) -> int:
+        for attr in ("layer_idx", "layer_index", "idx"):
+            value = getattr(layer, attr, None)
+            if isinstance(value, int):
+                return value
+        layer_number = getattr(layer, "layer_number", None)
+        if isinstance(layer_number, int):
+            return layer_number - 1 if layer_number > 0 else layer_number
+        return self.pp_rank * num_local_layers + local_idx
 
     def _get_decoder_layers(self, model):
         if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
@@ -226,14 +239,7 @@ class PaddleQKStatsMonitor(Probe):
                     "entropy_std": float(all_heads.std()),
                 }
 
-                log_dict = {}
-                if self.log_per_layer:
-                    for name, val in metrics.items():
-                        log_dict[f"qk_stats/layer_{layer_idx}/{name}"] = val
-                if self.log_global:
-                    for name, val in metrics.items():
-                        log_dict[f"qk_stats/global_{name}"] = val
-                training_logs.update(**log_dict)
+                self._record_metrics(layer_idx, metrics)
             except Exception as e:
                 logger.error(f"[PaddleQKMonitor] Error layer {layer_idx}: {e}")
 

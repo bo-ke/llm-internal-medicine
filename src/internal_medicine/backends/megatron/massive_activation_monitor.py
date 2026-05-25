@@ -24,7 +24,7 @@ Metrics produced:
     massive_act/layer_{i}/channel_max          — peak channel magnitude
     massive_act/layer_{i}/channel_max_ratio    — outlier severity (max/median)
     massive_act/layer_{i}/massive_act_channel_count — number of massive activation channels
-    massive_act/layer_{i}/top3_channel_norm    — L2 norm of top-3 channels
+    massive_act/layer_{i}/topk_channel_norm    — L2 norm of top-K channels
     massive_act/layer_{i}/post_norm_sparsity   — near-zero fraction after norm
     massive_act/layer_{i}/post_norm_cosine     — token similarity after norm
     massive_act/global_*                       — layer-aggregated versions
@@ -37,11 +37,10 @@ import torch.nn as nn
 
 from ...core.base_monitor import Probe
 from .massive_activation_metrics import (
-    compute_channel_max,
-    compute_massive_activation_channel_count,
+    compute_per_channel_max,
     compute_post_norm_cosine_stability,
     compute_post_norm_sparsity,
-    compute_topk_channel_norm,
+    summarize_per_channel_max,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,7 +59,7 @@ class MassiveActivationMonitor(Probe):
     """
 
     METRIC_PREFIX = "massive_act"
-    MAX_AGGREGATED = {"channel_max", "channel_max_ratio", "top3_channel_norm"}
+    MAX_AGGREGATED = {"channel_max", "channel_max_ratio", "topk_channel_norm"}
 
     def __init__(
         self,
@@ -95,14 +94,20 @@ class MassiveActivationMonitor(Probe):
         self.sparsity_epsilon = sparsity_epsilon
         self.cosine_sample_pairs = cosine_sample_pairs
         self.sample_layers = set(sample_layers) if sample_layers else None
+        self.tp_size = 1
+        self.tp_group = None
+        self._warned_per_channel_aggregate = False
+        self._post_norm_failed_layers: set[int] = set()
 
-    def register_hooks(self, model: nn.Module):
+    def register_hooks(self, model: nn.Module, layer_offset: int = 0):
         """Register forward hooks on Transformer layer normalization points."""
         try:
             from megatron.core import parallel_state
 
             if parallel_state.model_parallel_is_initialized():
                 self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+                self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                self.tp_group = parallel_state.get_tensor_model_parallel_group()
         except ImportError:
             pass
 
@@ -113,7 +118,7 @@ class MassiveActivationMonitor(Probe):
 
         registered = 0
         for local_idx, layer in layers:
-            global_idx = self.pp_rank * len(layers) + local_idx
+            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers), layer_offset)
 
             if self.sample_layers and global_idx not in self.sample_layers:
                 continue
@@ -146,6 +151,17 @@ class MassiveActivationMonitor(Probe):
 
         return list(enumerate(layers))
 
+    def _resolve_layer_idx(self, layer: nn.Module, local_idx: int, num_local_layers: int, layer_offset: int = 0) -> int:
+        """Resolve a stable global layer id when model layers expose one."""
+        for attr in ("layer_idx", "layer_index", "idx"):
+            value = getattr(layer, attr, None)
+            if isinstance(value, int):
+                return value
+        layer_number = getattr(layer, "layer_number", None)
+        if isinstance(layer_number, int):
+            return layer_number - 1 if layer_number > 0 else layer_number
+        return self.pp_rank * num_local_layers + layer_offset + local_idx
+
     def _make_residual_hook(self, layer_idx: int):
         """Create a forward pre-hook that captures the residual stream."""
 
@@ -173,19 +189,19 @@ class MassiveActivationMonitor(Probe):
 
     def _compute_and_log(self, layer_idx: int, hidden_states: torch.Tensor, module: nn.Module):
         """Compute all massive activation metrics and log them."""
-        metrics = {}
-
-        channel_stats = compute_channel_max(hidden_states)
-        metrics["channel_max"] = channel_stats["channel_max"].item()
-        metrics["channel_max_ratio"] = channel_stats["channel_max_ratio"].item()
-
-        spike_count = compute_massive_activation_channel_count(
-            hidden_states, threshold_multiplier=self.spike_threshold_multiplier
+        per_channel_max = compute_per_channel_max(hidden_states)
+        per_channel_max = self._aggregate_per_channel_max(per_channel_max)
+        tensor_metrics = summarize_per_channel_max(
+            per_channel_max,
+            threshold_multiplier=self.spike_threshold_multiplier,
+            k=self.topk_channels,
         )
-        metrics["massive_act_channel_count"] = spike_count.item()
-
-        topk_norm = compute_topk_channel_norm(hidden_states, k=self.topk_channels)
-        metrics["top3_channel_norm"] = topk_norm.item()
+        metrics = {
+            "channel_max": tensor_metrics["channel_max"].item(),
+            "channel_max_ratio": tensor_metrics["channel_max_ratio"].item(),
+            "massive_act_channel_count": tensor_metrics["massive_act_channel_count"].item(),
+            "topk_channel_norm": tensor_metrics["topk_channel_norm"].item(),
+        }
 
         norm_layer = getattr(module, "input_layernorm", None)
         if norm_layer is not None:
@@ -196,10 +212,27 @@ class MassiveActivationMonitor(Probe):
 
                 cosine = compute_post_norm_cosine_stability(normalized, num_sample_pairs=self.cosine_sample_pairs)
                 metrics["post_norm_cosine"] = cosine.item()
-            except Exception:
-                pass
+            except Exception as e:
+                if self.verbose and layer_idx not in self._post_norm_failed_layers:
+                    logger.warning(f"[MassiveActMonitor] Post-norm metrics disabled at layer {layer_idx}: {e}")
+                    self._post_norm_failed_layers.add(layer_idx)
 
         self._record_metrics(layer_idx, metrics)
+
+    def _aggregate_per_channel_max(self, per_channel_max: torch.Tensor) -> torch.Tensor:
+        """Aggregate token-sharded per-channel maxima across the TP group when available."""
+        if self.tp_size <= 1 or self.tp_group is None:
+            return per_channel_max
+        try:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.all_reduce(per_channel_max, op=dist.ReduceOp.MAX, group=self.tp_group)
+        except Exception as e:
+            if self.verbose and not self._warned_per_channel_aggregate:
+                logger.warning(f"[MassiveActMonitor] TP per-channel aggregation failed; using local values: {e}")
+                self._warned_per_channel_aggregate = True
+        return per_channel_max
 
 
 def setup_massive_activation_monitor(
@@ -229,8 +262,11 @@ def setup_massive_activation_monitor(
     )
 
     models = [model] if not isinstance(model, list) else model
+    layer_offset = 0
     for m in models:
-        monitor.register_hooks(m)
+        layers = monitor._find_transformer_layers(m)
+        monitor.register_hooks(m, layer_offset=layer_offset)
+        layer_offset += len(layers)
     logger.info(f"[MassiveActMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")
 
     if monitor_dict is not None:

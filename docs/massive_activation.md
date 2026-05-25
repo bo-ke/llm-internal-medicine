@@ -87,7 +87,7 @@ massive_act_channel_count = |{c : max_pos(|H_i[:, c]|) > median × threshold_mul
 
 **数学公式：**
 ```
-top3_channel_norm = ||topk(per_channel_max, k=3)||₂
+topk_channel_norm = ||topk(per_channel_max, k=3)||₂
 ```
 
 前 3 个最大 channel 的 L2 范数。直接对应论文 Figure 1 的 "top-3 channel magnitudes"。
@@ -171,7 +171,7 @@ RMSNorm(h^(a)) ≈ RMSNorm(h^(b))
 | `channel_max` 暴涨 + `qk_stats/sink` 上升 | 经典 spike→sink 路径激活 |
 | `post_norm_sparsity` 高 + `qk_stats/entropy_min` 低 | 存在 dormant sink heads |
 | `channel_max` 高 + `moe_health/router_entropy` 低 | 模型在用 spike 走捷径 |
-| `top3_channel_norm` 平稳 + `qk_stats/sink_head_ratio` 上升 | Sink 在没有更多 spike 的情况下增长（替代策略） |
+| `topk_channel_norm` 平稳 + `qk_stats/sink_head_ratio` 上升 | Sink 在没有更多 spike 的情况下增长（替代策略） |
 
 ---
 

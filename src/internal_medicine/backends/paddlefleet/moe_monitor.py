@@ -51,7 +51,7 @@ def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=
     """
     num_tokens, num_experts = gates_no_bias.shape
 
-    if n_group > 1 and topk_group > 1:
+    if n_group > 1 and topk_group >= 1:
         group_size = num_experts // n_group
         gates_reshaped = gates_no_bias.reshape([num_tokens, n_group, group_size])
         group_max = gates_reshaped.max(axis=-1)
@@ -90,12 +90,15 @@ def _compute_expert_norms_paddle(weight_list):
 
 class PaddleMoEMonitor(Probe):
     METRIC_PREFIX = "moe_health"
-    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max"}
+    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max", "expert_bias_max"}
+    MIN_AGGREGATED = {"score_sum_min", "expert_norm_min", "expert_bias_min"}
 
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
+        self._patched_gates = []
+        self._pending_router_global_layers: set[int] = set()
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -122,20 +125,31 @@ class PaddleMoEMonitor(Probe):
 
         logger.info(f"[PaddleMoEMonitor] Registered {len(self.hooks)} hooks on {len(moe_layers)} layers.")
 
-    @staticmethod
-    def _patch_gate_cache(gate):
+    def _patch_gate_cache(self, gate):
         """Monkey-patch gate.gate_score_func to cache pre-bias gates."""
+        if not hasattr(gate, "gate_score_func"):
+            if self.verbose:
+                logger.warning("[PaddleMoEMonitor] Gate has no gate_score_func; router metrics may be unavailable")
+            return
         if hasattr(gate, "_im_patched"):
+            if self.verbose:
+                logger.warning("[PaddleMoEMonitor] Gate is already patched; skipping duplicate patch")
             return
         original_fn = gate.gate_score_func
+        monitor = self
 
         def cached_gate_score_func(logits):
             result = original_fn(logits)
-            gate._cached_gates = result.detach()
+            if monitor._should_monitor():
+                gate._cached_gates = result.detach()
+            else:
+                gate._cached_gates = None
             return result
 
+        gate._im_original_gate_score_func = original_fn
         gate.gate_score_func = cached_gate_score_func
         gate._im_patched = True
+        self._patched_gates.append(gate)
 
     def _find_moe_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer]]:
         moe_layers = []
@@ -147,7 +161,7 @@ class PaddleMoEMonitor(Probe):
             return moe_layers
 
         for local_idx, layer in enumerate(layers):
-            global_idx = self.pp_rank * len(layers) + local_idx
+            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
             moe_module = None
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
                 moe_module = layer.mlp
@@ -190,11 +204,25 @@ class PaddleMoEMonitor(Probe):
                 transformer_layers.append(sublayer)
         return transformer_layers if transformer_layers else None
 
+    def _resolve_layer_idx(self, layer: nn.Layer, local_idx: int, num_local_layers: int) -> int:
+        for attr in ("layer_idx", "layer_index", "idx"):
+            value = getattr(layer, attr, None)
+            if isinstance(value, int):
+                return value
+        layer_number = getattr(layer, "layer_number", None)
+        if isinstance(layer_number, int):
+            return layer_number - 1 if layer_number > 0 else layer_number
+        return self.pp_rank * num_local_layers + local_idx
+
     def _make_gate_hook(self, layer_idx: int, moe_layer: nn.Layer):
         def hook_fn(layer, inputs, outputs):
             if not layer.training:
+                if hasattr(layer, "_cached_gates"):
+                    layer._cached_gates = None
                 return
             if not self._should_monitor():
+                if hasattr(layer, "_cached_gates"):
+                    layer._cached_gates = None
                 return
             try:
                 with paddle.no_grad():
@@ -202,6 +230,9 @@ class PaddleMoEMonitor(Probe):
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[PaddleMoEMonitor] Gate hook error layer {layer_idx}: {e}")
+            finally:
+                if hasattr(layer, "_cached_gates"):
+                    layer._cached_gates = None
 
         return hook_fn
 
@@ -260,8 +291,9 @@ class PaddleMoEMonitor(Probe):
         # Per-layer log + global accumulate (no count increment — expert hook does that)
         if self.log_per_layer and metrics:
             training_logs.update(**{f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v for k, v in metrics.items()})
-        if self.log_global:
+        if self.log_global and metrics:
             self._accumulate_global(metrics)
+            self._pending_router_global_layers.add(layer_idx)
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
         metrics = {}
@@ -303,8 +335,30 @@ class PaddleMoEMonitor(Probe):
                 if routed_norm_mean is not None and routed_norm_mean > 1e-8:
                     metrics["shared_routed_ratio"] = shared_norm / routed_norm_mean
 
+        has_pending_router = layer_idx in self._pending_router_global_layers
+
         # _record_metrics handles per-layer log + global accumulate + count++
-        self._record_metrics(layer_idx, metrics)
+        if metrics:
+            self._record_metrics(layer_idx, metrics)
+        elif self.log_global and has_pending_router:
+            self._global_count += 1
+        self._pending_router_global_layers.discard(layer_idx)
+
+    def remove_hooks(self):
+        super().remove_hooks()
+        for gate in self._patched_gates:
+            original_fn = getattr(gate, "_im_original_gate_score_func", None)
+            if original_fn is not None:
+                gate.gate_score_func = original_fn
+            for attr in ("_im_original_gate_score_func", "_im_patched", "_cached_gates"):
+                if hasattr(gate, attr):
+                    delattr(gate, attr)
+        self._patched_gates = []
+        self._pending_router_global_layers.clear()
+
+    def step(self):
+        super().step()
+        self._pending_router_global_layers.clear()
 
 
 def setup_moe_monitor(

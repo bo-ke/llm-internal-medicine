@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = ("SmoothedValue", "TrainingLogs", "training_logs")
 
+MAX_AGGREGATED_SUFFIXES = ("topk_channel_norm",)
+
 
 class SmoothedValue:
     """Track a series of scalar values and provide smoothed access."""
@@ -21,12 +23,14 @@ class SmoothedValue:
         self.total = 0.0
         self.count = 0
         self.mode = mode
+        self.latest_value = 0.0
         if self.mode == "max":
             self.max_value = float("-inf")
         if self.mode == "min":
             self.min_value = float("inf")
 
     def update(self, value: float):
+        self.latest_value = value
         self.count += 1
         self.total += value
         if self.mode == "max":
@@ -46,9 +50,14 @@ class SmoothedValue:
             return self.min_value
         return self.global_avg
 
+    @property
+    def latest(self):
+        return self.latest_value
+
     def reset(self):
         self.total = 0.0
         self.count = 0
+        self.latest_value = 0.0
         if self.mode == "max":
             self.max_value = float("-inf")
         if self.mode == "min":
@@ -82,26 +91,34 @@ class TrainingLogs:
     def __setitem__(self, k, v):
         val = float(v) if isinstance(v, int | float) else float(v.item() if hasattr(v, "item") else v)
         if k not in self.meters:
-            if "/max" in k or k.endswith("_max"):
+            if self._is_max_metric(k):
                 mode = "max"
-            elif "/min" in k or k.endswith("_min"):
+            elif self._is_min_metric(k):
                 mode = "min"
             else:
                 mode = "mean"
             self.meters[k] = SmoothedValue(mode=mode)
         self.meters[k].update(val)
 
+    @staticmethod
+    def _is_max_metric(key: str) -> bool:
+        return "/max" in key or key.endswith("_max") or key.endswith(MAX_AGGREGATED_SUFFIXES)
+
+    @staticmethod
+    def _is_min_metric(key: str) -> bool:
+        return "/min" in key or key.endswith("_min")
+
     def __getitem__(self, v):
         return self.meters[v]
 
-    def dict(self):
-        return {k: v.log for k, v in self.meters.items()}
+    def dict(self, smoothed: bool = False):
+        return {k: (v.log if smoothed else v.latest) for k, v in self.meters.items()}
 
-    def get_latest(self, prefix=None):
+    def get_latest(self, prefix=None, smoothed: bool = False):
         result = {}
         for k, v in self.meters.items():
             if prefix is None or k.startswith(prefix):
-                result[k] = v.log
+                result[k] = v.log if smoothed else v.latest
         return result
 
     def print_metrics(self, metrics=None, prefix=None, format_fn=None):
@@ -150,9 +167,9 @@ class TrainingLogs:
             values = [v[k] for v in info_list if k in v]
             if not values:
                 continue
-            if "_max" in k or k.endswith("/max"):
+            if self._is_max_metric(k):
                 aggregated[k] = max(values)
-            elif "_min" in k or k.endswith("/min"):
+            elif self._is_min_metric(k):
                 aggregated[k] = min(values)
             else:
                 aggregated[k] = sum(values) / len(values)

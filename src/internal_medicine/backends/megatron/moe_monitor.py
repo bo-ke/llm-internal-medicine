@@ -27,12 +27,15 @@ logger = logging.getLogger(__name__)
 class MoESpecialistMonitor(Probe):
     METRIC_PREFIX = "moe_health"
     MAX_AGGREGATED = {"score_sum_max", "expert_norm_max"}
+    MIN_AGGREGATED = {"score_sum_min", "expert_norm_min"}
 
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self.moe_layers: list[weakref.ref] = []
+        self._patched_routers: list[weakref.ref] = []
+        self._pending_router_global_layers: set[int] = set()
 
     def register_hooks(self, model: nn.Module):
         try:
@@ -61,25 +64,37 @@ class MoESpecialistMonitor(Probe):
 
         logger.info(f"[MoEMonitor] Registered {len(self.hooks)} hooks on {len(moe_layers)} layers.")
 
-    @staticmethod
-    def _patch_router_cache(router):
+    def _patch_router_cache(self, router):
         """Monkey-patch router._apply_aux_loss to intercept scores_for_aux_loss.
 
         Inside routing(), compute_routing_scores_for_aux_loss is already called
         and the result is passed to _apply_aux_loss. We intercept there to cache
         the data with zero additional compute (just detach).
         """
+        if not hasattr(router, "_apply_aux_loss"):
+            if self.verbose:
+                logger.warning("[MoEMonitor] Router has no _apply_aux_loss; router metrics may be unavailable")
+            return
         if getattr(router, "_im_patched", False):
+            if self.verbose:
+                logger.warning("[MoEMonitor] Router is already patched; skipping duplicate patch")
             return
         original_apply = router._apply_aux_loss
+        monitor = self
 
         def patched_apply(probs, scores_for_aux_loss, routing_map, *args, **kwargs):
-            router._cached_scores_for_aux_loss = scores_for_aux_loss.detach()
-            router._cached_routing_map_for_aux_loss = routing_map.detach()
+            if monitor._should_monitor():
+                router._cached_scores_for_aux_loss = scores_for_aux_loss.detach()
+                router._cached_routing_map_for_aux_loss = routing_map.detach()
+            else:
+                router._cached_scores_for_aux_loss = None
+                router._cached_routing_map_for_aux_loss = None
             return original_apply(probs, scores_for_aux_loss, routing_map, *args, **kwargs)
 
+        router._im_original_apply_aux_loss = original_apply
         router._apply_aux_loss = patched_apply
         router._im_patched = True
+        self._patched_routers.append(weakref.ref(router))
 
     def _find_moe_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
         moe_layers = []
@@ -104,7 +119,7 @@ class MoESpecialistMonitor(Probe):
                     moe_layers.append((len(moe_layers), module))
             return moe_layers
         for local_idx, layer in enumerate(layers):
-            global_idx = self.pp_rank * len(layers) + local_idx
+            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
             moe_module = None
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
                 moe_module = layer.mlp
@@ -116,11 +131,27 @@ class MoESpecialistMonitor(Probe):
                 moe_layers.append((global_idx, moe_module))
         return moe_layers
 
+    def _resolve_layer_idx(self, layer: nn.Module, local_idx: int, num_local_layers: int) -> int:
+        for attr in ("layer_idx", "layer_index", "idx"):
+            value = getattr(layer, attr, None)
+            if isinstance(value, int):
+                return value
+        layer_number = getattr(layer, "layer_number", None)
+        if isinstance(layer_number, int):
+            return layer_number - 1 if layer_number > 0 else layer_number
+        return self.pp_rank * num_local_layers + local_idx
+
     def _make_router_hook(self, layer_idx: int, moe_layer: nn.Module):
         def hook_fn(module, _inputs, outputs):
             if not torch.is_grad_enabled():
+                for attr in ("_cached_scores_for_aux_loss", "_cached_routing_map_for_aux_loss"):
+                    if hasattr(module, attr):
+                        setattr(module, attr, None)
                 return
             if not self._should_monitor():
+                for attr in ("_cached_scores_for_aux_loss", "_cached_routing_map_for_aux_loss"):
+                    if hasattr(module, attr):
+                        setattr(module, attr, None)
                 return
             try:
                 with torch.no_grad():
@@ -128,6 +159,10 @@ class MoESpecialistMonitor(Probe):
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MoEMonitor] Router hook error layer {layer_idx}: {e}")
+            finally:
+                for attr in ("_cached_scores_for_aux_loss", "_cached_routing_map_for_aux_loss"):
+                    if hasattr(module, attr):
+                        setattr(module, attr, None)
 
         return hook_fn
 
@@ -172,8 +207,9 @@ class MoESpecialistMonitor(Probe):
         # Per-layer log + global accumulate (no count increment — expert hook does that)
         if self.log_per_layer and metrics:
             training_logs.update(**{f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v for k, v in metrics.items()})
-        if self.log_global:
+        if self.log_global and metrics:
             self._accumulate_global(metrics)
+            self._pending_router_global_layers.add(layer_idx)
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
         metrics = {}
@@ -221,12 +257,39 @@ class MoESpecialistMonitor(Probe):
                     ratio = compute_shared_routed_ratio(shared_norm, routed_norm_mean.clone().detach())
                     metrics["shared_routed_ratio"] = ratio.item()
 
+        has_pending_router = layer_idx in self._pending_router_global_layers
+
         # _record_metrics handles per-layer log + global accumulate + count++
-        self._record_metrics(layer_idx, metrics)
+        if metrics:
+            self._record_metrics(layer_idx, metrics)
+        elif self.log_global and has_pending_router:
+            self._global_count += 1
+        self._pending_router_global_layers.discard(layer_idx)
 
     def remove_hooks(self):
         super().remove_hooks()
+        for router_ref in self._patched_routers:
+            router = router_ref()
+            if router is None:
+                continue
+            original_apply = getattr(router, "_im_original_apply_aux_loss", None)
+            if original_apply is not None:
+                router._apply_aux_loss = original_apply
+            for attr in (
+                "_im_original_apply_aux_loss",
+                "_im_patched",
+                "_cached_scores_for_aux_loss",
+                "_cached_routing_map_for_aux_loss",
+            ):
+                if hasattr(router, attr):
+                    delattr(router, attr)
         self.moe_layers = []
+        self._patched_routers = []
+        self._pending_router_global_layers.clear()
+
+    def step(self):
+        super().step()
+        self._pending_router_global_layers.clear()
 
     def get_health_summary(self) -> dict[str, Any]:
         metrics = training_logs.get_latest(prefix="moe_health")

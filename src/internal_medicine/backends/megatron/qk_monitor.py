@@ -22,6 +22,7 @@ _MAX_SEQ_LEN_FOR_QK = 8192
 class QKStatsMonitor(Probe):
     METRIC_PREFIX = "qk_stats"
     MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
+    MIN_AGGREGATED = {"entropy_min"}
 
     def __init__(
         self,
@@ -85,7 +86,7 @@ class QKStatsMonitor(Probe):
         if layers is None:
             return []
         for local_idx, layer in enumerate(layers):
-            global_idx = self.pp_rank * len(layers) + local_idx
+            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
             attn = None
             if hasattr(layer, "self_attention"):
                 attn = layer.self_attention
@@ -94,6 +95,16 @@ class QKStatsMonitor(Probe):
             if attn:
                 attention_layers.append((global_idx, attn))
         return attention_layers
+
+    def _resolve_layer_idx(self, layer: nn.Module, local_idx: int, num_local_layers: int) -> int:
+        for attr in ("layer_idx", "layer_index", "idx"):
+            value = getattr(layer, attr, None)
+            if isinstance(value, int):
+                return value
+        layer_number = getattr(layer, "layer_number", None)
+        if isinstance(layer_number, int):
+            return layer_number - 1 if layer_number > 0 else layer_number
+        return self.pp_rank * num_local_layers + local_idx
 
     def _aggregate_tp_stats(self, stats: dict) -> dict:
         data = torch.tensor(
@@ -144,7 +155,7 @@ class QKStatsMonitor(Probe):
                 if query.dim() == 3:
                     query = query.unsqueeze(1)
                     key = key.unsqueeze(1)
-                seq_len = query.shape[0] if query.dim() == 4 and query.shape[1] == 1 else query.shape[-2]
+                seq_len = query.shape[0]
                 if seq_len > _MAX_SEQ_LEN_FOR_QK and not self.use_triton:
                     return
                 with torch.no_grad():

@@ -8,13 +8,14 @@ from .training_logs import training_logs
 class Probe(ABC):
     """Base class shared by all backend-specific monitors.
 
-    Subclasses set METRIC_PREFIX and MAX_AGGREGATED, then call
+    Subclasses set METRIC_PREFIX plus aggregation overrides, then call
     _record_metrics() from their hooks. Global aggregation and
     flushing are handled here automatically.
     """
 
     METRIC_PREFIX: str = ""
     MAX_AGGREGATED: set[str] = set()
+    MIN_AGGREGATED: set[str] = set()
 
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         self.log_per_layer = log_per_layer
@@ -67,6 +68,8 @@ class Probe(ABC):
         for name, val in metrics.items():
             if name in self.MAX_AGGREGATED:
                 self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
+            elif name in self.MIN_AGGREGATED:
+                self._global_accum[name] = min(self._global_accum.get(name, float("inf")), val)
             else:
                 self._global_accum[name] = self._global_accum.get(name, 0.0) + val
 
@@ -77,7 +80,7 @@ class Probe(ABC):
             return
         log_dict = {}
         for name, val in self._global_accum.items():
-            if name in self.MAX_AGGREGATED:
+            if name in self.MAX_AGGREGATED or name in self.MIN_AGGREGATED:
                 log_dict[f"{self.METRIC_PREFIX}/global_{name}"] = val
             else:
                 log_dict[f"{self.METRIC_PREFIX}/global_{name}"] = val / self._global_count

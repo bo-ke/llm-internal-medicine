@@ -16,6 +16,36 @@ Core metrics:
 import paddle
 
 
+def compute_per_channel_max(hidden_states: paddle.Tensor) -> paddle.Tensor:
+    """Per-channel maximum absolute activation for [..., H] hidden states."""
+    h = hidden_states.reshape([-1, hidden_states.shape[-1]]).astype("float32")
+    return h.abs().max(axis=0)
+
+
+def summarize_per_channel_max(
+    per_channel_max: paddle.Tensor,
+    threshold_multiplier: float = 100.0,
+    k: int = 3,
+) -> dict[str, float]:
+    """Derive scalar massive-activation metrics from per-channel maxima."""
+    channel_max = float(per_channel_max.max())
+    channel_median = float(paddle.median(per_channel_max))
+    channel_max_ratio = channel_max / max(channel_median, 1e-8)
+
+    threshold = channel_median * threshold_multiplier
+    massive_act_channel_count = float((per_channel_max > threshold).astype("float32").sum())
+
+    topk_vals, _ = paddle.topk(per_channel_max, min(k, per_channel_max.shape[0]))
+    topk_channel_norm = float(topk_vals.norm())
+
+    return {
+        "channel_max": channel_max,
+        "channel_max_ratio": channel_max_ratio,
+        "massive_act_channel_count": massive_act_channel_count,
+        "topk_channel_norm": topk_channel_norm,
+    }
+
+
 def compute_pre_norm_metrics(
     hidden_states: paddle.Tensor,
     threshold_multiplier: float = 100.0,
@@ -33,25 +63,11 @@ def compute_pre_norm_metrics(
     Returns:
         Dict with channel_max, channel_max_ratio, massive_act_channel_count, topk_channel_norm.
     """
-    h = hidden_states.reshape([-1, hidden_states.shape[-1]]).astype("float32")
-    per_channel_max = h.abs().max(axis=0)
-
-    channel_max = float(per_channel_max.max())
-    channel_median = float(paddle.median(per_channel_max))
-    channel_max_ratio = channel_max / max(channel_median, 1e-8)
-
-    threshold = channel_median * threshold_multiplier
-    massive_act_channel_count = float((per_channel_max > threshold).astype("float32").sum())
-
-    topk_vals, _ = paddle.topk(per_channel_max, min(k, per_channel_max.shape[0]))
-    topk_channel_norm = float(topk_vals.norm())
-
-    return {
-        "channel_max": channel_max,
-        "channel_max_ratio": channel_max_ratio,
-        "massive_act_channel_count": massive_act_channel_count,
-        "topk_channel_norm": topk_channel_norm,
-    }
+    return summarize_per_channel_max(
+        compute_per_channel_max(hidden_states),
+        threshold_multiplier=threshold_multiplier,
+        k=k,
+    )
 
 
 def compute_post_norm_sparsity(

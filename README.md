@@ -196,7 +196,7 @@ setup_internal_medicine()
 | 1 | `channel_max` | `massive_act/.../channel_max` | `max(abs(H_i))` | 每层+全局 | 通道峰值，追踪 spike 生命周期 |
 | 2 | `channel_max_ratio` | `massive_act/.../channel_max_ratio` | `max / median` | 每层+全局 | 异常值严重度 |
 | 3 | `massive_act_channel_count` | `massive_act/.../massive_act_channel_count` | `count(ch > 100*med)` | 每层+全局 | 异常通道数量 |
-| 4 | `top3_channel_norm` | `massive_act/.../top3_channel_norm` | `norm(topk(3))` | 每层+全局 | 对应论文 Figure 1 |
+| 4 | `topk_channel_norm` | `massive_act/.../topk_channel_norm` | `norm(topk(3))` | 每层+全局 | 对应论文 Figure 1 |
 | 5 | `post_norm_sparsity` | `massive_act/.../post_norm_sparsity` | `mean(abs(x) < eps)` | 每层+全局 | 归一化后稀疏度 |
 | 6 | `post_norm_cosine` | `massive_act/.../post_norm_cosine` | `cos_sim(tokens)` | 每层+全局 | 近常量向量检测 |
 
@@ -289,6 +289,6 @@ from internal_medicine import training_logs
 | **MassiveAct** | `channel_max` | `max(abs(H_i))` | max | 通道峰值激活 |
 | **MassiveAct** | `channel_max_ratio` | `max / median` | max | 异常值严重度 |
 | **MassiveAct** | `massive_act_channel_count` | `count(ch > 100*median)` | mean | 异常通道数 |
-| **MassiveAct** | `top3_channel_norm` | `norm(topk(3))` | mean | Top-3 通道范数 |
+| **MassiveAct** | `topk_channel_norm` | `norm(topk(3))` | max | Top-K 通道范数 |
 | **MassiveAct** | `post_norm_sparsity` | `mean(abs(x) < eps)` | mean | 归一化后稀疏度 |
 | **MassiveAct** | `post_norm_cosine` | `cos_sim(tokens)` | mean | 近常量向量检测 |

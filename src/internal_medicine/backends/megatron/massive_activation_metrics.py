@@ -26,6 +26,33 @@ Reference:
 import torch
 
 
+def compute_per_channel_max(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Per-channel maximum absolute activation for [..., H] hidden states."""
+    h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
+    return h.abs().max(dim=0).values
+
+
+def summarize_per_channel_max(
+    per_channel_max: torch.Tensor,
+    threshold_multiplier: float = 100.0,
+    k: int = 3,
+) -> dict[str, torch.Tensor]:
+    """Derive scalar massive-activation metrics from per-channel maxima."""
+    channel_max = per_channel_max.max()
+    channel_median = per_channel_max.median()
+    channel_max_ratio = channel_max / channel_median.clamp(min=1e-8)
+    threshold = channel_median * threshold_multiplier
+    topk_vals = per_channel_max.topk(min(k, per_channel_max.shape[0])).values
+
+    return {
+        "channel_max": channel_max,
+        "channel_median": channel_median,
+        "channel_max_ratio": channel_max_ratio,
+        "massive_act_channel_count": (per_channel_max > threshold).sum().float(),
+        "topk_channel_norm": topk_vals.norm(),
+    }
+
+
 def compute_channel_max(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
     """Compute per-channel maximum absolute activation statistics.
 
@@ -42,23 +69,7 @@ def compute_channel_max(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
             channel_median: median of per-channel max absolute values (scalar)
             channel_max_ratio: channel_max / channel_median (outlier severity)
     """
-    # Flatten to [tokens, hidden_dim]
-    h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
-
-    # Per-channel max absolute value: [hidden_dim]
-    per_channel_max = h.abs().max(dim=0).values
-
-    channel_max = per_channel_max.max()
-    channel_median = per_channel_max.median()
-
-    # Ratio: how extreme is the worst channel relative to typical channels
-    channel_max_ratio = channel_max / channel_median.clamp(min=1e-8)
-
-    return {
-        "channel_max": channel_max,
-        "channel_median": channel_median,
-        "channel_max_ratio": channel_max_ratio,
-    }
+    return summarize_per_channel_max(compute_per_channel_max(hidden_states))
 
 
 def compute_massive_activation_channel_count(
@@ -80,11 +91,10 @@ def compute_massive_activation_channel_count(
     Returns:
         Scalar tensor: number of channels exceeding the threshold.
     """
-    h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
-    per_channel_max = h.abs().max(dim=0).values
-    median_val = per_channel_max.median()
-    threshold = median_val * threshold_multiplier
-    return (per_channel_max > threshold).sum().float()
+    return summarize_per_channel_max(
+        compute_per_channel_max(hidden_states),
+        threshold_multiplier=threshold_multiplier,
+    )["massive_act_channel_count"]
 
 
 def compute_topk_channel_norm(
@@ -104,10 +114,7 @@ def compute_topk_channel_norm(
     Returns:
         Scalar tensor: L2 norm of the top-K per-channel-max values.
     """
-    h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
-    per_channel_max = h.abs().max(dim=0).values
-    topk_vals = per_channel_max.topk(min(k, per_channel_max.shape[0])).values
-    return topk_vals.norm()
+    return summarize_per_channel_max(compute_per_channel_max(hidden_states), k=k)["topk_channel_norm"]
 
 
 def compute_post_norm_sparsity(

@@ -8,7 +8,7 @@ each CP rank keeps its local Q shard (``seq_len_q = S/CP``) but sees the
 full-sequence K (``seq_len_k = S``) after an all_gather. Passing
 ``q_row_offset = cp_rank * seq_len_q`` restores correct causal masking.
 
-Two families of kernels live here:
+Three families of kernels live here:
 
 * ``qk_stats_kernel`` / ``qk_stats_partial_kernel`` — dense causal attention.
 * ``qk_stats_sparse_partial_kernel`` — two-segment sparse attention, used for
@@ -16,6 +16,11 @@ Two families of kernels live here:
   attends to a sliding window over the original KV plus a contiguous run of
   compressed KV entries, under a single softmax that also includes a learned
   per-head sink logit.
+* ``qk_stats_packed_kernel`` — packed (THD) variant of the partial kernel: when
+  multiple variable-length sequences are packed into one ``[H, T, D]`` tensor,
+  per-token ``seq_start``/``seq_end`` boundaries confine each query to its own
+  sequence (no cross-sequence leakage) and the sink column is each row's own
+  sequence start rather than global token 0.
 """
 
 import triton
@@ -721,6 +726,189 @@ def qk_stats_sparse_partial_kernel(
     block_valid_rows = tl.sum(valid_mask.to(tl.float32))
 
     out_offset = batch_idx * stride_p_batch + head_idx * stride_p_head + pid_m * stride_p_m
+
+    tl.store(partial_max_ptr + out_offset, block_max_logit)
+    tl.store(partial_sum_logit_ptr + out_offset, block_sum_logit)
+    tl.store(partial_sum_row_mean_ptr + out_offset, block_sum_row_mean)
+    tl.store(partial_count_ptr + out_offset, block_count)
+    tl.store(partial_sum_entropy_ptr + out_offset, block_sum_entropy)
+    tl.store(partial_sum_sink_ptr + out_offset, block_sum_sink)
+    tl.store(partial_valid_rows_ptr + out_offset, block_valid_rows)
+
+
+@triton.jit
+def qk_stats_packed_kernel(
+    # Pointers
+    Q_ptr,
+    K_ptr,
+    token_seq_start_ptr,  # [total_tokens] int32: start token index of each token's sequence
+    token_seq_end_ptr,  # [total_tokens] int32: end (exclusive) token index of each token's sequence
+    partial_max_ptr,
+    partial_sum_logit_ptr,
+    partial_sum_row_mean_ptr,
+    partial_count_ptr,
+    partial_sum_entropy_ptr,
+    partial_sum_sink_ptr,
+    partial_valid_rows_ptr,
+    # Shapes
+    num_heads,
+    total_tokens,
+    head_dim,
+    num_m_blocks,
+    # Strides for Q/K (THD layout [H, T, D]; batch is always 1 for packed)
+    stride_q_head,
+    stride_q_seq,
+    stride_q_dim,
+    stride_k_head,
+    stride_k_seq,
+    stride_k_dim,
+    # Strides for partial buffers (layout [H, num_m_blocks])
+    stride_p_head,
+    stride_p_m,
+    # Configs
+    scale: tl.constexpr,
+    apply_causal_mask: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Packed (THD) variant of ``qk_stats_partial_kernel``.
+
+    Grid: (num_heads, num_m_blocks). Input layout: [H, T, D] where T is the
+    total packed-token count across all sequences (batch dim is always 1).
+
+    Per-sequence semantics via ``token_seq_start``/``token_seq_end`` (built on
+    the host from ``cu_seqlens`` — see ``_cu_seqlens_to_token_arrays``):
+      * a query row m only attends to key columns n with
+        ``seq_start[m] <= n < seq_end[m]`` (no cross-sequence leakage), and
+      * the attention-sink column for row m is that row's own sequence start
+        ``seq_start[m]`` — NOT global token 0.
+    Padding tokens carry ``seq_start == seq_end == 0`` so ``same_seq`` masks
+    them out (empty valid range) and they contribute nothing.
+
+    NOTE: CP (``q_row_offset`` / asymmetric seq lens) and ``ROW_STRIDE``
+    subsampling are intentionally unsupported here — packed monitoring does not
+    yet compose with either. Add them only alongside a correctness test.
+    """
+    pid_head = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    head_idx = pid_head
+    q_base = Q_ptr + head_idx * stride_q_head
+    # GQA is expanded on the host (repeat_interleave), so K shares Q's head idx.
+    k_base = K_ptr + head_idx * stride_k_head
+
+    m_start = pid_m * BLOCK_M
+    m_offsets = m_start + tl.arange(0, BLOCK_M)
+    m_mask = m_offsets < total_tokens
+
+    # Per-row sequence boundaries (int32). Padding rows -> [0, 0) empty range.
+    seq_start = tl.load(token_seq_start_ptr + m_offsets, mask=m_mask, other=0)
+    seq_end = tl.load(token_seq_end_ptr + m_offsets, mask=m_mask, other=0)
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
+    d_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    h_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    s_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    row_max_logit_raw = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
+    row_sum_logit_raw = tl.zeros([BLOCK_M], dtype=tl.float32)
+    row_count_raw = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # Bound the key scan to the columns any row in this block can actually see:
+    # lower = smallest sequence start among valid rows (skip fully-masked
+    # earlier sequences); upper = causal cap (n <= max m) or max sequence end.
+    n_lo = tl.min(tl.where(m_mask, seq_start, total_tokens))
+    n_start_init = (n_lo // BLOCK_N) * BLOCK_N
+    if apply_causal_mask:
+        n_stop = tl.minimum(m_start + BLOCK_M, total_tokens)
+    else:
+        n_stop = tl.minimum(tl.max(tl.where(m_mask, seq_end, 0)), total_tokens)
+
+    for n_start in range(n_start_init, n_stop, BLOCK_N):
+        n_offsets = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offsets < total_tokens
+
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+        for k_start in range(0, head_dim, BLOCK_K):
+            k_offsets = k_start + tl.arange(0, BLOCK_K)
+            k_mask = k_offsets < head_dim
+
+            q_ptr = q_base + m_offsets[:, None] * stride_q_seq + k_offsets[None, :] * stride_q_dim
+            q = tl.load(q_ptr, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+
+            k_ptr = k_base + n_offsets[:, None] * stride_k_seq + k_offsets[None, :] * stride_k_dim
+            k = tl.load(k_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+
+            acc += tl.dot(q, tl.trans(k))
+
+        logits = acc * scale
+
+        # Same-sequence mask: n in [seq_start[m], seq_end[m]). Global offsets are
+        # used directly — same_seq already prevents any cross-sequence leakage.
+        same_seq = (n_offsets[None, :] >= seq_start[:, None]) & (n_offsets[None, :] < seq_end[:, None])
+        mask_val = n_mask[None, :] & m_mask[:, None] & same_seq
+        if apply_causal_mask:
+            causal = m_offsets[:, None] >= n_offsets[None, :]
+            mask_val = mask_val & causal
+
+        logits = tl.where(mask_val, logits, -1e10)
+
+        block_max = tl.max(logits, 1)
+        row_max_logit_raw = tl.maximum(row_max_logit_raw, block_max)
+
+        logits_zeroed = tl.where(mask_val, logits, 0.0)
+        row_sum_logit_raw += tl.sum(logits_zeroed, 1)
+        row_count_raw += tl.sum(mask_val.to(tl.float32), 1)
+
+        # Online softmax update
+        m_curr = block_max
+        m_new = tl.maximum(m_i, m_curr)
+
+        alpha_prev = tl.exp(m_i - m_new)
+        alpha_curr = tl.exp(logits - m_new[:, None])
+        alpha_curr = tl.where(mask_val, alpha_curr, 0.0)
+
+        d_curr = tl.sum(alpha_curr, 1)
+        d_new = d_i * alpha_prev + d_curr
+
+        h_term_prev = h_i * alpha_prev + (m_i - m_new) * d_i * alpha_prev
+        logits_diff = logits - m_new[:, None]
+        h_term_curr = tl.sum(tl.where(mask_val, logits_diff * alpha_curr, 0.0), 1)
+        h_new = h_term_prev + h_term_curr
+
+        # Sink = per-row sequence start column. Unlike the dense kernel this is
+        # not confined to n_start==0, since each row's sink lives at seq_start[m]
+        # which can fall in any key block.
+        is_sink_col = n_offsets[None, :] == seq_start[:, None]
+        sink_contrib = tl.sum(tl.where(mask_val & is_sink_col, alpha_curr, 0.0), 1)
+        s_new = s_i * alpha_prev + sink_contrib
+
+        m_i = m_new
+        d_i = d_new
+        h_i = h_new
+        s_i = s_new
+
+    # Finalize per-row stats for this M-block
+    safe_d = tl.where(d_i > 0, d_i, 1.0)
+    row_entropy = tl.log(safe_d) - (h_i / safe_d)
+    row_sink = s_i / safe_d
+
+    row_has_data = row_count_raw > 0
+    valid_mask = row_has_data & m_mask
+
+    block_max_logit = tl.max(tl.where(m_mask, row_max_logit_raw, -1e10))
+    block_sum_logit = tl.sum(tl.where(valid_mask, row_sum_logit_raw, 0.0))
+    safe_row_count = tl.where(row_count_raw > 0, row_count_raw, 1.0)
+    row_mean_logit = row_sum_logit_raw / safe_row_count
+    block_sum_row_mean = tl.sum(tl.where(valid_mask, row_mean_logit, 0.0))
+    block_count = tl.sum(tl.where(m_mask, row_count_raw, 0.0))
+    block_sum_entropy = tl.sum(tl.where(valid_mask, row_entropy, 0.0))
+    block_sum_sink = tl.sum(tl.where(valid_mask, row_sink, 0.0))
+    block_valid_rows = tl.sum(valid_mask.to(tl.float32))
+
+    out_offset = head_idx * stride_p_head + pid_m * stride_p_m
 
     tl.store(partial_max_ptr + out_offset, block_max_logit)
     tl.store(partial_sum_logit_ptr + out_offset, block_sum_logit)

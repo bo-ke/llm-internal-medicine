@@ -7,7 +7,7 @@ import logging
 
 import torch
 
-from ...core.triton_qk_kernel import qk_stats_kernel
+from ...core.triton_qk_kernel import qk_stats_kernel, qk_stats_packed_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -159,3 +159,244 @@ def compute_qk_stats(q: torch.Tensor, k: torch.Tensor, causal: bool = True, use_
         return compute_qk_stats_triton(q, k, causal)
 
     return compute_qk_stats_pytorch(q, k, causal)
+
+
+def _cu_seqlens_to_token_arrays(cu_seqlens: torch.Tensor, total_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map ``cu_seqlens`` to per-token sequence boundaries, entirely on-device.
+
+    Given ``cu_seqlens = [0, l0, l0+l1, ...]`` (the packed cumulative sequence
+    lengths), returns two int32 tensors of shape ``[total_tokens]``:
+      * ``seq_start[t]`` = start token index of the sequence containing token t
+      * ``seq_end[t]``   = end (exclusive) token index of that sequence
+
+    Padding tokens (``t >= cu_seqlens[-1]``) get an empty ``[0, 0)`` range so
+    the kernel's ``same_seq`` mask discards them.
+
+    Sync-free: built from ``torch.searchsorted`` + ``torch.where`` with NO
+    ``.item()`` / ``.cpu()`` / ``.tolist()``, so it is safe to call from a
+    forward hook without breaking compute/comm overlap.
+    """
+    device = cu_seqlens.device
+    cu = cu_seqlens.to(torch.int64)
+    num_seqs = cu.numel() - 1
+    token_ids = torch.arange(total_tokens, device=device, dtype=torch.int64)
+
+    # seq_idx: i such that cu[i] <= t < cu[i+1]
+    seq_idx = torch.searchsorted(cu, token_ids, right=True) - 1
+    seq_idx = seq_idx.clamp(0, max(num_seqs - 1, 0))
+
+    seq_start = cu[seq_idx]
+    seq_end = cu[seq_idx + 1]
+
+    # Padding tokens beyond the last real token -> empty range.
+    last = cu[-1]
+    is_pad = token_ids >= last
+    zero = torch.zeros((), device=device, dtype=torch.int64)
+    seq_start = torch.where(is_pad, zero, seq_start)
+    seq_end = torch.where(is_pad, zero, seq_end)
+
+    return seq_start.to(torch.int32).contiguous(), seq_end.to(torch.int32).contiguous()
+
+
+def compute_qk_stats_triton_packed(
+    q: torch.Tensor, k: torch.Tensor, cu_seqlens: torch.Tensor, causal: bool = True
+) -> dict:
+    """Packed (THD) QK statistics via the split-M Triton kernel.
+
+    Input: [H, T, D] (GQA already repeat_interleave-expanded, batch flattened).
+    Reduces the per-M-block partial buffers into per-head stats using row-first
+    mean semantics (mean over valid rows of each row's mean logit), matching
+    the dense ``qk_stats_partial_kernel`` reduction.
+    """
+    num_heads, total_tokens, head_dim = q.shape
+    scale = 1.0 / (head_dim**0.5)
+
+    seq_start, seq_end = _cu_seqlens_to_token_arrays(cu_seqlens, total_tokens)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 64
+    if head_dim > 64:
+        BLOCK_K = 128
+
+    num_m_blocks = (total_tokens + BLOCK_M - 1) // BLOCK_M
+
+    def _buf():
+        return torch.empty((num_heads, num_m_blocks), device=q.device, dtype=torch.float32)
+
+    p_max = _buf()
+    p_sum_logit = _buf()
+    p_sum_row_mean = _buf()
+    p_count = _buf()
+    p_sum_entropy = _buf()
+    p_sum_sink = _buf()
+    p_valid_rows = _buf()
+
+    grid = (num_heads, num_m_blocks)
+
+    qk_stats_packed_kernel[grid](
+        q,
+        k,
+        seq_start,
+        seq_end,
+        p_max,
+        p_sum_logit,
+        p_sum_row_mean,
+        p_count,
+        p_sum_entropy,
+        p_sum_sink,
+        p_valid_rows,
+        num_heads,
+        total_tokens,
+        head_dim,
+        num_m_blocks,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        p_max.stride(0),
+        p_max.stride(1),
+        scale=scale,
+        apply_causal_mask=causal,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    # Reduce partials over the M-block dim -> per-head [H].
+    valid_rows = p_valid_rows.sum(dim=1)
+    safe_rows = valid_rows.clamp(min=1)
+
+    max_per_head = p_max.max(dim=1).values
+    mean_per_head = p_sum_row_mean.sum(dim=1) / safe_rows
+    entropy_per_head = p_sum_entropy.sum(dim=1) / safe_rows
+    sink_per_head = p_sum_sink.sum(dim=1) / safe_rows
+
+    # Shape [1, H] to match the dense [B, H] convention consumed by the hook.
+    max_per_head = max_per_head.unsqueeze(0)
+    mean_per_head = mean_per_head.unsqueeze(0)
+    entropy_per_head = entropy_per_head.unsqueeze(0)
+    sink_per_head = sink_per_head.unsqueeze(0)
+
+    return {
+        "max_per_head": max_per_head,
+        "mean_per_head": mean_per_head,
+        "entropy_per_head": entropy_per_head,
+        "sink_per_head": sink_per_head,
+        "max_global": max_per_head.max(),
+        "mean_global": mean_per_head.mean(),
+        "entropy_global": entropy_per_head.mean(),
+        "sink_global": sink_per_head.mean(),
+    }
+
+
+def compute_qk_stats_pytorch_packed(
+    q: torch.Tensor, k: torch.Tensor, cu_seqlens: torch.Tensor, causal: bool = True
+) -> dict:
+    """Reference packed QK statistics. Input: [H, T, D].
+
+    Slices each packed sequence and accumulates row-first statistics so the
+    result matches ``compute_qk_stats_triton_packed`` exactly (mean is the
+    average over valid rows of each row's mean logit — NOT a count-weighted
+    position mean). This is the reference/fallback path; ``cu_seqlens.tolist()``
+    incurs a D2H sync and is acceptable here (not the Triton hot path).
+    """
+    num_heads, total_tokens, head_dim = q.shape
+    scale = 1.0 / (head_dim**0.5)
+    device = q.device
+
+    bounds = cu_seqlens.to(torch.int64).tolist()
+
+    sum_row_mean = torch.zeros(num_heads, device=device)
+    sum_entropy = torch.zeros(num_heads, device=device)
+    sum_sink = torch.zeros(num_heads, device=device)
+    valid_rows = torch.zeros(num_heads, device=device)
+    max_per_head = torch.full((num_heads,), -1e10, device=device)
+
+    for i in range(len(bounds) - 1):
+        s, e = bounds[i], bounds[i + 1]
+        length = e - s
+        if length <= 0:
+            continue
+
+        q_seq = q[:, s:e, :]  # [H, L, D]
+        k_seq = k[:, s:e, :]
+        logits = torch.matmul(q_seq, k_seq.transpose(-2, -1)) * scale  # [H, L, L]
+
+        if causal:
+            causal_mask = torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
+            logits = logits.masked_fill(causal_mask, float("-inf"))
+
+        valid_mask = logits > -1e9  # [H, L, L]
+        row_count = valid_mask.sum(dim=-1)  # [H, L]
+
+        # max over all valid positions in this sequence
+        seq_max = torch.where(valid_mask, logits, torch.full_like(logits, -1e10)).amax(dim=(-2, -1))
+        max_per_head = torch.maximum(max_per_head, seq_max)
+
+        # row-first mean
+        row_sum = torch.where(valid_mask, logits, torch.zeros_like(logits)).sum(dim=-1)  # [H, L]
+        row_mean = row_sum / row_count.clamp(min=1)  # [H, L]
+        sum_row_mean += row_mean.sum(dim=-1)
+
+        # entropy per row
+        probs = torch.softmax(logits, dim=-1)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        ent_map = -(probs * log_probs)
+        ent_map = torch.where(valid_mask, ent_map, torch.zeros_like(ent_map))
+        sum_entropy += ent_map.sum(dim=-1).sum(dim=-1)
+
+        # sink = prob of each row's own sequence-start (local column 0)
+        sum_sink += probs[..., 0].sum(dim=-1)
+
+        valid_rows += (row_count > 0).sum(dim=-1).to(valid_rows.dtype)
+
+    safe_rows = valid_rows.clamp(min=1)
+    mean_per_head = (sum_row_mean / safe_rows).unsqueeze(0)
+    entropy_per_head = (sum_entropy / safe_rows).unsqueeze(0)
+    sink_per_head = (sum_sink / safe_rows).unsqueeze(0)
+    max_per_head = max_per_head.unsqueeze(0)
+
+    return {
+        "max_per_head": max_per_head,
+        "mean_per_head": mean_per_head,
+        "entropy_per_head": entropy_per_head,
+        "sink_per_head": sink_per_head,
+        "max_global": max_per_head.max(),
+        "mean_global": mean_per_head.mean(),
+        "entropy_global": entropy_per_head.mean(),
+        "sink_global": sink_per_head.mean(),
+    }
+
+
+def compute_qk_stats_packed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    causal: bool = True,
+    use_triton: bool = True,
+) -> dict:
+    """Unified packed (THD) entry point. Input layout: [T, H, D].
+
+    Respects per-sequence boundaries from ``cu_seqlens`` so no attention
+    leaks across packed sequences and each sequence's sink is its own first
+    token. GQA is expanded on the host (matching ``compute_qk_stats``), then
+    the tensors are permuted to [H, T, D] before dispatch.
+    """
+    total_tokens, num_q_heads, head_dim = q.shape
+    _, num_k_heads, _ = k.shape
+
+    if num_q_heads != num_k_heads:
+        heads_per_group = num_q_heads // num_k_heads
+        k = k.repeat_interleave(heads_per_group, dim=1)
+
+    # [T, H, D] -> [H, T, D]
+    q = q.permute(1, 0, 2).contiguous()
+    k = k.permute(1, 0, 2).contiguous()
+
+    if use_triton:
+        return compute_qk_stats_triton_packed(q, k, cu_seqlens, causal)
+
+    return compute_qk_stats_pytorch_packed(q, k, cu_seqlens, causal)

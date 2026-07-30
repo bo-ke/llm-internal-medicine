@@ -18,7 +18,8 @@ except Exception as exc:  # pragma: no cover - depends on optional backend insta
 PaddleMassiveActivationMonitor = importlib.import_module(
     "internal_medicine.backends.paddlefleet.massive_activation_monitor"
 ).PaddleMassiveActivationMonitor
-PaddleMoEMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor").PaddleMoEMonitor
+moe_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
+PaddleMoEMonitor = moe_monitor_module.PaddleMoEMonitor
 PaddleQKStatsMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor").PaddleQKStatsMonitor
 paddlefleet_backend = importlib.import_module("internal_medicine.backends.paddlefleet")
 layer_discovery = importlib.import_module("internal_medicine.backends.paddlefleet.layer_discovery")
@@ -102,6 +103,12 @@ class PaddleFleetSetupTest(unittest.TestCase):
         self.assertEqual(len(created), 2)
         self.assertTrue(first["dummy"].removed)
         self.assertIs(second["dummy"], created[1])
+
+    def test_all_contains_only_supported_forward_monitors(self):
+        self.assertEqual(
+            set(paddlefleet_backend._MONITOR_MAP),
+            {"qk_stats", "moe_health", "massive_act", "mhc_health"},
+        )
 
 
 class PaddleLayerDiscoveryTest(unittest.TestCase):
@@ -197,6 +204,23 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         latest = training_logs.get_latest(prefix="moe_health")
         self.assertAlmostEqual(latest["moe_health/layer_0/router_entropy"], 2.0, places=4)
         self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 2.0, places=4)
+
+    def test_hard_load_distribution_metrics_distinguish_balance(self):
+        balanced = moe_monitor_module._distribution_metrics(paddle.to_tensor([1.0, 1.0, 1.0, 1.0]))
+        imbalanced = moe_monitor_module._distribution_metrics(paddle.to_tensor([4.0, 0.0, 0.0, 0.0]))
+
+        self.assertAlmostEqual(float(balanced["cv"]), 0.0, places=6)
+        self.assertAlmostEqual(float(balanced["entropy_norm"]), 1.0, places=6)
+        self.assertGreater(float(imbalanced["cv"]), float(balanced["cv"]))
+        self.assertLess(float(imbalanced["entropy_norm"]), float(balanced["entropy_norm"]))
+
+    def test_moe_gate_metrics_ignore_all_invalid_expert_ids(self):
+        probabilities = paddle.to_tensor([[[0.7, 0.2, 0.1], [0.1, 0.3, 0.6]]])
+        invalid_assignments = paddle.to_tensor([[[-1, 3], [4, -2]]], dtype="int64")
+        assignment, gate_mass = moe_monitor_module._assignment_mass(probabilities, invalid_assignments)
+
+        self.assertEqual(float(assignment.sum()), 0.0)
+        self.assertEqual(float(gate_mass.sum()), 0.0)
 
     def test_mtp_layer_marker_is_encoded_in_metric_key(self):
         monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
@@ -531,12 +555,38 @@ class PaddleQKKernelComputeTest(unittest.TestCase):
                 f"{key} mismatch: grouped={grouped[key].item()} expanded={expanded[key].item()}",
             )
 
-    def test_row_stride_is_near_unbiased_for_mean_class_metrics(self):
-        """Subsampling query rows must keep the row-averaged metrics close to
-        the full pass. entropy_global / mean_global / sink_global are all
-        uniform averages over query rows, so a uniform stride is an unbiased,
-        low-variance estimator. entropy has real magnitude -> tight relative
-        check; mean and sink sit near zero for N(0,1) inputs -> absolute check.
+    def test_sliding_window_matches_dense_reference(self):
+        q, k = self._gqa_inputs(S=64, Hq=4, Hkv=4, D=16, seed=7)
+        window = [8, 0]
+        actual = self.qk.compute_qk_stats_paddle(q, k, causal=True, sliding_window=window)
+
+        qh = q.transpose([0, 2, 1, 3])
+        kh = k.transpose([0, 2, 1, 3])
+        logits = paddle.matmul(qh, kh.transpose([0, 1, 3, 2])) / (q.shape[-1] ** 0.5)
+        query_pos = paddle.arange(q.shape[1]).reshape([-1, 1])
+        key_pos = paddle.arange(k.shape[1]).reshape([1, -1])
+        valid = (key_pos <= query_pos) & (key_pos >= query_pos - window[0])
+        logits = paddle.where(
+            valid.reshape([1, 1, q.shape[1], k.shape[1]]),
+            logits,
+            paddle.full_like(logits, float("-inf")),
+        )
+        probability = paddle.nn.functional.softmax(logits, axis=-1)
+        entropy = -paddle.where(
+            probability > 0,
+            probability * paddle.log(probability),
+            paddle.zeros_like(probability),
+        ).sum(axis=-1)
+
+        self.assertTrue(paddle.allclose(actual["max_global"], logits.max(), atol=5e-3, rtol=1e-4).item())
+        self.assertTrue(paddle.allclose(actual["entropy_global"], entropy.mean(), atol=1e-3, rtol=1e-4).item())
+        self.assertTrue(paddle.allclose(actual["sink_global"], probability[..., 0].mean(), atol=1e-4, rtol=1e-4).item())
+
+    def test_row_stride_approximates_mean_class_metrics(self):
+        """Subsampling query rows should keep row-averaged metrics close to
+        the full pass for representative random inputs. Entropy has meaningful
+        magnitude, so use a relative check; mean and sink sit near zero for
+        N(0,1) inputs, so use an absolute check.
         """
         q, k = self._gqa_inputs(S=512, seed=1)
         full = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
@@ -589,12 +639,8 @@ class PaddleQKKernelComputeTest(unittest.TestCase):
         q_a = q[:, :half, :, :]
         q_b = q[:, half:, :, :]
 
-        sub_a = self.qk.compute_qk_stats_paddle(
-            q_a, k, causal=True, row_stride=1, q_row_offset=0
-        )
-        sub_b = self.qk.compute_qk_stats_paddle(
-            q_b, k, causal=True, row_stride=1, q_row_offset=half
-        )
+        sub_a = self.qk.compute_qk_stats_paddle(q_a, k, causal=True, row_stride=1, q_row_offset=0)
+        sub_b = self.qk.compute_qk_stats_paddle(q_b, k, causal=True, row_stride=1, q_row_offset=half)
 
         # Per-head means: average the two halves (rows split evenly).
         for key in ("entropy_per_head", "sink_per_head", "mean_per_head"):
@@ -631,9 +677,7 @@ class PaddleQKKernelComputeTest(unittest.TestCase):
         """Passing q_row_offset=0 must be a no-op vs. the default path."""
         q, k = self._gqa_inputs(seed=4)
         default_pass = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
-        with_zero_offset = self.qk.compute_qk_stats_paddle(
-            q, k, causal=True, row_stride=1, q_row_offset=0
-        )
+        with_zero_offset = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1, q_row_offset=0)
         for key in ("max_global", "mean_global", "entropy_global", "sink_global"):
             self.assertTrue(
                 paddle.allclose(default_pass[key], with_zero_offset[key], atol=1e-6).item(),

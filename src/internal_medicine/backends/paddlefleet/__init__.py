@@ -46,11 +46,12 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
 
     if monitors is None:
         monitors = ["all"]
+    elif isinstance(monitors, str):
+        monitors = [name.strip() for name in monitors.split(",") if name.strip()]
     if "all" in monitors:
         monitors = list(_MONITOR_MAP.keys())
     if monitor_dict is None:
         monitor_dict = {}
-
     model_monitor_dict = getattr(model, _MODEL_MONITOR_ATTR, None)
     if model_monitor_dict is None:
         model_monitor_dict = {}
@@ -87,6 +88,7 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
             logger.info(f"[InternalMedicine/paddlefleet] Enabled monitor: {name}")
         except Exception as e:
             logger.error(f"[InternalMedicine/paddlefleet] Failed to setup {name}: {e}")
+            raise
 
     return model
 

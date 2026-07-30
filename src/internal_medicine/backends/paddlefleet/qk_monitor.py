@@ -100,6 +100,8 @@ def _compute_qk_stats_triton(
     heads_per_group: int = 1,
     row_stride: int = 1,
     q_row_offset: int = 0,
+    sliding_window: tuple[int, int] | list[int] | None = None,
+    softmax_scale: float | None = None,
 ) -> dict:
     """Triton kernel path for paddle tensors.
 
@@ -119,7 +121,8 @@ def _compute_qk_stats_triton(
 
     batch, num_heads, seq_len_q, head_dim = q.shape
     seq_len_k = k.shape[2]
-    scale = 1.0 / (head_dim**0.5)
+    scale = softmax_scale or 1.0 / (head_dim**0.5)
+    window_left, window_right = sliding_window or (0, 0)
 
     BLOCK_M = 64
     BLOCK_N = 64
@@ -171,6 +174,9 @@ def _compute_qk_stats_triton(
         partial_max.strides[2],
         scale=scale,
         apply_causal_mask=causal,
+        apply_sliding_window=sliding_window is not None,
+        window_left=int(window_left),
+        window_right=int(window_right),
         ROW_STRIDE=row_stride,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -202,6 +208,8 @@ def compute_qk_stats_paddle(
     causal: bool = True,
     row_stride: int = 1,
     q_row_offset: int = 0,
+    sliding_window: tuple[int, int] | list[int] | None = None,
+    softmax_scale: float | None = None,
 ) -> dict:
     """Compute QK stats via Triton kernel.
 
@@ -235,12 +243,21 @@ def compute_qk_stats_paddle(
         heads_per_group=heads_per_group,
         row_stride=row_stride,
         q_row_offset=q_row_offset,
+        sliding_window=sliding_window,
+        softmax_scale=softmax_scale,
     )
 
 
 class PaddleQKStatsMonitor(PaddleProbe):
     METRIC_PREFIX = "qk_stats"
-    MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
+    MAX_AGGREGATED = {
+        "q_norm_max",
+        "k_norm_max",
+        "v_norm_max",
+        "max",
+        "entropy_max",
+        "sink_head_max",
+    }
     MIN_AGGREGATED = {"entropy_min"}
 
     def __init__(
@@ -312,8 +329,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
         if self.verbose:
             logger.info(
-                f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. "
-                f"TP={self.tp_size} CP={self.cp_size}"
+                f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. TP={self.tp_size} CP={self.cp_size}"
             )
 
         if self.cp_size > 1:
@@ -328,6 +344,12 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
         for layer_idx, _attn_module, attn_type in attention_layers:
             for m in (
+                "q_norm_mean",
+                "q_norm_max",
+                "k_norm_mean",
+                "k_norm_max",
+                "v_norm_mean",
+                "v_norm_max",
                 "max",
                 "mean",
                 "entropy_avg",
@@ -350,6 +372,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 )
                 self.hooks.append(hook)
 
+        self._set_compatible_sources(len(attention_layers))
         logger.info(f"[PaddleQKMonitor] Registered {len(self.hooks)} hooks.")
 
     def _find_attention_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer, str | None]]:
@@ -406,7 +429,14 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 return
             try:
                 query, key = inputs[0], inputs[1]
+                value = inputs[2] if len(inputs) > 2 else None
                 with paddle.no_grad():
+                    for name, tensor in (("q", query), ("k", key), ("v", value)):
+                        if not isinstance(tensor, paddle.Tensor):
+                            continue
+                        norm = paddle.linalg.norm(tensor.detach().astype("float32"), axis=-1)
+                        self.record_layer_metric(layer_idx, f"{name}_norm_mean", norm.mean(), attn_type=attn_type)
+                        self.record_layer_metric(layer_idx, f"{name}_norm_max", norm.max(), attn_type=attn_type)
                     if self.cp_size > 1:
                         # CP > 1: gather K only, keep Q local.
                         query = query.detach()
@@ -443,6 +473,8 @@ class PaddleQKStatsMonitor(PaddleProbe):
                         causal=self.causal,
                         row_stride=effective_stride,
                         q_row_offset=q_row_offset,
+                        sliding_window=getattr(layer, "sliding_window", None),
+                        softmax_scale=getattr(layer, "softmax_scale", None),
                     )
 
                     if self.cp_size > 1 and self.cp_group is not None:
@@ -467,7 +499,9 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 sink_class = compute_sink_head_classification(sink_for_classify, threshold=self.sink_head_threshold)
                 for name, val in sink_class.items():
                     self.record_layer_metric(layer_idx, name, val, attn_type=attn_type)
+                self._record_observation(layer_idx)
             except Exception as e:
+                self._record_error()
                 logger.error(f"[PaddleQKMonitor] Error layer {layer_idx}: {e}")
 
         return hook_fn

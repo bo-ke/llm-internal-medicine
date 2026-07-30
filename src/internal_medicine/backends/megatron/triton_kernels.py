@@ -64,6 +64,9 @@ def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = Tru
         max_logits.stride(1),
         scale=scale,
         apply_causal_mask=causal,
+        apply_sliding_window=False,
+        window_left=0,
+        window_right=0,
         ROW_STRIDE=1,  # full-sequence (exact) behavior, unchanged
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,

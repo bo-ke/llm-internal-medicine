@@ -2,10 +2,10 @@
 
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
-包含五大监控模块：
-- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
-- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
-- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
+包含五类监控能力，完整指标、公式和后端差异见 **[能力参考](./docs/capability_reference.md)**：
+- **[MoE Health](./docs/moe_specialist.md)** — Router、hard assignment、gate mass 与专家健康
+- **[QK Stats](./docs/qk_logits.md)** — Q/K/V 尺度、attention logits、熵与 sink
+- **[Massive Activation Health](./docs/massive_activation.md)** — Residual stream、模块输出与 massive activation
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
 
@@ -24,7 +24,7 @@ monitor_dict = {}
 # 启用全部监控 (默认)
 model = setup_internal_medicine(
     model,
-    monitors=['all'],              # 或指定 ['moe_health', 'qk_stats', 'massive_act', 'ple_health']
+    monitors=['all'],
     monitor_dict=monitor_dict,
     monitor_interval=1,
     verbose=False,
@@ -107,7 +107,8 @@ setup_internal_medicine()
     ├── setup_moe_monitor()   → MoESpecialistMonitor → forward hooks on MoE layers
     ├── setup_qk_monitor()    → QKStatsMonitor     → forward pre-hooks on core_attention
     ├── setup_massive_activation_monitor() → MassiveActivationMonitor → forward pre-hooks on transformer layers
-    └── setup_ple_monitor()   → PLEHealthMonitor   → forward hooks on PLE modules
+    ├── setup_ple_monitor()   → PLEHealthMonitor   → forward hooks on PLE modules
+    └── setup_mhc_monitor()   → MHCHealthMonitor   → wraps mHC mapping computation
                                         │
                                         ▼
                               GPU 0-dim accumulators

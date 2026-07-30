@@ -9,6 +9,8 @@ Monitors:
 - qk_stats: Attention QK statistics (entropy, max logits, sink weights)
 - moe_health: MoE health metrics (router, experts, tokens, shared)
 - ple_health: Per-Layer Embedding health (Megatron only)
+- massive_act: Residual-stream and module-output activation health
+- mhc_health: Manifold-Constrained Hyper-Connections mapping health
 
 Usage:
     from internal_medicine import setup_internal_medicine, training_logs
@@ -59,6 +61,7 @@ def setup_internal_medicine(
             - 'moe_health': MoE health metrics
             - 'ple_health': PLE health (Megatron only)
             - 'massive_act': Massive activation metrics
+            - 'mhc_health': mHC mapping metrics
             - 'all': Enable all available monitors. None defaults to all.
         monitor_dict: Dict to store monitor instances
         monitor_interval: Steps between monitoring

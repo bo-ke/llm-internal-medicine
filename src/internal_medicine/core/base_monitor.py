@@ -30,6 +30,8 @@ class Probe(ABC):
     MIN_AGGREGATED: set[str] = set()
 
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
+        if monitor_interval < 1:
+            raise ValueError(f"monitor_interval must be positive, got {monitor_interval}")
         self.log_per_layer = log_per_layer
         self.log_global = log_global
         self.monitor_interval = monitor_interval
@@ -40,6 +42,10 @@ class Probe(ABC):
         self._global_accum: dict[str, float] = {}
         self._global_metric_counts: dict[str, int] = {}
         self._global_count: int = 0
+        self._compatible_sources = 0
+        self._observation_count = 0
+        self._observed_layers: set[int] = set()
+        self._runtime_error_count = 0
 
     @abstractmethod
     def register_hooks(self, model) -> None: ...
@@ -50,10 +56,16 @@ class Probe(ABC):
         self.hooks = []
 
     def step(self):
-        self.step_count += 1
+        sampled = self._should_monitor()
         self._flush_buffers()
         if self.log_global and self._global_accum:
             self._flush_global_metrics()
+        if sampled:
+            self._emit_status_metrics()
+            self._observation_count = 0
+            self._observed_layers.clear()
+            self._runtime_error_count = 0
+        self.step_count += 1
 
     def _flush_buffers(self) -> None:
         """Hook for backend-specific batched flush. Default: no-op.
@@ -63,9 +75,33 @@ class Probe(ABC):
         return None
 
     def _should_monitor(self) -> bool:
-        if not self.monitor_interval:
-            return False
         return self.step_count % self.monitor_interval == 0
+
+    def _set_compatible_sources(self, count: int) -> None:
+        self._compatible_sources = max(0, int(count))
+
+    def _record_observation(self, layer_idx: int) -> None:
+        self._observation_count += 1
+        if layer_idx >= 0:
+            self._observed_layers.add(int(layer_idx))
+
+    def _record_error(self) -> None:
+        self._runtime_error_count += 1
+
+    def _emit_status_metrics(self) -> None:
+        prefix = self.METRIC_PREFIX or self.__class__.__name__
+        values = {
+            "compatible_sources": self._compatible_sources,
+            "observations": self._observation_count,
+            "observed_layers": len(self._observed_layers),
+        }
+        metrics = {
+            f"monitor_status/{prefix}/{name}_{reduction}": value
+            for name, value in values.items()
+            for reduction in ("min", "max")
+        }
+        metrics[f"monitor_status/{prefix}/runtime_errors_max"] = self._runtime_error_count
+        training_logs.update(**metrics)
 
     # ------------------------------------------------------------------
     # Legacy CPU-float API
@@ -79,6 +115,7 @@ class Probe(ABC):
         """
         if not metrics:
             return
+        self._record_observation(layer_idx)
         self._log_per_layer_metrics(layer_idx, metrics)
         if self.log_global:
             self._accumulate_global(metrics)

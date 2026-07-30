@@ -215,6 +215,7 @@ class PaddleMHCHealthMonitor(PaddleProbe):
             return
         self.allocate_buffers()
         self._attach(all_targets)
+        self._set_compatible_sources(len(self._wrapped))
 
     def remove_hooks(self):
         # Restore the original bound methods and drop all cross-call state so
@@ -300,7 +301,9 @@ class PaddleMHCHealthMonitor(PaddleProbe):
 
                     self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_fwd", amax_gain(M, axis=-1))
                     self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_bwd", amax_gain(M, axis=-2))
+                    self._record_observation(layer_idx)
             except Exception as e:
+                self._record_error()
                 if self.verbose:
                     logger.error(f"[PaddleMHCMonitor] Error layer {layer_idx}/{component}: {e}")
             return out

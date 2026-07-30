@@ -47,6 +47,9 @@ def qk_stats_kernel(
     # Configs
     scale: tl.constexpr,
     apply_causal_mask: tl.constexpr,
+    apply_sliding_window: tl.constexpr,
+    window_left: tl.constexpr,
+    window_right: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -66,12 +69,11 @@ def qk_stats_kernel(
     ``heads_per_group=1`` for MHA (no grouping).
 
     Query-row subsampling: only every ``ROW_STRIDE``-th query row is visited
-    in the outer loop. The mean-class statistics (mean_logit, entropy, sink)
-    are row-averages, so a uniform stride is an unbiased estimator of the
-    full-sequence average at O(S/ROW_STRIDE) cost instead of O(S). Pass
-    ``ROW_STRIDE=1`` to recover the exact full-sequence behavior. Note that
-    ``max_logit`` is an extremum over the visited rows; with ROW_STRIDE>1 it
-    is a (typically tight) lower bound on the true max.
+    in the outer loop. Mean-class statistics (mean_logit, entropy, sink) are
+    deterministic approximations of their full-sequence row averages at
+    O(S/ROW_STRIDE) cost instead of O(S). Pass ``ROW_STRIDE=1`` to recover
+    exact full-sequence behavior. ``max_logit`` is an extremum over the
+    visited rows; with ROW_STRIDE>1 it is a lower bound on the true max.
     """
     pid = tl.program_id(0)
     batch_idx = pid // num_heads
@@ -138,6 +140,11 @@ def qk_stats_kernel(
             if apply_causal_mask:
                 causal = m_global[:, None] >= n_offsets[None, :]
                 mask_val = mask_val & causal
+            if apply_sliding_window:
+                in_window = (n_offsets[None, :] >= m_global[:, None] - window_left) & (
+                    n_offsets[None, :] <= m_global[:, None] + window_right
+                )
+                mask_val = mask_val & in_window
 
             logits = tl.where(mask_val, logits, -1e10)
 
@@ -200,8 +207,7 @@ def qk_stats_kernel(
     out_offset = batch_idx * stride_out_batch + head_idx * stride_out_head
 
     # NOTE: mean_logit uses row-first semantics (mean over valid rows of the
-    # per-row mean logit) rather than count-weighted position mean. 
-    safe_count = tl.maximum(head_valid_count, 1.0)
+    # per-row mean logit) rather than count-weighted position mean.
     safe_rows = tl.maximum(head_valid_rows, 1.0)
 
     tl.store(max_logits_ptr + out_offset, head_max_logit)
@@ -249,6 +255,9 @@ def qk_stats_partial_kernel(
     # Configs
     scale: tl.constexpr,
     apply_causal_mask: tl.constexpr,
+    apply_sliding_window: tl.constexpr,
+    window_left: tl.constexpr,
+    window_right: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -322,6 +331,11 @@ def qk_stats_partial_kernel(
         if apply_causal_mask:
             causal = m_global[:, None] >= n_offsets[None, :]
             mask_val = mask_val & causal
+        if apply_sliding_window:
+            in_window = (n_offsets[None, :] >= m_global[:, None] - window_left) & (
+                n_offsets[None, :] <= m_global[:, None] + window_right
+            )
+            mask_val = mask_val & in_window
 
         logits = tl.where(mask_val, logits, -1e10)
 

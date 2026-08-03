@@ -7,6 +7,11 @@
 与其它 monitor 不同，`act_dump` **不上报任何 `training_logs` 标量指标**：它在 forward
 hook 里把 hidden 从 GPU 拷到 pinned CPU，在 step 末尾（cold path）写成 safetensors 文件。
 
+也正因如此，它**不被 `monitors=['all']` / `all: true` 包含**：`all` 的语义是"打开全部
+指标监控"，而本工具只写盘、体量又大（默认全量 hidden × 全部层，单 step 几十 GB）。要启用
+必须显式点名 —— dict 形式写 `act_dump: {...}`，或 `monitors=['all', 'act_dump']`（与
+`all` 并列点名视为显式 opt-in，不会被排除）。
+
 ## 为什么不复用 Megatron 的 activation offload
 
 Megatron 的 `fine_grained_activation_offloading`（以及 TE 的 CPU offload）只在

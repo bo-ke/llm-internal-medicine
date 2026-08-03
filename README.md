@@ -25,7 +25,7 @@ from internal_medicine import setup_internal_medicine
 # 创建 monitor_dict 用于存储 monitor 实例
 monitor_dict = {}
 
-# 启用全部监控 (默认)
+# 启用全部指标类监控 (默认)
 model = setup_internal_medicine(
     model,
     monitors=['all'],              # 或指定 ['moe_health', 'qk_stats', 'massive_act', 'ple_health']
@@ -33,7 +33,15 @@ model = setup_internal_medicine(
     monitor_interval=1,
     verbose=False,
 )
+```
 
+> **`all` 不包含 `act_dump`**。`all` 的语义是"打开全部**指标**监控"，而 `act_dump` 不上报
+> 任何指标、只往磁盘写 hidden-state 张量（当前默认是全量 `[s*b, h]` × 全部层，单个被监控
+> step 就是几十 GB，且 `dump_dir` 必须指向真实大容量卷）。让 `all` 顺带把它打开，会让只想
+> 看指标的人写爆磁盘。需要落盘时显式点名：`act_dump: {...}`（dict 形式）或
+> `monitors=['all', 'act_dump']` —— 与 `all` 并列点名属于显式 opt-in，不会被排除掉。
+
+```python
 # 训练循环
 for step in range(num_steps):
     loss = model(inputs)

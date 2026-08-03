@@ -31,6 +31,7 @@ MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megat
 moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
+megatron_backend = importlib.import_module("internal_medicine.backends.megatron")
 massive_activation_metrics = importlib.import_module("internal_medicine.backends.megatron.massive_activation_metrics")
 compute_sink_head_classification = importlib.import_module(
     "internal_medicine.backends.megatron.sink_head_metrics"
@@ -1945,6 +1946,61 @@ class MegatronLARMonitorTest(unittest.TestCase):
         hidden_masked = hidden.reshape(-1, H)[mask]
         want, *_ = _lar_analytical(hidden_masked, router_weight, logits=hidden_masked @ router_weight.t())
         self.assertAlmostEqual(got, want, places=4)
+
+
+class MegatronMonitorRegistryTest(unittest.TestCase):
+    """``monitors=["all"]`` expansion — which monitors it does and does not include."""
+
+    def test_all_excludes_act_dump(self):
+        """act_dump writes tensors to disk (tens of GB per step at the current
+        full-hidden defaults), so it must never be swept in by "all"."""
+        names = megatron_backend._expand_monitor_names(["all"])
+        self.assertNotIn("act_dump", names)
+        self.assertIn("act_dump", megatron_backend._MONITOR_MAP, "still reachable by name")
+
+    def test_all_expands_to_the_all_monitors_set(self):
+        names = set(megatron_backend._expand_monitor_names(["all"]))
+        self.assertEqual(names, set(megatron_backend._ALL_MONITORS))
+        # The full registry is the "all" set plus the opt-in-only tools; act_dump is
+        # the only extra, so a future metric monitor added to _ALL_MONITORS is picked
+        # up by "all" with no test change.
+        self.assertEqual(set(megatron_backend._MONITOR_MAP) - set(megatron_backend._ALL_MONITORS), {"act_dump"})
+
+    def test_all_monitors_setup_fns_match_the_registry(self):
+        """_MONITOR_MAP is built from _ALL_MONITORS, so every name must resolve to the
+        same setup fn in both — a copy-paste divergence would silently run the wrong
+        setup for a monitor."""
+        for name, setup_fn in megatron_backend._ALL_MONITORS.items():
+            with self.subTest(monitor=name):
+                self.assertIs(megatron_backend._MONITOR_MAP[name], setup_fn)
+
+    def test_none_defaults_to_all_and_still_excludes_act_dump(self):
+        self.assertEqual(
+            megatron_backend._expand_monitor_names(None),
+            megatron_backend._expand_monitor_names(["all"]),
+        )
+        self.assertNotIn("act_dump", megatron_backend._expand_monitor_names(None))
+
+    def test_explicit_act_dump_alongside_all_is_honoured(self):
+        """Naming act_dump next to "all" is an explicit opt-in and must survive the
+        exclusion — otherwise there would be no way to get metrics + dumps together."""
+        names = megatron_backend._expand_monitor_names(["all", "act_dump"])
+        self.assertIn("act_dump", names)
+        self.assertIn("qk_stats", names)
+        self.assertEqual(len(names), len(set(names)), "no duplicates")
+
+    def test_explicit_act_dump_alone_is_honoured(self):
+        self.assertEqual(megatron_backend._expand_monitor_names(["act_dump"]), ["act_dump"])
+
+    def test_explicit_list_is_preserved_and_deduped(self):
+        self.assertEqual(
+            megatron_backend._expand_monitor_names(["qk_stats", "lar", "qk_stats"]),
+            ["qk_stats", "lar"],
+        )
+
+    def test_bare_string_spec_is_accepted(self):
+        self.assertEqual(megatron_backend._expand_monitor_names("lar"), ["lar"])
+        self.assertNotIn("act_dump", megatron_backend._expand_monitor_names("all"))
 
 
 if __name__ == "__main__":

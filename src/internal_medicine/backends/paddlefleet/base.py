@@ -162,10 +162,12 @@ class PaddleProbe(Probe):
         1. 根据 MAX_AGGREGATED/MIN_AGGREGATED 选择聚合方式，注册 layer key
         2. 建立 layer_key → global_key 的分组映射，flush 时自动推导 global
 
-        ``attn_type`` (optional): when set (``"swa"`` / ``"full"``), the tag is
-        prepended to ``metric_name`` in both layer and global keys so the
-        viewer renders window vs full statistics in separate charts. When
-        ``None``, legacy key layout is preserved.
+        ``attn_type`` (optional): when set (``"mla"`` / ``"hca"`` / ``"csa"`` /
+        ``"window"`` / ``"mqa"`` on ``csa_compress_ratios`` stacks, ``"swa"`` /
+        ``"full"`` on ``sliding_window`` stacks), the tag is prepended to
+        ``metric_name`` in both layer and global keys so the viewer renders each
+        attention kind in a separate chart. When ``None``, legacy key layout is
+        preserved.
         """
         if not (self.log_per_layer or self.log_global):
             return

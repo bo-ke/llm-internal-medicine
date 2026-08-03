@@ -80,7 +80,17 @@ _LATENT_COMBINE_METRICS = (
 
 class MoESpecialistMonitor(TorchProbe):
     METRIC_PREFIX = "moe_health"
-    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max", "latent_combine_channel_max_median_ratio"}
+    # Both latent-combine metrics are max-aggregated: they exist to catch magnitude
+    # blow-up, and a mean over microbatches / layers / ranks would average a spike away
+    # against the healthy majority. Same reasoning (and same choice) as
+    # ``massive_act``'s ``activation_rms``. Neither ends in ``_max``, so both must also
+    # be listed in ``training_logs.MAX_AGGREGATED_SUFFIXES`` for the cross-rank pass.
+    MAX_AGGREGATED = {
+        "score_sum_max",
+        "expert_norm_max",
+        "latent_combine_rms",
+        "latent_combine_channel_max_median_ratio",
+    }
     MIN_AGGREGATED = {"score_sum_min", "expert_norm_min"}
 
     def __init__(
@@ -424,8 +434,8 @@ class MoESpecialistMonitor(TorchProbe):
         No cross-rank collective here (perf-rules Rule 2). ``fc2_latent_proj`` is built
         ``parallel_mode="duplicated"``, so the latent dim is NOT TP-sharded and the
         per-channel reduction is already complete locally; the token dim is
-        DP/CP-partitioned, and flush-time ``gather_and_aggregate`` composes those
-        (mean for the RMS, max for the ratio).
+        DP/CP-partitioned, and flush-time ``gather_and_aggregate`` composes those with
+        MAX for both metrics (see ``MAX_AGGREGATED``).
         """
 
         def hook_fn(module, args, kwargs):

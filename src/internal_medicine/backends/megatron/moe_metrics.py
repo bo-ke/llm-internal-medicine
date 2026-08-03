@@ -214,6 +214,10 @@ def compute_latent_combine_stats(hidden_states: torch.Tensor) -> dict[str, torch
           denominator is itself inflated by the spike, which damps the very signal
           being measured.
 
+    Both are MAX-aggregated (per-layer -> global, and across ranks): they exist to catch
+    magnitude blow-up, so the worst observation is the informative one and a mean would
+    average a spike away.
+
     Both are 0-dim GPU tensors — no host sync (perf-rules Rule 1).
     """
     h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()

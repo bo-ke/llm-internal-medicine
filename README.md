@@ -162,8 +162,8 @@ setup_internal_medicine()
 | 14 | `load_max_min_ratio` | `moe_health/.../load_max_min_ratio` | `max(tokens) / min(tokens)` | 每层+全局 | 最忙/最闲专家 token 数比值 |
 | 15 | `load_max_median_ratio` | `moe_health/.../load_max_median_ratio` | `max(tokens) / median(tokens)` | 每层+全局 | 最忙/中位专家 token 数比值 |
 | 16 | `load_cv` | `moe_health/.../load_cv` | `std(tokens) / mean(tokens)` | 每层+全局 | 专家负载变异系数 (均衡=0) |
-| 17 | `latent_combine_rms` | `moe_health/.../latent_combine_rms` | `rms(combine 后的 latent 张量)` | 每层+全局 | k-way combine 后、latent 上投影前的整体幅度 |
-| 18 | `latent_combine_channel_max_median_ratio` | `moe_health/.../latent_combine_channel_max_median_ratio` | `max_c / median_c` (per-channel \|max\|) | 每层+全局 | 同一张量的 latent 通道集中度 (massive-activation 前兆) |
+| 17 | `latent_combine_rms` | `moe_health/.../latent_combine_rms` | `rms(combine 后的 latent 张量)` | 每层+全局 (max 聚合) | k-way combine 后、latent 上投影前的整体幅度 |
+| 18 | `latent_combine_channel_max_median_ratio` | `moe_health/.../latent_combine_channel_max_median_ratio` | `max_c / median_c` (per-channel \|max\|) | 每层+全局 (max 聚合) | 同一张量的 latent 通道集中度 (massive-activation 前兆) |
 
 > **注**: 指标 14-16 (`load_*`) 在满足以下**任一**条件时输出, 优先使用前者:
 > 1. `global_aux_loss` 已开启 (`get_aux_loss_coeff("global_aux_loss") > 0`): 复用
@@ -183,9 +183,12 @@ setup_internal_medicine()
 > `combine_postprocess` 产出、尚未做 latent 上投影的张量 —— 即 topk 个专家输出按
 > router 权重求和之后的结果。`fc2_latent_proj` 是 `parallel_mode="duplicated"`,
 > latent 维不被 TP 切分, 故 per-channel 归约在本 rank 内已完整; token 维按 DP/CP 切分,
-> 由 flush 时的 `gather_and_aggregate` 组合 (rms 取 mean, ratio 取 max)。分母用
-> **median** 与 `massive_act/channel_max_ratio` 保持一致, 两者可直接横向对比; 且 median
-> 对本指标要抓的离群通道稳健 —— 用 mean 会被尖峰自身抬高分母, 反而压掉信号。
+> 由 flush 时的 `gather_and_aggregate` 组合 —— 两个指标都取 **max**（不是 mean）: 它们
+> 的用途是抓幅度异常, 跨 microbatch / 跨层 / 跨 rank 取平均会把尖峰摊平在正常样本里。
+> 因此两者都显式列进 `MAX_AGGREGATED` 与 `MAX_AGGREGATED_SUFFIXES`（名字都不以 `_max`
+> 结尾, 不会被自动识别）。分母用 **median** 与 `massive_act/channel_max_ratio` 保持
+> 一致, 两者可直接横向对比; 且 median 对本指标要抓的离群通道稳健 —— 用 mean 会被尖峰
+> 自身抬高分母, 反而压掉信号。
 
 ### 健康阈值
 
@@ -408,7 +411,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MoE** | `load_max_min_ratio` | `max/min(tokens)` | mean | 越接近 1 越均衡 (global_aux_loss 或 expert_bias) |
 | **MoE** | `load_max_median_ratio` | `max/median(tokens)` | mean | 越接近 1 越均衡 (global_aux_loss 或 expert_bias) |
 | **MoE** | `load_cv` | `std/mean(tokens)` | mean | 越接近 0 越均衡 (global_aux_loss 或 expert_bias) |
-| **MoE** | `latent_combine_rms` | `rms(combine 后 latent)` | mean | 平稳 (仅 latent-MoE) |
+| **MoE** | `latent_combine_rms` | `rms(combine 后 latent)` | max | 平稳 (仅 latent-MoE) |
 | **MoE** | `latent_combine_channel_max_median_ratio` | `max_c/median_c(per-channel \|max\|)` | max | 越接近 1 越均匀 (仅 latent-MoE) |
 | **QK** | `max` | `max(QK^T/√d)` | max | 不应暴增 |
 | **QK** | `mean` | `mean(logits)` | mean | 稳定 |

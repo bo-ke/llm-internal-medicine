@@ -574,16 +574,60 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         finally:
             monitor.remove_hooks()
 
-    def test_latent_combine_ratio_is_max_aggregated_across_ranks(self):
-        """The ratio is a max-over-tokens of a per-channel peak, so cross-rank
-        composition must use max, not mean (it lacks a _max suffix, so it has to be
-        listed in MAX_AGGREGATED / MAX_AGGREGATED_SUFFIXES explicitly)."""
-        name = "latent_combine_channel_max_median_ratio"
-        self.assertIn(name, MoESpecialistMonitor.MAX_AGGREGATED)
-        self.assertTrue(training_logs._is_max_metric(f"moe_health/layer_0/{name}"))
-        self.assertTrue(training_logs._is_max_metric(f"moe_health/global_{name}"))
-        # The RMS is a scale, not an extremum -> mean-composed.
-        self.assertFalse(training_logs._is_max_metric("moe_health/layer_0/latent_combine_rms"))
+    def test_latent_combine_metrics_are_max_aggregated_across_ranks(self):
+        """Both latent-combine metrics compose with MAX, not mean: they exist to catch
+        magnitude blow-up, and a mean over microbatches / layers / ranks would average a
+        spike away. Neither ends in _max, so both must be listed explicitly in
+        MAX_AGGREGATED (per-layer -> global) and MAX_AGGREGATED_SUFFIXES (cross-rank)."""
+        for name in moe_monitor_module._LATENT_COMBINE_METRICS:
+            with self.subTest(metric=name):
+                self.assertIn(name, MoESpecialistMonitor.MAX_AGGREGATED)
+                self.assertTrue(training_logs._is_max_metric(f"moe_health/layer_0/{name}"))
+                self.assertTrue(training_logs._is_max_metric(f"moe_health/global_{name}"))
+
+    def test_latent_combine_global_takes_max_over_layers(self):
+        """The global key must be the worst layer, not the average of layers."""
+        S, B, H, L, E = 4, 1, 8, 4, 4
+        layers = [FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E) for _ in range(2)]
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: list(enumerate(layers))
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(list(enumerate(layers)))
+        try:
+            # layer 0 quiet, layer 1 hot: global must follow layer 1.
+            layers[0](torch.randn(S, B, H), expert_outputs=[torch.ones(S, B, L)], probs=[1.0])
+            hot = torch.ones(S, B, L) * 3.0
+            hot[..., 0] = 300.0
+            layers[1](torch.randn(S, B, H), expert_outputs=[hot], probs=[1.0])
+            monitor.step()
+
+            latest = training_logs.get_latest(prefix="moe_health")
+            for name in moe_monitor_module._LATENT_COMBINE_METRICS:
+                per_layer = [latest[f"moe_health/layer_{i}/{name}"] for i in range(2)]
+                self.assertAlmostEqual(latest[f"moe_health/global_{name}"], max(per_layer), places=5)
+                # A mean would sit strictly below the max given these two layers differ.
+                self.assertGreater(max(per_layer), sum(per_layer) / 2)
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_combine_rms_keeps_worst_microbatch(self):
+        """Two forwards in one step: the recorded RMS is the larger, not their mean."""
+        S, B, H, L, E = 4, 1, 8, 4, 4
+        layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            layer(torch.randn(S, B, H), expert_outputs=[torch.ones(S, B, L)], probs=[1.0])
+            layer(torch.randn(S, B, H), expert_outputs=[torch.ones(S, B, L) * 5.0], probs=[1.0])
+            monitor.step()
+            got = training_logs.get_latest(prefix="moe_health")["moe_health/layer_0/latent_combine_rms"]
+            self.assertAlmostEqual(got, 5.0, places=5)  # max(1.0, 5.0), not mean 3.0
+        finally:
+            monitor.remove_hooks()
 
     def test_latent_combine_hook_respects_monitor_interval(self):
         S, B, H, L, E = 4, 1, 8, 4, 4

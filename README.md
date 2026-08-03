@@ -4,8 +4,8 @@
 
 包含五大监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
-- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
-- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
+- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
+- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
 
@@ -202,6 +202,49 @@ setup_internal_medicine()
 | 7 | `sink_head_ratio` | `qk_stats/.../sink_head_ratio` | `count(sink>θ)/N_heads` | 每层+全局 | Sink head 占比 |
 | 8 | `sink_head_max` | `qk_stats/.../sink_head_max` | `max(sink_per_head)` | 每层+全局 | 最强 sink head 权重 |
 | 9 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
+| 10 | `attn_sink_logit` | `qk_stats/.../attn_sink_logit` | `mean(attn_sink)` | 每层+全局 | 仅 CSA/HCA 层；learned sink logit 量级漂移 |
+
+### 混合注意力栈的层类型标签 (attn_type)
+
+指标键会带上层类型前缀，避免不同注意力类型的统计混在同一张图里。
+
+- **`csa_compress_ratios` 描述的栈**（由 `experimental_attention_variant="dsv4_hybrid"` 标记）：
+  按每层 ratio 分类为 `mla`(-2) / `mqa`(-1) / `window`(0) / `csa`(2..127) / `hca`(128)。
+  例：`qk_stats/layer_8/hca_entropy_avg`、`qk_stats/global_mla_entropy_avg`。
+  这类 config 不设 `sliding_window`，层类型完全由 ratio 决定。
+- **`sliding_window`（+ `window_attn_skip_freq`）描述的栈**：用 `Attention.__init__` 逐层算出的
+  `is_swa` → `swa` / `full`。
+- **两个字段都没有的栈**：无标签，键布局保持不变（向后兼容，避免已有看板断档）。
+
+### CSA / HCA 层的统计口径
+
+这类层的 query 不做全因果注意力，key 集合是「sliding window ∪ 压缩 KV」，且 softmax 分母里
+还有一个 learned per-head `attn_sink`。qk_stats 对它们走独立路径：包裹
+`CompressedSparseAttention.compressed_sparse_attn`，从调用入参直接取真实的
+`topk_idxs` / `kv_full` / `attn_sink` / `softmax_scale`（层自身的 `v_head_dim ** -0.5`），
+再用两段式稀疏 kernel（`qk_stats_sparse_partial_kernel`）在真实 key 集合上做单次 softmax
+统计。索引取自模型自身，因此 document mask 下的文档边界重置、以及 learned indexer 的 top-k
+选择都自动覆盖。
+
+指标语义：
+
+- `sink`：该 row **可达的最早 key** 的权重。有压缩段时指向首个压缩块（概括序列/文档开头），
+  否则是窗口内最旧位置；dense causal 层下退化为 token-0。
+- `attn_sink_logit`：learned sink 参数的均值，用于观察它在训练中的漂移。
+
+启用 learned indexer 的层（`compress_ratio` 在 `[2, 127]` 且未开 `csa_dense_mode`）压缩 key
+是运行时 top-k 选出的，统计会覆盖真实 key 的超集，注册 hook 时会打一条 warning。
+
+读数注意 —— **`sink` 与 `entropy` 的绝对值不可跨层类型比较**：
+
+- 粒度不同：dense 层的 key 是单个 token，压缩段的 key 是一个 `compress_ratio` 大小的聚合块
+- key 集合大小不同：dense 层 O(S)，稀疏层 O(window + S/ratio)，熵的上界随之不同
+- logit 尺度不同：压缩 key 由 Compressor 的独立参数产出，与原始 K 不在同一尺度，
+  而 softmax 对 logit 尺度敏感
+- 分母组成不同：稀疏层含 learned `attn_sink`，dense 路径默认没有对应项
+
+因此只做**同类层之间的横向对比**（如 `hca_sink` 随层号的变化）或**同一 key 的纵向趋势**。
+global 指标已按层类型拆分，不要再把不同类型平均到一起。
 
 ---
 
@@ -396,6 +439,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **QK** | `sink_head_ratio` | `count(sink>threshold)/N_heads` | mean | Sink head 占比 |
 | **QK** | `sink_head_max` | `max(sink_per_head)` | max | 最强 sink head |
 | **QK** | `sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | mean | Sink vs 非Sink gap |
+| **QK** | `attn_sink_logit` | `mean(attn_sink)` | mean | CSA/HCA 层；learned sink 量级 |
 | **MassiveAct** | `channel_max` | `max(abs(H_i))` | max | 通道峰值激活 |
 | **MassiveAct** | `channel_median` | `median(per_channel_max)` | max | 通道峰值基准量级 |
 | **MassiveAct** | `channel_p95` | `p95(per_channel_max)` | max | 高分位通道幅度 |

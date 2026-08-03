@@ -13,12 +13,40 @@ class MonitorLayer:
     idx: int
     layer: object
     is_mtp: bool = False
-    # Attention type tag for models that mix window / full attention (e.g. ernie-lite).
-    # ``"swa"`` for sliding-window layers, ``"full"`` for full-attention layers,
-    # ``None`` when the layer does not expose an ``is_swa`` flag (backward compat
-    # for eb5_v2 / dsv4). Monitors use this to split metric keys so window vs
-    # full statistics never mix in the same chart.
+    # Attention kind tag for stacks that mix kinds across layers. Which config
+    # field describes the mix decides the value space (see classify_attn_type):
+    #   - ``csa_compress_ratios`` present  -> ``"mla"`` / ``"mqa"`` /
+    #     ``"window"`` / ``"csa"`` / ``"hca"``
+    #   - ``sliding_window`` present       -> ``"swa"`` / ``"full"``
+    #   - neither                          -> ``None`` (homogeneous stack; keeps
+    #     the legacy untagged metric keys)
+    # Monitors prepend this to the metric name so statistics of different
+    # attention kinds never mix in one chart.
     attn_type: str | None = None
+    # Structural metadata needed to reproduce the real attention key set (see
+    # ``qk_monitor``). Only available on ``csa_compress_ratios`` stacks.
+    compress_ratio: int | None = None
+    window_size: int | None = None
+    # True when the layer runs a learned Lightning Indexer, i.e. the compressed
+    # key set is top-k selected at runtime and cannot be reconstructed from
+    # ``csa_compress_ratios`` alone.
+    has_indexer: bool = False
+
+
+# Sentinel values of ``config.csa_compress_ratios``; keep in sync with
+# ``paddlefleet.transformer.transformer_config`` validation and
+# ``paddlefleet.transformer.csa_attention``.
+MLA_RATIO = -2
+MQA_RATIO = -1
+WINDOW_RATIO = 0
+HCA_RATIO = 128
+
+_RATIO_KINDS = {
+    MLA_RATIO: "mla",
+    MQA_RATIO: "mqa",
+    WINDOW_RATIO: "window",
+    HCA_RATIO: "hca",
+}
 
 
 def _flatten_model_chunks(model) -> list[object] | None:
@@ -77,28 +105,94 @@ def unwrap_mtp_layer(layer):
     return getattr(layer, "transformer_layer", None) if is_mtp_wrapper(layer) else layer
 
 
-def classify_attn_type(layer) -> str | None:
-    """Classify a transformer layer as sliding-window or full attention.
-
-    Reads ``layer.self_attn.is_swa`` (or ``layer.self_attention.is_swa``) — a
-    boolean set at model init by the attention module. Returns:
-
-    - ``"swa"`` if the layer uses sliding-window attention
-    - ``"full"`` if the layer uses full attention
-    - ``None`` if the attention module does not expose ``is_swa`` (e.g.
-      eb5_v2 / dsv4 where all layers are homogeneous). Callers should treat
-      ``None`` as "do not tag metrics with attention type" so those models
-      keep their existing metric key layout.
-    """
+def get_attention_module(layer):
+    """Return the layer's self-attention module, or ``None``."""
     attn = getattr(layer, "self_attn", None)
     if attn is None:
         attn = getattr(layer, "self_attention", None)
-    if attn is None:
+    return attn
+
+
+def _uses_compress_ratios(attn) -> bool:
+    """True when the stack describes its per-layer attention kind via ratios.
+
+    Signalled by ``config.experimental_attention_variant == "dsv4_hybrid"``,
+    which is what makes ``config.csa_compress_ratios`` authoritative. Gating on
+    the field (not on a model name) keeps stacks that carry no mix information
+    on their existing untagged metric keys.
+    """
+    config = getattr(attn, "config", None)
+    if config is None:
+        return False
+    return getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid"
+
+
+def _compress_ratio_meta(attn) -> tuple[str, int | None, int | None, bool] | None:
+    """Classify one layer of a ``csa_compress_ratios`` stack.
+
+    Returns ``(kind, compress_ratio, window_size, has_indexer)``, or ``None``
+    when the stack is not ratio-described.
+
+    Layers whose ratio selects sparse attention build a
+    ``CompressedSparseAttention`` core that carries the per-layer
+    ``compress_ratio``; ratio ``-2`` builds an ``MLASelfAttention`` instead,
+    which exposes no ratio.
+    """
+    if not _uses_compress_ratios(attn):
         return None
+    core = getattr(attn, "core_attention", None)
+    ratio = getattr(core, "compress_ratio", None)
+    if ratio is None:
+        # No CSA core in a ratio-described stack -> this is the MLA branch (-2).
+        return ("mla", MLA_RATIO, None, False)
+    ratio = int(ratio)
+    kind = _RATIO_KINDS.get(ratio)
+    if kind is None:
+        kind = "csa" if 2 <= ratio < HCA_RATIO else "unknown"
+    window_size = getattr(core, "window_size", None)
+    has_indexer = getattr(core, "indexer", None) is not None
+    return (kind, ratio, window_size, has_indexer)
+
+
+def attn_meta(layer) -> tuple[str | None, int | None, int | None, bool]:
+    """Return ``(attn_type, compress_ratio, window_size, has_indexer)``.
+
+    Ratio-described stacks are classified from ``compress_ratio``; otherwise the
+    ``is_swa`` flag is used (see :func:`classify_attn_type`).
+    """
+    attn = get_attention_module(layer)
+    if attn is None:
+        return (None, None, None, False)
+    by_ratio = _compress_ratio_meta(attn)
+    if by_ratio is not None:
+        return by_ratio
     is_swa = getattr(attn, "is_swa", None)
     if is_swa is None:
-        return None
-    return "swa" if is_swa else "full"
+        return (None, None, None, False)
+    return ("swa" if is_swa else "full", None, None, False)
+
+
+def classify_attn_type(layer) -> str | None:
+    """Classify a transformer layer's attention kind.
+
+    Which config field describes the layer mix decides the value space; the two
+    mechanisms are independent and never both apply:
+
+    1. ``csa_compress_ratios`` (flagged by
+       ``experimental_attention_variant="dsv4_hybrid"``): the per-layer kind
+       implied by the ratio — ``"mla"`` (-2), ``"mqa"`` (-1), ``"window"`` (0),
+       ``"csa"`` (2..127), ``"hca"`` (128). ``is_swa`` is useless here because
+       it is derived from ``config.sliding_window``, which these configs do not
+       set, so every layer would look like ``"full"``.
+    2. ``config.sliding_window`` (+ ``window_attn_skip_freq``): the ``is_swa``
+       flag that ``Attention.__init__`` computes per layer → ``"swa"`` /
+       ``"full"``.
+
+    Returns ``None`` when neither field is present (homogeneous stack), which
+    callers treat as "do not tag metrics with attention kind" so those runs keep
+    their existing metric key layout.
+    """
+    return attn_meta(layer)[0]
 
 
 def resolve_layer_idx(layer, local_idx: int, num_local_layers: int, pp_rank: int = 0, layer_offset: int = 0) -> int:
@@ -135,11 +229,21 @@ def iter_monitor_layers(
     num_main_layers = len(matched_main_layers)
     monitor_layers: list[MonitorLayer] = []
 
+    def _make(idx: int, layer: object, is_mtp: bool) -> MonitorLayer:
+        kind, ratio, window_size, has_indexer = attn_meta(layer)
+        return MonitorLayer(
+            idx=idx,
+            layer=layer,
+            is_mtp=is_mtp,
+            attn_type=kind,
+            compress_ratio=ratio,
+            window_size=window_size,
+            has_indexer=has_indexer,
+        )
+
     for local_idx, layer in enumerate(matched_main_layers):
         idx = resolve_layer_idx(layer, local_idx, num_main_layers, pp_rank=pp_rank, layer_offset=layer_offset)
-        monitor_layers.append(
-            MonitorLayer(idx=idx, layer=layer, is_mtp=False, attn_type=classify_attn_type(layer))
-        )
+        monitor_layers.append(_make(idx, layer, False))
 
     next_mtp_idx = max((item.idx for item in monitor_layers), default=layer_offset - 1) + 1
     for mtp_idx, wrapper in enumerate(mtp_wrappers):
@@ -147,8 +251,6 @@ def iter_monitor_layers(
         if not matches(layer):
             continue
         idx = next_mtp_idx + mtp_idx
-        monitor_layers.append(
-            MonitorLayer(idx=idx, layer=layer, is_mtp=True, attn_type=classify_attn_type(layer))
-        )
+        monitor_layers.append(_make(idx, layer, True))
 
     return monitor_layers

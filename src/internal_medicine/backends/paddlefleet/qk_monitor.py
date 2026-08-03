@@ -11,9 +11,21 @@ import paddle
 import paddle.nn as nn
 
 from .base import PaddleProbe
-from .layer_discovery import get_decoder_layers, iter_monitor_layers
+from .layer_discovery import MLA_RATIO, MQA_RATIO, get_decoder_layers, iter_monitor_layers
 
 logger = logging.getLogger(__name__)
+
+
+class _MethodPatch:
+    """Handle for a monkey-patched bound method, shaped like a paddle hook."""
+
+    def __init__(self, module, name: str, original):
+        self._module = module
+        self._name = name
+        self._original = original
+
+    def remove(self) -> None:
+        setattr(self._module, self._name, self._original)
 
 
 def compute_sink_head_classification(sink_per_head: paddle.Tensor, threshold: float = 0.3) -> dict:
@@ -238,11 +250,228 @@ def compute_qk_stats_paddle(
     )
 
 
+def _segment_bounds(idx: paddle.Tensor, base: int) -> tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
+    """Reduce a per-row key-index set to inclusive ``[lo, hi]`` bounds.
+
+    ``idx`` is ``[B, S, K]`` with ``-1`` marking unused slots (the convention
+    used by PaddleFleet's window / compressed index helpers). Rows whose set is
+    empty get ``lo = base, hi = base - 1`` so the kernel skips them without
+    dragging the block's scalar loop bounds outside the segment.
+
+    Also returns the number of live slots per row, which the caller compares
+    against ``hi - lo + 1`` to detect a non-contiguous set (the learned-indexer
+    top-k case), where bounds are an over-approximation.
+    """
+    valid = idx >= 0
+    live = valid.astype("float32").sum(axis=-1)
+    far = paddle.full_like(idx, 1 << 30)
+    lo = paddle.where(valid, idx, far).min(axis=-1)
+    hi = paddle.where(valid, idx, paddle.full_like(idx, -1)).max(axis=-1)
+    empty = hi < lo
+    lo = paddle.where(empty, paddle.full_like(lo, base), lo)
+    hi = paddle.where(empty, paddle.full_like(hi, base - 1), hi)
+    return lo.astype("int32"), hi.astype("int32"), live
+
+
+def sparse_bounds_from_topk(topk_idxs: paddle.Tensor, seq_len_orig: int) -> dict:
+    """Split the model's real key indices into window / compressed segments.
+
+    ``topk_idxs`` is what ``CompressedSparseAttention`` feeds to its sparse
+    attention kernel: ``[B, S, K]`` indices into ``kv_full = concat([kv,
+    compressed_kv])``, with ``-1`` for unused slots. Indices below
+    ``seq_len_orig`` address original KV (the sliding window), the rest address
+    compressed KV. Splitting by value rather than by column width keeps this
+    correct regardless of how the model orders the concatenation.
+
+    ``sink_col`` is the row's earliest reachable key — the first compressed
+    block when there is one (it summarises the start of the sequence/document),
+    otherwise the oldest in-window position. For dense causal attention this
+    degenerates to column 0, matching the legacy ``sink`` metric.
+    """
+    orig = paddle.where(topk_idxs < seq_len_orig, topk_idxs, paddle.full_like(topk_idxs, -1))
+    comp = paddle.where(topk_idxs >= seq_len_orig, topk_idxs, paddle.full_like(topk_idxs, -1))
+
+    win_lo, win_hi, win_live = _segment_bounds(orig, 0)
+    cmp_lo, cmp_hi, cmp_live = _segment_bounds(comp, seq_len_orig)
+
+    has_comp = cmp_hi >= cmp_lo
+    sink_col = paddle.where(has_comp, cmp_lo, win_lo)
+
+    # 1.0 when the two [lo, hi] ranges reproduce the index set exactly; below
+    # 1.0 means the set is sparse inside its span (learned-indexer top-k), so
+    # the statistics are computed over a superset of the real keys.
+    span = (win_hi - win_lo + 1).clip(min=0) + (cmp_hi - cmp_lo + 1).clip(min=0)
+    live = (win_live + cmp_live).clip(min=1.0)
+    exactness = (live / span.astype("float32").clip(min=1.0)).clip(max=1.0).mean()
+
+    return {
+        "win_lo": win_lo,
+        "win_hi": win_hi,
+        "cmp_lo": cmp_lo,
+        "cmp_hi": cmp_hi,
+        "sink_col": sink_col.astype("int32"),
+        "exactness": exactness,
+    }
+
+
+def _compute_qk_stats_sparse_triton(
+    q: paddle.Tensor,
+    k: paddle.Tensor,
+    bounds: dict,
+    attn_sink: paddle.Tensor | None,
+    scale: float,
+    heads_per_group: int = 1,
+    row_stride: int = 1,
+) -> dict:
+    """Triton path for two-segment sparse attention stats.
+
+    ``q``: ``[B, H, S_q, D]``, ``k``: ``[B, H_kv, S_k, D]`` (``S_k`` covers
+    ``kv_full``). Reuses the same partial-buffer reduction as the dense path so
+    both produce identical metric semantics.
+    """
+    _ensure_triton_driver()
+    from ...core.triton_qk_kernel import qk_stats_sparse_partial_kernel
+
+    batch, num_heads, seq_len_q, head_dim = q.shape
+    seq_len_k = k.shape[2]
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 64 if head_dim <= 64 else 128
+
+    m_block_span = BLOCK_M * row_stride
+    num_m_blocks = (seq_len_q + m_block_span - 1) // m_block_span
+
+    partial_shape = [batch, num_heads, num_m_blocks]
+    partial_max = paddle.empty(partial_shape, dtype="float32")
+    partial_sum_logit = paddle.empty(partial_shape, dtype="float32")
+    partial_sum_row_mean = paddle.empty(partial_shape, dtype="float32")
+    partial_count = paddle.empty(partial_shape, dtype="float32")
+    partial_sum_entropy = paddle.empty(partial_shape, dtype="float32")
+    partial_sum_sink = paddle.empty(partial_shape, dtype="float32")
+    partial_valid_rows = paddle.empty(partial_shape, dtype="float32")
+
+    win_lo = bounds["win_lo"]
+    sink_present = attn_sink is not None
+    sink_buf = attn_sink if sink_present else paddle.zeros([num_heads], dtype="float32")
+
+    grid = (batch * num_heads, num_m_blocks)
+    qk_stats_sparse_partial_kernel[grid](
+        q,
+        k,
+        win_lo,
+        bounds["win_hi"],
+        bounds["cmp_lo"],
+        bounds["cmp_hi"],
+        bounds["sink_col"],
+        sink_buf,
+        partial_max,
+        partial_sum_logit,
+        partial_sum_row_mean,
+        partial_count,
+        partial_sum_entropy,
+        partial_sum_sink,
+        partial_valid_rows,
+        batch,
+        num_heads,
+        seq_len_q,
+        seq_len_k,
+        head_dim,
+        heads_per_group,
+        num_m_blocks,
+        q.strides[0],
+        q.strides[1],
+        q.strides[2],
+        q.strides[3],
+        k.strides[0],
+        k.strides[1],
+        k.strides[2],
+        k.strides[3],
+        win_lo.strides[0],
+        win_lo.strides[1],
+        partial_max.strides[0],
+        partial_max.strides[1],
+        partial_max.strides[2],
+        scale=scale,
+        HAS_SINK=sink_present,
+        ROW_STRIDE=row_stride,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    max_logits = partial_max.max(axis=-1)
+    total_rows = partial_valid_rows.sum(axis=-1).clip(min=1.0)
+    mean_logits = partial_sum_row_mean.sum(axis=-1) / total_rows
+    entropy = partial_sum_entropy.sum(axis=-1) / total_rows
+    sink = partial_sum_sink.sum(axis=-1) / total_rows
+
+    return {
+        "max_per_head": max_logits,
+        "mean_per_head": mean_logits,
+        "entropy_per_head": entropy,
+        "sink_per_head": sink,
+        "max_global": max_logits.max(),
+        "mean_global": mean_logits.mean(),
+        "entropy_global": entropy.mean(),
+        "sink_global": sink.mean(),
+    }
+
+
+def compute_qk_stats_sparse_paddle(
+    query: paddle.Tensor,
+    kv_full: paddle.Tensor,
+    topk_idxs: paddle.Tensor,
+    softmax_scale: float,
+    attn_sink: paddle.Tensor | None = None,
+    row_stride: int = 1,
+) -> tuple[dict, paddle.Tensor]:
+    """QK stats over the exact key set of a window + compressed-KV layer.
+
+    Args:
+        query: ``[B, S, H, D]`` as handed to the model's sparse attention.
+        kv_full: ``[B, S + n_compressed, D]`` single-head (MQA) keys, i.e.
+            original KV concatenated with compressed KV.
+        topk_idxs: ``[B, S, K]`` real key indices into ``kv_full``.
+        softmax_scale: the scale the layer itself uses (``v_head_dim ** -0.5``),
+            not ``1 / sqrt(head_dim)`` of the monitored tensor.
+        attn_sink: learned per-head sink logit ``[H]``, folded into the softmax
+            denominator. ``None`` to omit.
+
+    Returns ``(stats, exactness)``.
+    """
+    if not query.place.is_gpu_place():
+        raise RuntimeError("[PaddleQKMonitor] QK stats requires GPU (triton kernel)")
+
+    seq_len_orig = query.shape[1]
+    if kv_full.ndim == 3:
+        kv_full = kv_full.unsqueeze(2)  # [B, S_k, 1, D]
+
+    num_q_heads = query.shape[2]
+    num_k_heads = kv_full.shape[2]
+    heads_per_group = num_q_heads // num_k_heads if num_k_heads > 0 else 1
+
+    bounds = sparse_bounds_from_topk(topk_idxs, seq_len_orig)
+
+    q = query.transpose([0, 2, 1, 3])
+    k = kv_full.transpose([0, 2, 1, 3])
+
+    stats = _compute_qk_stats_sparse_triton(
+        q,
+        k,
+        bounds,
+        attn_sink,
+        scale=softmax_scale,
+        heads_per_group=heads_per_group,
+        row_stride=row_stride,
+    )
+    return stats, bounds["exactness"]
+
+
 class PaddleQKStatsMonitor(PaddleProbe):
     METRIC_PREFIX = "qk_stats"
     MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
     MIN_AGGREGATED = {"entropy_min"}
-
     def __init__(
         self,
         causal=True,
@@ -326,7 +555,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 self.cp_size,
             )
 
-        for layer_idx, _attn_module, attn_type in attention_layers:
+        for layer_idx, _attn_module, item in attention_layers:
             for m in (
                 "max",
                 "mean",
@@ -339,20 +568,123 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 "sink_head_max",
                 "sink_nonsink_gap",
             ):
-                self.declare_layer_metric(layer_idx, m, attn_type=attn_type)
+                self.declare_layer_metric(layer_idx, m, attn_type=item.attn_type)
+            if self._is_sparse_layer(item):
+                # Fraction of the scanned key span that is a real key: 1.0 for
+                # window+all-compressed layers, < 1.0 once a learned indexer
+                # makes the compressed set non-contiguous.
+                self.declare_layer_metric(layer_idx, "index_exactness", attn_type=item.attn_type)
+                self.declare_layer_metric(layer_idx, "attn_sink_logit", attn_type=item.attn_type)
 
         self.allocate_buffers()
 
-        for layer_idx, attn_module, attn_type in attention_layers:
+        for layer_idx, attn_module, item in attention_layers:
+            if self._is_sparse_layer(item):
+                patch = self._patch_sparse_attn(layer_idx, attn_module, item)
+                if patch is not None:
+                    self.hooks.append(patch)
+                    continue
             if hasattr(attn_module, "core_attention"):
                 hook = attn_module.core_attention.register_forward_pre_hook(
-                    self._make_compute_hook(layer_idx, attn_type)
+                    self._make_compute_hook(layer_idx, item.attn_type)
                 )
                 self.hooks.append(hook)
 
         logger.info(f"[PaddleQKMonitor] Registered {len(self.hooks)} hooks.")
 
-    def _find_attention_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer, str | None]]:
+    def _is_sparse_layer(self, item) -> bool:
+        """True for layers whose core attention is window + compressed KV.
+
+        That is any ratio-described layer other than ``-2`` (MLA) and ``-1``
+        (full-causal MQA). Those layers attend to a sliding window plus
+        compressed KV under one softmax, so the dense causal kernel would
+        describe a key set ~25x larger than the real one at 8k sequences.
+        """
+        ratio = item.compress_ratio
+        if ratio is None or ratio in (MLA_RATIO, MQA_RATIO):
+            return False
+        core = getattr(item.layer, "self_attn", None) or getattr(item.layer, "self_attention", None)
+        core = getattr(core, "core_attention", None)
+        return hasattr(core, "compressed_sparse_attn")
+
+    def _patch_sparse_attn(self, layer_idx: int, attn_module, item):
+        """Wrap ``CompressedSparseAttention.compressed_sparse_attn``.
+
+        That call receives everything needed for an exact reproduction of the
+        layer's attention distribution — the post-RoPE query, ``kv_full``, the
+        real ``topk_idxs``, the learned ``attn_sink`` and the layer's own
+        ``softmax_scale`` — so nothing has to be re-derived and the
+        document-mask / indexer variants are covered by construction.
+        """
+        core = getattr(attn_module, "core_attention", None)
+        original = getattr(core, "compressed_sparse_attn", None)
+        if original is None:
+            return None
+        if self.cp_size > 1:
+            logger.warning(
+                "[PaddleQKMonitor] CP=%d with sparse (CSA/HCA) layers is not "
+                "supported; skipping qk_stats for layer %d.",
+                self.cp_size,
+                layer_idx,
+            )
+            return None
+
+        monitor = self
+        attn_type = item.attn_type
+
+        def wrapped(query, kv_full, attn_sink, topk_idxs, softmax_scale, topk_length=None):
+            out = original(query, kv_full, attn_sink, topk_idxs, softmax_scale, topk_length=topk_length)
+            if core.training and monitor._should_monitor():
+                monitor._record_sparse_stats(
+                    layer_idx, attn_type, query, kv_full, attn_sink, topk_idxs, softmax_scale
+                )
+            return out
+
+        core.compressed_sparse_attn = wrapped
+        return _MethodPatch(core, "compressed_sparse_attn", original)
+
+    def _record_sparse_stats(
+        self, layer_idx, attn_type, query, kv_full, attn_sink, topk_idxs, softmax_scale
+    ) -> None:
+        try:
+            with paddle.no_grad():
+                stats, exactness = compute_qk_stats_sparse_paddle(
+                    query.detach(),
+                    kv_full.detach(),
+                    topk_idxs.detach(),
+                    float(softmax_scale),
+                    attn_sink=None if attn_sink is None else attn_sink.detach().astype("float32"),
+                    row_stride=self.row_stride,
+                )
+                self._record_common_stats(layer_idx, attn_type, stats)
+                self.record_layer_metric(layer_idx, "index_exactness", exactness, attn_type=attn_type)
+                if attn_sink is not None:
+                    self.record_layer_metric(
+                        layer_idx,
+                        "attn_sink_logit",
+                        attn_sink.detach().astype("float32").mean(),
+                        attn_type=attn_type,
+                    )
+        except Exception as e:
+            logger.error(f"[PaddleQKMonitor] Error sparse layer {layer_idx}: {e}")
+
+    def _record_common_stats(self, layer_idx, attn_type, stats) -> None:
+        all_heads = stats["entropy_per_head"]
+        self.record_layer_metric(layer_idx, "max", stats["max_global"], attn_type=attn_type)
+        self.record_layer_metric(layer_idx, "mean", stats["mean_global"], attn_type=attn_type)
+        self.record_layer_metric(layer_idx, "entropy_avg", stats["entropy_global"], attn_type=attn_type)
+        self.record_layer_metric(layer_idx, "sink", stats["sink_global"], attn_type=attn_type)
+        self.record_layer_metric(layer_idx, "entropy_min", all_heads.min(), attn_type=attn_type)
+        self.record_layer_metric(layer_idx, "entropy_max", all_heads.max(), attn_type=attn_type)
+        self.record_layer_metric(layer_idx, "entropy_std", all_heads.std(), attn_type=attn_type)
+        # sink_per_head: [B, H] — average across batch to get [H]
+        sink_per_head = stats["sink_per_head"]
+        sink_for_classify = sink_per_head.mean(axis=0) if sink_per_head.ndim > 1 else sink_per_head
+        sink_class = compute_sink_head_classification(sink_for_classify, threshold=self.sink_head_threshold)
+        for name, val in sink_class.items():
+            self.record_layer_metric(layer_idx, name, val, attn_type=attn_type)
+
+    def _find_attention_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer, object]]:
         def has_attention(layer):
             return hasattr(layer, "self_attn") or hasattr(layer, "self_attention")
 
@@ -369,7 +701,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
         for item in monitor_layers:
             attn = getattr(item.layer, "self_attn", None) or getattr(item.layer, "self_attention", None)
             if attn is not None:
-                attention_layers.append((item.idx, attn, item.attn_type))
+                attention_layers.append((item.idx, attn, item))
         return attention_layers
 
     def _cp_gather_seq(self, tensor: paddle.Tensor) -> paddle.Tensor | None:
@@ -453,20 +785,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
                             dist.all_reduce(t, op=dist.ReduceOp.SUM, group=self.cp_group)
                             stats[key_name] = t / float(self.cp_size)
 
-                all_heads = stats["entropy_per_head"]
-                self.record_layer_metric(layer_idx, "max", stats["max_global"], attn_type=attn_type)
-                self.record_layer_metric(layer_idx, "mean", stats["mean_global"], attn_type=attn_type)
-                self.record_layer_metric(layer_idx, "entropy_avg", stats["entropy_global"], attn_type=attn_type)
-                self.record_layer_metric(layer_idx, "sink", stats["sink_global"], attn_type=attn_type)
-                self.record_layer_metric(layer_idx, "entropy_min", all_heads.min(), attn_type=attn_type)
-                self.record_layer_metric(layer_idx, "entropy_max", all_heads.max(), attn_type=attn_type)
-                self.record_layer_metric(layer_idx, "entropy_std", all_heads.std(), attn_type=attn_type)
-                # sink_per_head: [B, H] — average across batch to get [H]
-                sink_per_head = stats["sink_per_head"]
-                sink_for_classify = sink_per_head.mean(axis=0) if sink_per_head.ndim > 1 else sink_per_head
-                sink_class = compute_sink_head_classification(sink_for_classify, threshold=self.sink_head_threshold)
-                for name, val in sink_class.items():
-                    self.record_layer_metric(layer_idx, name, val, attn_type=attn_type)
+                self._record_common_stats(layer_idx, attn_type, stats)
             except Exception as e:
                 logger.error(f"[PaddleQKMonitor] Error layer {layer_idx}: {e}")
 

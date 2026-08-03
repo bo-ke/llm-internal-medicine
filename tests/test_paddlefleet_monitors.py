@@ -155,7 +155,7 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
         self.assertEqual([item.attn_type for item in result], ["full", "swa", "full"])
 
     def test_iter_monitor_layers_attn_type_is_none_for_backward_compat_models(self):
-        """Models without an is_swa flag (eb5_v2 / dsv4) must yield attn_type=None."""
+        """Stacks with neither sliding_window nor csa_compress_ratios yield attn_type=None."""
         layer = SimpleNamespace(self_attn=SimpleNamespace())  # no is_swa
         result = layer_discovery.iter_monitor_layers([layer], lambda x: hasattr(x, "self_attn"))
         self.assertEqual(len(result), 1)
@@ -639,6 +639,242 @@ class PaddleQKKernelComputeTest(unittest.TestCase):
                 paddle.allclose(default_pass[key], with_zero_offset[key], atol=1e-6).item(),
                 f"{key} diverged with q_row_offset=0",
             )
+
+
+def _build_hca_topk_idxs(seqlen, window_size, ratio):
+    """Rebuild what CompressedSparseAttention feeds its sparse attention kernel.
+
+    Mirrors ``get_window_topk_idxs`` + ``get_compress_topk_idxs`` (simple causal
+    branch) from ``paddlefleet.transformer.csa_attention``: a left-inclusive
+    sliding window over original KV, concatenated with every causally valid
+    compressed block, offset by ``seqlen`` because both index ``kv_full``.
+    """
+    base = paddle.arange(seqlen).unsqueeze(1)
+    offsets = paddle.arange(window_size)
+    window = paddle.clip(base - window_size + 1, min=0) + offsets
+    window = paddle.where(window > base, paddle.full_like(window, -1), window)
+
+    n_compressed = seqlen // ratio
+    k_indices = paddle.arange(n_compressed).unsqueeze(0).expand([seqlen, -1])
+    causal_bound = paddle.arange(1, seqlen + 1).unsqueeze(1) // ratio
+    compressed = paddle.where(
+        k_indices >= causal_bound,
+        paddle.full_like(k_indices, -1),
+        k_indices + seqlen,
+    )
+    return paddle.concat([window, compressed], axis=-1).unsqueeze(0).astype("int32")
+
+
+class CompressRatioLayerClassificationTest(unittest.TestCase):
+    """Per-layer attention-kind classification on ``csa_compress_ratios`` stacks."""
+
+    @staticmethod
+    def _ratio_layer(compress_ratio=None, window_size=None, indexer=None):
+        # experimental_attention_variant is what makes csa_compress_ratios
+        # authoritative for the per-layer kind.
+        config = SimpleNamespace(experimental_attention_variant="dsv4_hybrid")
+        if compress_ratio is None:
+            core = SimpleNamespace()  # MLA branch: no CSA core
+        else:
+            core = SimpleNamespace(
+                compress_ratio=compress_ratio,
+                window_size=window_size,
+                indexer=indexer,
+                compressed_sparse_attn=lambda *a, **k: None,
+            )
+        return SimpleNamespace(self_attn=SimpleNamespace(config=config, core_attention=core))
+
+    def test_ratio_maps_to_layer_kind(self):
+        cases = {-2: "mla", -1: "mqa", 0: "window", 4: "csa", 128: "hca"}
+        for ratio, expected in cases.items():
+            layer = self._ratio_layer(compress_ratio=ratio)
+            self.assertEqual(layer_discovery.classify_attn_type(layer), expected, f"ratio={ratio}")
+
+    def test_mla_branch_without_csa_core_is_tagged_mla(self):
+        """Ratio -2 builds MLASelfAttention, which exposes no compress_ratio."""
+        layer = self._ratio_layer(compress_ratio=None)
+        kind, ratio, window, has_indexer = layer_discovery.attn_meta(layer)
+        self.assertEqual(kind, "mla")
+        self.assertEqual(ratio, layer_discovery.MLA_RATIO)
+        self.assertIsNone(window)
+        self.assertFalse(has_indexer)
+
+    def test_meta_carries_window_size_and_indexer_flag(self):
+        layer = self._ratio_layer(compress_ratio=4, window_size=128, indexer=object())
+        kind, ratio, window, has_indexer = layer_discovery.attn_meta(layer)
+        self.assertEqual((kind, ratio, window), ("csa", 4, 128))
+        self.assertTrue(has_indexer)
+
+    def test_hca_has_no_indexer(self):
+        layer = self._ratio_layer(compress_ratio=128, window_size=128, indexer=None)
+        self.assertFalse(layer_discovery.attn_meta(layer)[3])
+
+    def test_stack_without_the_variant_field_keeps_is_swa_fallback(self):
+        """Stacks with no ratio field must not gain ratio tags (metric-key compat)."""
+        swa = SimpleNamespace(self_attn=SimpleNamespace(is_swa=True, config=SimpleNamespace()))
+        self.assertEqual(layer_discovery.classify_attn_type(swa), "swa")
+
+    def test_iter_monitor_layers_tags_mixed_hca_mla_stack(self):
+        layers = [
+            self._ratio_layer(compress_ratio=128, window_size=128),
+            self._ratio_layer(compress_ratio=128, window_size=128),
+            self._ratio_layer(compress_ratio=None),
+        ]
+        result = layer_discovery.iter_monitor_layers(layers, lambda layer: True)
+        self.assertEqual([item.attn_type for item in result], ["hca", "hca", "mla"])
+        self.assertEqual([item.compress_ratio for item in result], [128, 128, -2])
+
+
+class SparseBoundsTest(unittest.TestCase):
+    """Window/compressed segment bounds derived from the model's real indices."""
+
+    def setUp(self):
+        self.qk = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor")
+
+    def _hca_topk_idxs(self, seqlen, window_size, ratio):
+        return _build_hca_topk_idxs(seqlen, window_size, ratio)
+
+    def test_bounds_reproduce_the_index_set_exactly(self):
+        seqlen, window_size, ratio = 32, 8, 4
+        topk = self._hca_topk_idxs(seqlen, window_size, ratio)
+        bounds = self.qk.sparse_bounds_from_topk(topk, seqlen)
+
+        # Rebuild membership from the [lo, hi] ranges and compare to the real set.
+        cols = paddle.arange(seqlen + seqlen // ratio).astype("int32")
+        in_win = (cols.unsqueeze(0) >= bounds["win_lo"][0].unsqueeze(1)) & (
+            cols.unsqueeze(0) <= bounds["win_hi"][0].unsqueeze(1)
+        )
+        in_cmp = (cols.unsqueeze(0) >= bounds["cmp_lo"][0].unsqueeze(1)) & (
+            cols.unsqueeze(0) <= bounds["cmp_hi"][0].unsqueeze(1)
+        )
+        from_ranges = in_win | in_cmp
+
+        expected = paddle.zeros_like(from_ranges)
+        for row in range(seqlen):
+            live = [int(v) for v in topk[0, row].tolist() if v >= 0]
+            for col in live:
+                expected[row, col] = True
+
+        self.assertTrue(bool((from_ranges == expected).all()))
+        self.assertAlmostEqual(float(bounds["exactness"]), 1.0, places=5)
+
+    def test_sink_col_points_at_first_compressed_block_when_present(self):
+        seqlen, window_size, ratio = 32, 8, 4
+        topk = self._hca_topk_idxs(seqlen, window_size, ratio)
+        bounds = self.qk.sparse_bounds_from_topk(topk, seqlen)
+        sink = bounds["sink_col"][0]
+        # Row 0 sees no compressed block yet -> falls back to the window start.
+        self.assertEqual(int(sink[0]), 0)
+        # Later rows summarise sequence start via compressed block 0 (== seqlen).
+        self.assertEqual(int(sink[seqlen - 1]), seqlen)
+
+    def test_exactness_below_one_for_non_contiguous_topk(self):
+        """A learned indexer selects a sparse compressed subset; flag it."""
+        seqlen = 8
+        window = paddle.arange(seqlen).unsqueeze(1).astype("int32")
+        # Compressed picks blocks 0 and 3 only -> span 4, live 2.
+        compressed = paddle.to_tensor([[seqlen, seqlen + 3]] * seqlen, dtype="int32")
+        topk = paddle.concat([window, compressed], axis=-1).unsqueeze(0)
+        bounds = self.qk.sparse_bounds_from_topk(topk, seqlen)
+        self.assertLess(float(bounds["exactness"]), 1.0)
+
+
+class SparseQKKernelComputeTest(unittest.TestCase):
+    """GPU numerical test: sparse kernel == explicit masked softmax reference."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not paddle.device.is_compiled_with_cuda() or paddle.device.cuda.device_count() == 0:
+            raise unittest.SkipTest("qk_stats kernel requires a CUDA GPU")
+        paddle.device.set_device("gpu:0")
+        cls.qk = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor")
+
+    @staticmethod
+    def _reference_stats(query, kv_full, topk_idxs, scale, attn_sink):
+        """Dense reference: one softmax over exactly the listed keys (+ sink)."""
+        b, s, h, d = query.shape
+        s_k = kv_full.shape[1]
+        logits = paddle.matmul(query.transpose([0, 2, 1, 3]), kv_full.unsqueeze(1), transpose_y=True)
+        logits = logits * scale  # [B, H, S, S_k]
+
+        allowed = paddle.zeros([b, s, s_k], dtype="bool")
+        for bi in range(b):
+            for row in range(s):
+                for col in topk_idxs[bi, row].tolist():
+                    if col >= 0:
+                        allowed[bi, row, int(col)] = True
+        mask = allowed.unsqueeze(1)
+
+        neg = paddle.full_like(logits, -1e10)
+        masked = paddle.where(mask, logits, neg)
+        row_max = masked.max(axis=-1, keepdim=True)
+        exp = paddle.where(mask, paddle.exp(masked - row_max), paddle.zeros_like(masked))
+        denom = exp.sum(axis=-1, keepdim=True)
+        if attn_sink is not None:
+            sink_logit = attn_sink.reshape([1, h, 1, 1])
+            denom = denom + paddle.exp(sink_logit - row_max)
+        probs = exp / denom
+        entropy = -(probs * paddle.log(probs.clip(min=1e-30))).sum(axis=-1)
+        if attn_sink is not None:
+            p_sink = paddle.exp(attn_sink.reshape([1, h, 1, 1]) - row_max) / denom
+            p_sink = p_sink.squeeze(-1)
+            entropy = entropy - (p_sink * paddle.log(p_sink.clip(min=1e-30)))
+        return {
+            "entropy_per_head": entropy.mean(axis=-1),
+            "max_per_head": masked.max(axis=-1).max(axis=-1),
+        }
+
+    def _hca_case(self, seqlen=32, window_size=8, ratio=4, heads=2, dim=32, seed=7):
+        paddle.seed(seed)
+        n_compressed = seqlen // ratio
+        query = paddle.randn([1, seqlen, heads, dim], dtype="float32")
+        kv_full = paddle.randn([1, seqlen + n_compressed, dim], dtype="float32")
+        topk = _build_hca_topk_idxs(seqlen, window_size, ratio)
+        return query, kv_full, topk
+
+    def test_sparse_stats_match_masked_reference(self):
+        query, kv_full, topk = self._hca_case()
+        scale = float(query.shape[-1]) ** -0.5
+        stats, exactness = self.qk.compute_qk_stats_sparse_paddle(
+            query, kv_full, topk, scale, attn_sink=None, row_stride=1
+        )
+        ref = self._reference_stats(query, kv_full, topk, scale, None)
+        self.assertAlmostEqual(float(exactness), 1.0, places=5)
+        self.assertTrue(
+            paddle.allclose(stats["entropy_per_head"], ref["entropy_per_head"], atol=1e-3, rtol=1e-3).item(),
+            f"entropy mismatch: {stats['entropy_per_head']} vs {ref['entropy_per_head']}",
+        )
+        self.assertTrue(
+            paddle.allclose(stats["max_per_head"], ref["max_per_head"], atol=1e-3, rtol=1e-3).item()
+        )
+
+    def test_attn_sink_lowers_entropy_and_is_folded_into_denominator(self):
+        query, kv_full, topk = self._hca_case(seed=11)
+        scale = float(query.shape[-1]) ** -0.5
+        heads = query.shape[2]
+        sink = paddle.full([heads], 5.0, dtype="float32")  # dominant sink logit
+
+        no_sink, _ = self.qk.compute_qk_stats_sparse_paddle(
+            query, kv_full, topk, scale, attn_sink=None, row_stride=1
+        )
+        with_sink, _ = self.qk.compute_qk_stats_sparse_paddle(
+            query, kv_full, topk, scale, attn_sink=sink, row_stride=1
+        )
+        ref = self._reference_stats(query, kv_full, topk, scale, sink)
+
+        self.assertTrue(
+            paddle.allclose(with_sink["entropy_per_head"], ref["entropy_per_head"], atol=1e-3, rtol=1e-3).item(),
+            f"entropy with sink mismatch: {with_sink['entropy_per_head']} vs {ref['entropy_per_head']}",
+        )
+        # A dominant sink absorbs probability mass, so real-key entropy drops.
+        self.assertLess(
+            float(with_sink["entropy_global"]),
+            float(no_sink["entropy_global"]),
+        )
+        # The sink is not a real key, so logit max/mean must be unchanged.
+        self.assertTrue(
+            paddle.allclose(with_sink["max_per_head"], no_sink["max_per_head"], atol=1e-6).item()
+        )
 
 
 if __name__ == "__main__":

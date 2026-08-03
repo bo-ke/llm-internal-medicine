@@ -485,13 +485,13 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             combined = layer.combined.detach().reshape(-1, L).float()
             want_rms = float(combined.square().mean().sqrt())
             per_channel_max = combined.abs().amax(dim=0)
-            want_ratio = float(per_channel_max.max() / per_channel_max.mean())
+            want_ratio = float(per_channel_max.max() / per_channel_max.median())
             self.assertAlmostEqual(latest["moe_health/layer_0/latent_combine_rms"], want_rms, places=5)
             self.assertAlmostEqual(
-                latest["moe_health/layer_0/latent_combine_channel_max_mean_ratio"], want_ratio, places=5
+                latest["moe_health/layer_0/latent_combine_channel_max_median_ratio"], want_ratio, places=5
             )
             self.assertIn("moe_health/global_latent_combine_rms", latest)
-            self.assertIn("moe_health/global_latent_combine_channel_max_mean_ratio", latest)
+            self.assertIn("moe_health/global_latent_combine_channel_max_median_ratio", latest)
         finally:
             monitor.remove_hooks()
 
@@ -533,7 +533,7 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             layer(torch.randn(S, B, H), expert_outputs=[flat], probs=[1.0])
             monitor.step()
             ratio_flat = training_logs.get_latest(prefix="moe_health")[
-                "moe_health/layer_0/latent_combine_channel_max_mean_ratio"
+                "moe_health/layer_0/latent_combine_channel_max_median_ratio"
             ]
             self.assertAlmostEqual(ratio_flat, 1.0, places=5)
 
@@ -543,10 +543,13 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             layer(torch.randn(S, B, H), expert_outputs=[spiked], probs=[1.0])
             monitor.step()
             ratio_spiked = training_logs.get_latest(prefix="moe_health")[
-                "moe_health/layer_0/latent_combine_channel_max_mean_ratio"
+                "moe_health/layer_0/latent_combine_channel_max_median_ratio"
             ]
-            # per-channel maxima = [100, 1, 1, 1] -> mean 25.75 -> ratio ~3.88
-            self.assertAlmostEqual(ratio_spiked, 100.0 / (103.0 / 4), places=4)
+            # per-channel maxima = [100, 1, 1, 1]; torch.median takes the lower middle
+            # value of the sorted [1, 1, 1, 100] => 1.0, so the ratio is the full 100.
+            # A mean denominator would give 100/25.75 ~= 3.88 — the spike inflating its
+            # own denominator, which is exactly why median is the right choice here.
+            self.assertAlmostEqual(ratio_spiked, 100.0, places=4)
             self.assertGreater(ratio_spiked, ratio_flat)
         finally:
             monitor.remove_hooks()
@@ -575,7 +578,7 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         """The ratio is a max-over-tokens of a per-channel peak, so cross-rank
         composition must use max, not mean (it lacks a _max suffix, so it has to be
         listed in MAX_AGGREGATED / MAX_AGGREGATED_SUFFIXES explicitly)."""
-        name = "latent_combine_channel_max_mean_ratio"
+        name = "latent_combine_channel_max_median_ratio"
         self.assertIn(name, MoESpecialistMonitor.MAX_AGGREGATED)
         self.assertTrue(training_logs._is_max_metric(f"moe_health/layer_0/{name}"))
         self.assertTrue(training_logs._is_max_metric(f"moe_health/global_{name}"))

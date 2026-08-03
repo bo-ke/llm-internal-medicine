@@ -74,13 +74,13 @@ _EXPERT_METRICS = (
 # ``fc2_latent_proj``'s forward pre-hook, which sees exactly that tensor.
 _LATENT_COMBINE_METRICS = (
     "latent_combine_rms",
-    "latent_combine_channel_max_mean_ratio",
+    "latent_combine_channel_max_median_ratio",
 )
 
 
 class MoESpecialistMonitor(TorchProbe):
     METRIC_PREFIX = "moe_health"
-    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max", "latent_combine_channel_max_mean_ratio"}
+    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max", "latent_combine_channel_max_median_ratio"}
     MIN_AGGREGATED = {"score_sum_min", "expert_norm_min"}
 
     def __init__(

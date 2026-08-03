@@ -22,7 +22,7 @@ MAX_AGGREGATED_SUFFIXES = (
     "activation_rms",
     # max-over-tokens of a per-channel peak: compose across token-partitioned ranks
     # with max, not mean (it does not end in _max, so it needs listing here).
-    "latent_combine_channel_max_mean_ratio",
+    "latent_combine_channel_max_median_ratio",
 )
 
 

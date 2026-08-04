@@ -224,6 +224,7 @@ def qk_stats_partial_kernel(
     # Pointers
     Q_ptr,
     K_ptr,
+    attn_sink_ptr,
     partial_max_ptr,
     partial_sum_logit_ptr,
     partial_sum_row_mean_ptr,
@@ -257,6 +258,7 @@ def qk_stats_partial_kernel(
     # Configs
     scale: tl.constexpr,
     apply_causal_mask: tl.constexpr,
+    HAS_SINK: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -270,6 +272,13 @@ def qk_stats_partial_kernel(
     Asymmetric Q/K seq lens (for CP): ``seq_len_q`` may be smaller than
     ``seq_len_k``. Row m in Q corresponds to *global* row ``m + q_row_offset``
     which is used only for causal masking against K columns.
+
+    ``HAS_SINK``: fold a learned per-head sink logit (``attn_sink_ptr``, one
+    scalar per query head) into the same softmax. Full-attention layers carry it
+    as ``core_attention.softmax_offset`` and hand it to their kernel as
+    ``learnable_sink``; ``off-by-one`` softmax is the same thing with the logit
+    pinned to 0. Without this the reported distribution is renormalised over the
+    real keys only, which is not the distribution the model computes.
     """
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -367,6 +376,23 @@ def qk_stats_partial_kernel(
         d_i = d_new
         h_i = h_new
         s_i = s_new
+
+    # Fold the sink logit into the same softmax. It is an extra key-less column,
+    # so it changes the denominator (and therefore entropy and sink) but is
+    # deliberately excluded from logit max/mean, which describe real keys. Same
+    # rescale as the in-loop update: shifting the max by (m_i - m_new) moves h by
+    # (m_i - m_new) * d, so h must be updated from the old d.
+    if HAS_SINK:
+        sink_logit = tl.load(attn_sink_ptr + head_idx).to(tl.float32)
+        m_new = tl.maximum(m_i, sink_logit)
+        alpha_prev = tl.exp(m_i - m_new)
+        h_i = (h_i + (m_i - m_new) * d_i) * alpha_prev
+        d_i = d_i * alpha_prev
+        s_i = s_i * alpha_prev
+        sink_w = tl.exp(sink_logit - m_new)
+        d_i = d_i + sink_w
+        h_i = h_i + sink_w * (sink_logit - m_new)
+        m_i = m_new
 
     # Finalize per-row stats for this M-block
     safe_d = tl.where(d_i > 0, d_i, 1.0)

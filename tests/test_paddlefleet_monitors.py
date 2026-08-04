@@ -665,6 +665,97 @@ def _build_hca_topk_idxs(seqlen, window_size, ratio):
     return paddle.concat([window, compressed], axis=-1).unsqueeze(0).astype("int32")
 
 
+class DenseSinkFoldTest(unittest.TestCase):
+    """The learned sink is a real softmax column and must be folded in.
+
+    Full-attention layers hand ``core_attention.softmax_offset`` to their kernel as
+    ``learnable_sink``, so the model's distribution spans ``real keys + 1``. Folding
+    it into the stats kernel is what makes entropy/sink describe that distribution
+    instead of one renormalised over the real keys only.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not paddle.device.is_compiled_with_cuda() or paddle.device.cuda.device_count() == 0:
+            raise unittest.SkipTest("qk_stats kernel requires a CUDA GPU")
+        paddle.device.set_device("gpu:0")
+        cls.qk = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor")
+
+    @staticmethod
+    def _inputs(B=1, S=64, Hq=4, Hkv=2, D=32, seed=7):
+        paddle.seed(seed)
+        q = paddle.randn([B, S, Hq, D], dtype="float32")
+        k = paddle.randn([B, S, Hkv, D], dtype="float32")
+        return q, k
+
+    @staticmethod
+    def _reference(q, k, sink):
+        """Materialized [S, S(+1)] softmax reference: entropy and col-0 probability."""
+        B, S, Hq, D = q.shape
+        heads_per_group = Hq // k.shape[2]
+        qh = q.transpose([0, 2, 1, 3])
+        kh = k.transpose([0, 2, 1, 3]).repeat_interleave(heads_per_group, axis=1)
+        logits = paddle.matmul(qh, kh, transpose_y=True) / (D**0.5)  # [B, Hq, S, S]
+
+        causal = paddle.tril(paddle.ones([S, S], dtype="bool"))
+        logits = paddle.where(causal, logits, paddle.full_like(logits, -1e10))
+
+        if sink is not None:
+            sink_col = sink.reshape([1, Hq, 1, 1]).expand([B, Hq, S, 1])
+            logits = paddle.concat([logits, sink_col], axis=-1)
+
+        probs = paddle.nn.functional.softmax(logits, axis=-1)
+        entropy = -(probs * paddle.log(paddle.clip(probs, min=1e-30))).sum(axis=-1)  # [B, Hq, S]
+        return entropy.mean(axis=-1), probs[..., 0].mean(axis=-1)  # both [B, Hq]
+
+    def test_folded_stats_match_materialized_reference(self):
+        q, k = self._inputs()
+        sink = paddle.to_tensor([0.5, -1.0, 2.0, 0.0], dtype="float32")
+
+        stats = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1, attn_sink=sink)
+        ref_entropy, ref_sink = self._reference(q, k, sink)
+
+        self.assertTrue(
+            paddle.allclose(stats["entropy_per_head"], ref_entropy, atol=1e-3, rtol=1e-3).item(),
+            f"entropy: kernel={stats['entropy_per_head'].numpy()} ref={ref_entropy.numpy()}",
+        )
+        self.assertTrue(
+            paddle.allclose(stats["sink_per_head"], ref_sink, atol=1e-3, rtol=1e-3).item(),
+            f"sink: kernel={stats['sink_per_head'].numpy()} ref={ref_sink.numpy()}",
+        )
+
+    def test_without_sink_matches_real_key_only_reference(self):
+        """attn_sink=None keeps the pre-existing (real-key-only) semantics."""
+        q, k = self._inputs()
+        stats = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
+        ref_entropy, ref_sink = self._reference(q, k, None)
+
+        self.assertTrue(paddle.allclose(stats["entropy_per_head"], ref_entropy, atol=1e-3, rtol=1e-3).item())
+        self.assertTrue(paddle.allclose(stats["sink_per_head"], ref_sink, atol=1e-3, rtol=1e-3).item())
+
+    def test_zero_sink_still_changes_the_distribution(self):
+        """"off-by-one" softmax: a frozen 0 logit still adds exp(0) to the denominator."""
+        q, k = self._inputs()
+        zeros = paddle.zeros([q.shape[2]], dtype="float32")
+
+        without = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
+        with_zero = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1, attn_sink=zeros)
+
+        # Extra column takes probability mass, so col-0 probability must drop.
+        self.assertLess(with_zero["sink_global"].item(), without["sink_global"].item())
+        # logit max/mean describe real keys only and must be untouched by the fold.
+        self.assertAlmostEqual(with_zero["max_global"].item(), without["max_global"].item(), places=4)
+        self.assertAlmostEqual(with_zero["mean_global"].item(), without["mean_global"].item(), places=4)
+
+    def test_large_sink_dominates_and_collapses_entropy(self):
+        q, k = self._inputs()
+        huge = paddle.full([q.shape[2]], 50.0, dtype="float32")
+        stats = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1, attn_sink=huge)
+        # Nearly all mass on the sink column -> entropy ~ 0, real-key sink ~ 0.
+        self.assertLess(stats["entropy_global"].item(), 1e-3)
+        self.assertLess(stats["sink_global"].item(), 1e-3)
+
+
 class CompressRatioLayerClassificationTest(unittest.TestCase):
     """Per-layer attention-kind classification on ``csa_compress_ratios`` stacks."""
 

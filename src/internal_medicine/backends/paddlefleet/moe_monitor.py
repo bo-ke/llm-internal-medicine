@@ -46,6 +46,12 @@ def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=
         k: num_experts_per_tok
         n_group / topk_group: group-limited topk params
 
+    Group score is the sum of the group's top-2 experts, mirroring a literal in both
+    router paths (``moe_router.TopKRouter`` and ``moe_topk_fusion``'s ``m1 + m2``);
+    a group max would pick different groups and read < 1 even with an all-zero bias.
+    Follow the router if it ever parameterises that 2. ``min(2, group_size)`` is only
+    a shape guard.
+
     Returns:
         mean Jaccard similarity (1 = identical routing, 0 = completely different)
     """
@@ -54,8 +60,8 @@ def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=
     if n_group > 1 and topk_group >= 1:
         group_size = num_experts // n_group
         gates_reshaped = gates_no_bias.reshape([num_tokens, n_group, group_size])
-        group_max = gates_reshaped.max(axis=-1)
-        _, top_groups = paddle.topk(group_max, topk_group, axis=-1)
+        group_scores = gates_reshaped.topk(min(2, group_size), axis=-1)[0].sum(axis=-1)
+        _, top_groups = paddle.topk(group_scores, topk_group, axis=-1)
         group_mask = paddle.zeros([num_tokens, n_group], dtype="int32")
         group_mask = group_mask.put_along_axis(top_groups, paddle.to_tensor(1, dtype="int32"), axis=1)
         group_mask = group_mask.unsqueeze(-1).expand([-1, -1, group_size]).reshape([num_tokens, num_experts])

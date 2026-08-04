@@ -19,6 +19,7 @@ PaddleMassiveActivationMonitor = importlib.import_module(
     "internal_medicine.backends.paddlefleet.massive_activation_monitor"
 ).PaddleMassiveActivationMonitor
 PaddleMoEMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor").PaddleMoEMonitor
+moe_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
 PaddleQKStatsMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor").PaddleQKStatsMonitor
 paddlefleet_backend = importlib.import_module("internal_medicine.backends.paddlefleet")
 layer_discovery = importlib.import_module("internal_medicine.backends.paddlefleet.layer_discovery")
@@ -462,6 +463,97 @@ class SplitFeatureRoutingCaptureTest(unittest.TestCase):
         gate.gate_score_func(logits)
 
         self.assertTrue(paddle.allclose(gate._cached_gates, two_views, atol=1e-6).item())
+
+
+class BiasAffinityJaccardTest(unittest.TestCase):
+    """The bias-free branch must mirror the router's group-limited topk exactly.
+
+    PaddleFleet scores a group by the sum of its top-2 experts (tensor path
+    ``moe_router.TopKRouter``, fused path ``moe_topk_fusion``: ``score = m1 + m2``).
+    Using a group max instead selects different groups, so the metric would report
+    routing divergence even with an all-zero correction bias.
+    """
+
+    @staticmethod
+    def _router_topk(scores, k, n_group, topk_group):
+        """Reference: the router's own selection (group score = top-2 sum)."""
+        num_tokens, num_experts = scores.shape
+        group_size = num_experts // n_group
+        grouped = scores.reshape([num_tokens, n_group, group_size])
+        group_scores = grouped.topk(2, axis=-1)[0].sum(axis=-1)
+        _, top_groups = paddle.topk(group_scores, topk_group, axis=-1)
+        mask = paddle.zeros([num_tokens, n_group], dtype="int32")
+        mask = mask.put_along_axis(top_groups, paddle.to_tensor(1, dtype="int32"), axis=1)
+        mask = mask.unsqueeze(-1).expand([-1, -1, group_size]).reshape([num_tokens, num_experts])
+        masked = paddle.where(mask > 0, scores, paddle.full_like(scores, float("-inf")))
+        return paddle.topk(masked, k, axis=-1)[1]
+
+    def test_zero_bias_gives_identical_routing(self):
+        """correction_bias is zero-initialised, so step 1 must read exactly 1.0."""
+        paddle.seed(0)
+        scores = paddle.rand([16, 8], dtype="float32")
+        k, n_group, topk_group = 2, 2, 1
+
+        top_idx = self._router_topk(scores, k, n_group, topk_group)
+        jaccard = moe_monitor_module._compute_bias_affinity_jaccard(top_idx, scores, k, n_group, topk_group)
+        self.assertAlmostEqual(float(jaccard), 1.0, places=6)
+
+    def test_group_score_uses_top2_sum_not_max(self):
+        """A case where max and top-2 sum disagree on which group wins.
+
+        group0 has the single strongest expert, group1 the stronger pair:
+        max picks group0, top-2 sum picks group1. The router picks group1, so a
+        max-based reimplementation would score 0 here instead of 1.
+        """
+        scores = paddle.to_tensor(
+            [[0.90, 0.05, 0.03, 0.02, 0.80, 0.70, 0.05, 0.05]],
+            dtype="float32",
+        )
+        k, n_group, topk_group = 2, 2, 1
+
+        top_idx = self._router_topk(scores, k, n_group, topk_group)
+        # Sanity: the router really did take group1 (experts 4 and 5).
+        self.assertEqual(sorted(top_idx.numpy().flatten().tolist()), [4, 5])
+
+        jaccard = moe_monitor_module._compute_bias_affinity_jaccard(top_idx, scores, k, n_group, topk_group)
+        self.assertAlmostEqual(float(jaccard), 1.0, places=6)
+
+    def test_nonzero_bias_lowers_the_score(self):
+        """With a bias that flips the winning group, the score must drop below 1."""
+        scores = paddle.to_tensor(
+            [[0.90, 0.80, 0.05, 0.05, 0.40, 0.30, 0.05, 0.05]],
+            dtype="float32",
+        )
+        bias = paddle.to_tensor([0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], dtype="float32")
+        k, n_group, topk_group = 2, 2, 1
+
+        top_idx = self._router_topk(scores + bias, k, n_group, topk_group)
+        jaccard = moe_monitor_module._compute_bias_affinity_jaccard(top_idx, scores, k, n_group, topk_group)
+        self.assertAlmostEqual(float(jaccard), 0.0, places=6)
+
+    def test_ungrouped_router_path(self):
+        paddle.seed(1)
+        scores = paddle.rand([8, 6], dtype="float32")
+        top_idx = paddle.topk(scores, 3, axis=-1)[1]
+        jaccard = moe_monitor_module._compute_bias_affinity_jaccard(top_idx, scores, 3, n_group=1, topk_group=1)
+        self.assertAlmostEqual(float(jaccard), 1.0, places=6)
+
+    def test_single_expert_groups_do_not_crash(self):
+        """group_size == 1 has no second expert to add; top-2 clamps to top-1."""
+        scores = paddle.to_tensor([[0.9, 0.1, 0.5, 0.4]], dtype="float32")
+        k, n_group, topk_group = 2, 4, 2
+        num_tokens, num_experts = scores.shape
+        grouped = scores.reshape([num_tokens, n_group, num_experts // n_group])
+        _, top_groups = paddle.topk(grouped.squeeze(-1), topk_group, axis=-1)
+        mask = paddle.zeros([num_tokens, n_group], dtype="int32")
+        mask = mask.put_along_axis(top_groups, paddle.to_tensor(1, dtype="int32"), axis=1)
+        masked = paddle.where(mask > 0, scores, paddle.full_like(scores, float("-inf")))
+        top_idx = paddle.topk(masked, k, axis=-1)[1]
+
+        jaccard = moe_monitor_module._compute_bias_affinity_jaccard(top_idx, scores, k, n_group, topk_group)
+        self.assertAlmostEqual(float(jaccard), 1.0, places=6)
+
+
 
 
 class PaddleMassiveActivationMonitorTest(unittest.TestCase):

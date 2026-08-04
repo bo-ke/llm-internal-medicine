@@ -3,7 +3,7 @@
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
 包含五大监控模块：
-- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (18 指标)
+- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (19 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
@@ -172,6 +172,7 @@ setup_internal_medicine()
 | 16 | `load_cv` | `moe_health/.../load_cv` | `std(tokens) / mean(tokens)` | 每层+全局 | 专家负载变异系数 (均衡=0) |
 | 17 | `latent_combine_rms` | `moe_health/.../latent_combine_rms` | `rms(combine_postprocess 输出)` | 每层+全局 (max 聚合) | k-way combine 之后（上投影/归一化之前）的整体幅度 |
 | 18 | `latent_combine_channel_max_median_ratio` | `moe_health/.../latent_combine_channel_max_median_ratio` | `max_c / median_c` (per-channel \|max\|) | 每层+全局 (max 聚合) | 同一张量的 latent 通道集中度 (massive-activation 前兆) |
+| 19 | `combine_coef_max_median_ratio` | `moe_health/.../combine_coef_max_median_ratio` | `mean_t(max(coef_t) / median(coef_t))` | 每层+全局 | k-way combine 系数的尖锐度: 1.0=k 个专家等权, 越大=单专家主导 (退化成 top-1) |
 
 > **注**: 指标 14-16 (`load_*`) 在满足以下**任一**条件时输出, 优先使用前者:
 > 1. `global_aux_loss` 已开启 (`get_aux_loss_coeff("global_aux_loss") > 0`): 复用
@@ -207,6 +208,16 @@ setup_internal_medicine()
 > `_max` 结尾, 不会被自动识别）。分母用 **median** 与 `massive_act/channel_max_ratio` 保持
 > 一致, 两者可直接横向对比; 且 median 对本指标要抓的离群通道稳健 —— 用 mean 会被尖峰
 > 自身抬高分母, 反而压掉信号。
+>
+> **注**: 指标 19 (`combine_coef_max_median_ratio`) 量的是 combine **系数**本身有多尖,
+> 与 17-18 量的"combine **结果**有多大"互补。取 router forward 的最终 `probs`
+> (`outputs[0]`) 里每个 token 的 topk 个非零系数, 先按 token 算 `max/median`, 再对 token
+> 取 **mean** —— 这里刻意用 mean 而不是 max: 它已经是对 token 分布的汇总, 关心的是"典型
+> token 有多尖", 少数几个高置信 token 不该把曲线拉走。
+>
+> 不用 `_cached_scores_for_aux_loss`: 那是 pre-topk 的 aux-loss 分数, 没走
+> 重归一化 / scaling / token-dropping, 不是 dispatcher 真正拿去加权的系数。
+> `topk == 1` 时 max 恒等于 median, 该指标退化为常数 1.0, 因此**不上报**。
 
 ### 健康阈值
 
@@ -222,6 +233,8 @@ setup_internal_medicine()
 | | 持续上升 | WARNING | 少数 latent 通道开始主导 combine 输出 (massive activation 前兆) |
 | `latent_combine_rms` | 平稳 | OK | combine 输出幅度稳定 |
 | | 随 step 单调上升 | WARNING | combine 侧幅度累积, 关注下游 `fc2_latent_proj` 与残差流放大 |
+| `combine_coef_max_median_ratio` | ~1 ~ 数倍 | OK | k 个专家有实质混合 |
+| | 持续上升并远大于 topk | WARNING | 单专家主导 combine, MoE 实际退化为 top-1, topk 的算力白付 |
 
 ---
 
@@ -431,6 +444,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MoE** | `load_cv` | `std/mean(tokens)` | mean | 越接近 0 越均衡 (global_aux_loss 或 expert_bias) |
 | **MoE** | `latent_combine_rms` | `rms(combine_postprocess 输出)` | max | 平稳 (仅 latent-MoE) |
 | **MoE** | `latent_combine_channel_max_median_ratio` | `max_c/median_c(per-channel \|max\|)` | max | 越接近 1 越均匀 (仅 latent-MoE) |
+| **MoE** | `combine_coef_max_median_ratio` | `mean_t(max/median(topk coefs))` | mean | 1=等权混合, 越大越接近 top-1 (topk>1 才上报) |
 | **QK** | `max` | `max(QK^T/√d)` | max | 不应暴增 |
 | **QK** | `mean` | `mean(logits)` | mean | 稳定 |
 | **QK** | `entropy_avg` | `-Σ(p log p)` avg | mean | 适中 |

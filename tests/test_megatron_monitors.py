@@ -263,6 +263,9 @@ class FakeLatentMoELayer(nn.Module):
 
     def forward(self, hidden_states, expert_outputs=None, probs=None):
         latent = self.fc1_latent_proj(hidden_states)
+        # mcore's MoELayer.route() runs the router first; do the same so the monitor's
+        # router forward hook fires on this fixture too.
+        self.router(latent)
         if expert_outputs is None:
             # topk expert outputs in latent dim; combine with uniform weights.
             expert_outputs = [latent for _ in range(self.topk)]
@@ -508,6 +511,115 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         finally:
             monitor.remove_hooks()
             fmg.get_updated_expert_bias = original
+
+    # ---------------- combine-coefficient sharpness ----------------
+
+    def _sharpness_monitor(self):
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        for name in moe_monitor_module._ROUTER_METRICS:
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+        return monitor
+
+    def test_combine_coef_sharpness_is_mean_over_tokens_of_max_over_median(self):
+        """Per-token max/median over the topk combine coefficients, then MEAN over
+        tokens: token 0 is an even 2-way split (ratio 1.0), token 1 is dominated by one
+        expert (0.9/0.1 = 9.0), so the reported value is their mean."""
+        monitor = self._sharpness_monitor()
+        probs = torch.tensor(
+            [
+                [0.5, 0.5, 0.0, 0.0],
+                [0.9, 0.1, 0.0, 0.0],
+            ]
+        )
+        router = SimpleNamespace(topk=2, _cached_scores_for_aux_loss=None)
+        monitor._compute_router_metrics(0, router, (probs, None), None)
+        monitor.step()
+        got = training_logs.get_latest(prefix="moe_health")["moe_health/layer_0/combine_coef_max_median_ratio"]
+        self.assertAlmostEqual(got, (1.0 + 9.0) / 2, places=5)
+
+    def test_combine_coef_sharpness_is_one_for_uniform_combine(self):
+        """A perfectly even k-way blend must read exactly 1.0 — the calibration point."""
+        monitor = self._sharpness_monitor()
+        probs = torch.zeros(6, 8)
+        probs[:, :4] = 0.25  # 4 experts, equal coefficients
+        router = SimpleNamespace(topk=4, _cached_scores_for_aux_loss=None)
+        monitor._compute_router_metrics(0, router, (probs, None), None)
+        monitor.step()
+        got = training_logs.get_latest(prefix="moe_health")["moe_health/layer_0/combine_coef_max_median_ratio"]
+        self.assertAlmostEqual(got, 1.0, places=5)
+
+    def test_combine_coef_sharpness_grows_as_routing_peaks(self):
+        monitor = self._sharpness_monitor()
+        soft = torch.tensor([[0.4, 0.35, 0.25, 0.0]])
+        router = SimpleNamespace(topk=3, _cached_scores_for_aux_loss=None)
+        monitor._compute_router_metrics(0, router, (soft, None), None)
+        monitor.step()
+        soft_val = training_logs.get_latest(prefix="moe_health")["moe_health/layer_0/combine_coef_max_median_ratio"]
+
+        training_logs.reset()
+        monitor = self._sharpness_monitor()
+        peaked = torch.tensor([[0.96, 0.03, 0.01, 0.0]])
+        monitor._compute_router_metrics(0, router, (peaked, None), None)
+        monitor.step()
+        peaked_val = training_logs.get_latest(prefix="moe_health")["moe_health/layer_0/combine_coef_max_median_ratio"]
+
+        self.assertAlmostEqual(soft_val, 0.4 / 0.35, places=5)
+        self.assertAlmostEqual(peaked_val, 0.96 / 0.03, places=4)
+        self.assertGreater(peaked_val, soft_val)
+
+    def test_combine_coef_sharpness_reads_router_probs_not_aux_scores(self):
+        """The coefficients are the router's FINAL probs (outputs[0]). The cached
+        aux-loss scores are pre-topk and skip renormalisation/scaling, so using them
+        would report a different number — pin that we use the right tensor."""
+        monitor = self._sharpness_monitor()
+        probs = torch.tensor([[0.8, 0.2, 0.0, 0.0]])  # ratio 4.0
+        aux_scores = torch.tensor([[0.3, 0.3, 0.2, 0.2]])  # would give ratio 1.0
+        router = SimpleNamespace(topk=2, _cached_scores_for_aux_loss=aux_scores)
+        monitor._compute_router_metrics(0, router, (probs, None), None)
+        monitor.step()
+        got = training_logs.get_latest(prefix="moe_health")["moe_health/layer_0/combine_coef_max_median_ratio"]
+        self.assertAlmostEqual(got, 4.0, places=5)
+
+    def test_combine_coef_sharpness_skipped_at_topk_1(self):
+        """At topk == 1 max == median identically, so the metric would be a constant
+        1.0 carrying no information — it must not be emitted at all."""
+        monitor = self._sharpness_monitor()
+        probs = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        router = SimpleNamespace(topk=1, _cached_scores_for_aux_loss=None)
+        monitor._compute_router_metrics(0, router, (probs, None), None)
+        monitor.step()
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertNotIn("moe_health/layer_0/combine_coef_max_median_ratio", latest)
+
+    def test_combine_coef_sharpness_is_mean_aggregated(self):
+        """Unlike the latent-combine metrics, this one is MEAN-composed: it already
+        summarises a distribution over tokens, and the ask is the typical token."""
+        name = "combine_coef_max_median_ratio"
+        self.assertNotIn(name, MoESpecialistMonitor.MAX_AGGREGATED)
+        self.assertNotIn(name, MoESpecialistMonitor.MIN_AGGREGATED)
+        self.assertFalse(training_logs._is_max_metric(f"moe_health/layer_0/{name}"))
+        self.assertFalse(training_logs._is_min_metric(f"moe_health/layer_0/{name}"))
+
+    def test_combine_coef_sharpness_end_to_end_through_router_hook(self):
+        """Fires through the real forward-hook path, not a direct _compute call."""
+        S, B, H, L, E = 4, 1, 8, 6, 4
+        layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
+        layer.router.topk = 2
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            layer(torch.randn(S, B, H))
+            monitor.step()
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertIn("moe_health/layer_0/combine_coef_max_median_ratio", latest)
+            self.assertIn("moe_health/global_combine_coef_max_median_ratio", latest)
+            self.assertGreaterEqual(latest["moe_health/layer_0/combine_coef_max_median_ratio"], 1.0)
+        finally:
+            monitor.remove_hooks()
 
     # ---------------- latent-combine magnitude ----------------
 

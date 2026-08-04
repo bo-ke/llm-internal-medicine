@@ -15,6 +15,7 @@ from ...core.training_logs import training_logs
 from .base import TorchProbe
 from .moe_metrics import (
     compute_bias_affinity_jaccard,
+    compute_combine_coef_sharpness,
     compute_expert_norms,
     compute_latent_combine_stats,
     compute_load_balance_ratios,
@@ -40,6 +41,12 @@ _ROUTER_METRICS = (
     "expert_bias_mean",
     "expert_bias_std",
     "bias_affinity_jaccard",
+    # Sharpness of the k-way combine coefficients: per-token max/median over the topk
+    # router probs, then MEAN over tokens (so it describes the typical token, not the
+    # worst). 1.0 = experts contribute equally; large = one expert dominates and the
+    # layer is effectively top-1. Declared for every router but only recorded when
+    # topk > 1 (at topk == 1 max == median identically).
+    "combine_coef_max_median_ratio",
 )
 
 # Emitted from globally-reduced per-expert token counts. Two sources, no
@@ -520,6 +527,20 @@ class MoESpecialistMonitor(TorchProbe):
                 self.record_layer_metric(layer_idx, "score_sum_mean", stats["score_sum_mean"])
                 self.record_layer_metric(layer_idx, "score_sum_min", stats["score_sum_min"])
                 self.record_layer_metric(layer_idx, "score_sum_max", stats["score_sum_max"])
+
+        # Combine-coefficient sharpness, from the router's FINAL probs (outputs[0]) —
+        # the tensor whose non-zeros the dispatcher uses as combine weights. Not from
+        # _cached_scores_for_aux_loss: those are the pre-topk aux-loss scores, which skip
+        # renormalisation / scaling / token-dropping and so are not the actual
+        # coefficients. Meaningless at topk == 1 (max == median), so skipped there.
+        if topk is not None and topk > 1:
+            probs = outputs[0] if isinstance(outputs, tuple | list) and outputs else outputs
+            if isinstance(probs, torch.Tensor) and probs.dim() >= 2:
+                self.record_layer_metric(
+                    layer_idx,
+                    "combine_coef_max_median_ratio",
+                    compute_combine_coef_sharpness(probs, topk),
+                )
 
         if hasattr(router, "expert_bias") and router.expert_bias is not None:
             self.record_layer_metric(layer_idx, "expert_bias_mean", router.expert_bias.mean())

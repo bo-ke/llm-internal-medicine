@@ -190,6 +190,42 @@ def compute_shared_expert_norm(shared_expert_weights: list[torch.Tensor]) -> tor
     return all_params.float().norm()
 
 
+def compute_combine_coef_sharpness(probs: torch.Tensor, topk: int) -> torch.Tensor:
+    """Per-token sharpness of the k-way combine coefficients, averaged over tokens.
+
+    ``probs`` is the router's output: ``[num_tokens, num_experts]``, sparse, with exactly
+    ``topk`` non-zero entries per token — those non-zeros ARE the coefficients the
+    dispatcher uses to weight expert outputs during combine. For each token::
+
+        ratio_t = max(coef_t) / median(coef_t)      # over the topk coefficients
+
+    and the returned scalar is ``mean_t(ratio_t)``.
+
+    Read it as how peaked the combine is: ``1.0`` means the k experts contribute equally
+    (a true k-way blend), while a large value means one expert dominates and the MoE is
+    effectively behaving as top-1 despite paying for topk. Because the reduction over
+    tokens is a MEAN, this reports the typical token rather than the worst one — a few
+    confidently-routed tokens do not move it, a broad shift toward peakiness does.
+
+    ``topk == 1`` makes max == median by construction, so the ratio is identically 1 and
+    the metric carries no information; callers should skip it in that case.
+
+    Note ``torch.median`` returns the LOWER middle element for an even ``k`` (not the
+    average of the two middles), so at ``topk == 2`` this is exactly ``max/min``, and at
+    ``topk == 8`` the denominator is the 4th-smallest coefficient. That matches the
+    convention ``massive_act/channel_max_ratio`` and ``latent_combine_*`` already use.
+
+    Returns a 0-dim GPU tensor — no host sync (perf-rules Rule 1).
+    """
+    p = probs.detach().float().reshape(-1, probs.shape[-1])
+    if p.shape[0] == 0 or topk < 1:
+        return torch.zeros((), device=probs.device)
+    k = min(int(topk), p.shape[-1])
+    coefs = p.topk(k, dim=-1).values  # [num_tokens, k] — the combine weights
+    per_token = coefs.amax(dim=-1) / coefs.median(dim=-1).values.clamp(min=1e-8)
+    return per_token.mean()
+
+
 def compute_latent_combine_stats(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
     """Magnitude stats for the k-way-combined expert output, in LATENT dim.
 

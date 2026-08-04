@@ -85,6 +85,13 @@ _LATENT_COMBINE_METRICS = (
     "latent_combine_channel_max_median_ratio",
 )
 
+# ``eps / (mean(h**2) + eps)`` on the same combine output: what fraction of the
+# downstream RMSNorm's denominator is the epsilon floor rather than the signal. ~0 =
+# activations dominate (healthy); ->1 = eps swamps the hidden, so the norm divides by a
+# constant instead of the token's own scale. Declared only when the layer's config
+# exposes ``layernorm_epsilon`` (the eps that norm would use).
+_LATENT_EPS_METRICS = ("latent_eps_ratio",)
+
 
 class MoESpecialistMonitor(TorchProbe):
     METRIC_PREFIX = "moe_health"
@@ -164,6 +171,9 @@ class MoESpecialistMonitor(TorchProbe):
             if self._latent_proj_of(moe_layer) is not None:
                 for name in _LATENT_COMBINE_METRICS:
                     self.declare_layer_metric(layer_idx, name)
+                if self._layernorm_eps_of(moe_layer) is not None:
+                    for name in _LATENT_EPS_METRICS:
+                        self.declare_layer_metric(layer_idx, name)
             # Load-balance ratios need globally-reduced per-expert counts. Prefer
             # router.global_tokens_per_expert (global_aux_loss path); fall back to
             # the expert-bias path when only that is available. Declare the metrics
@@ -214,6 +224,19 @@ class MoESpecialistMonitor(TorchProbe):
         """
         return getattr(moe_layer, "fc2_latent_proj", None)
 
+    @staticmethod
+    def _layernorm_eps_of(moe_layer: nn.Module) -> float | None:
+        """Return ``config.layernorm_epsilon`` for this layer, else ``None``.
+
+        This is the eps a latent RMSNorm sitting before ``fc2_latent_proj`` would use
+        (mcore's single knob for every LayerNorm/RMSNorm, ``transformer_config.py:184``,
+        default ``1e-5``). Used only to parameterise ``latent_eps_ratio``; absent config
+        means the ratio is not emitted rather than guessed.
+        """
+        config = getattr(moe_layer, "config", None)
+        eps = getattr(config, "layernorm_epsilon", None) if config is not None else None
+        return float(eps) if isinstance(eps, int | float) else None
+
     def _patch_combine_postprocess(self, layer_idx: int, moe_layer: nn.Module):
         """Measure the k-way-combined latent tensor at its true source.
 
@@ -248,13 +271,15 @@ class MoESpecialistMonitor(TorchProbe):
         if getattr(dispatcher, "_im_combine_patched", False):
             return
         monitor = self
+        # Resolved once at setup, not per forward: config is fixed for the run.
+        eps = self._layernorm_eps_of(moe_layer)
 
         def patched_combine_postprocess(*args, **kwargs):
             output = original(*args, **kwargs)
             if monitor._should_monitor() and isinstance(output, torch.Tensor) and output.dim() >= 2:
                 try:
                     with torch.no_grad():
-                        for name, val in compute_latent_combine_stats(output.detach()).items():
+                        for name, val in compute_latent_combine_stats(output.detach(), eps=eps).items():
                             monitor.record_layer_metric(layer_idx, name, val)
                 except Exception as e:
                     if monitor.verbose:

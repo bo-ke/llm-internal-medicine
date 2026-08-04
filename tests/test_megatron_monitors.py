@@ -621,6 +621,98 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         finally:
             monitor.remove_hooks()
 
+    # ---------------- latent eps dominance ----------------
+
+    def _latent_eps_layer(self, hidden_size=8, latent_size=4, num_experts=4, eps=1e-5):
+        layer = FakeLatentMoELayer(hidden_size=hidden_size, latent_size=latent_size, num_experts=num_experts)
+        layer.config = SimpleNamespace(layernorm_epsilon=eps)
+        return layer
+
+    def _run_latent_eps(self, layer, expert_out):
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            layer(
+                torch.randn(expert_out.shape[0], expert_out.shape[1], layer.fc1_latent_proj.in_features),
+                expert_outputs=[expert_out],
+                probs=[1.0],
+            )
+            monitor.step()
+            return training_logs.get_latest(prefix="moe_health")
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_eps_ratio_is_negligible_for_healthy_activations(self):
+        """O(1) activations => eps contributes ~nothing to the RMSNorm denominator."""
+        eps = 1e-5
+        latest = self._run_latent_eps(self._latent_eps_layer(eps=eps), torch.ones(4, 2, 4))
+        got = latest["moe_health/layer_0/latent_eps_ratio"]
+        self.assertAlmostEqual(got, eps / (1.0 + eps), places=7)
+        self.assertLess(got, 1e-4)
+
+    def test_latent_eps_ratio_approaches_one_when_eps_dominates(self):
+        """Tiny activations => the norm divides by eps, not by the token's own scale.
+        This is the failure the metric exists to surface."""
+        eps = 1e-5
+        latest = self._run_latent_eps(self._latent_eps_layer(eps=eps), torch.full((4, 2, 4), 1e-4))
+        got = latest["moe_health/layer_0/latent_eps_ratio"]
+        self.assertAlmostEqual(got, eps / (1e-8 + eps), places=5)
+        self.assertGreater(got, 0.99)
+
+    def test_latent_eps_ratio_is_half_at_crossover(self):
+        """mean(h**2) == eps is the 50/50 point — the readable calibration anchor."""
+        eps = 1e-5
+        coef = torch.full((4, 2, 4), eps**0.5)
+        got = self._run_latent_eps(self._latent_eps_layer(eps=eps), coef)["moe_health/layer_0/latent_eps_ratio"]
+        self.assertAlmostEqual(got, 0.5, places=5)
+
+    def test_latent_eps_ratio_is_per_token_not_global(self):
+        """One healthy token + one eps-floored token must average to ~0.5. A single
+        GLOBAL mean(h**2) would instead read ~2e-5 and hide the floored token entirely —
+        that is why the ratio is formed per token, matching how RMSNorm normalises."""
+        eps = 1e-5
+        coef = torch.zeros(2, 1, 4)
+        coef[0] = 1.0  # healthy token
+        coef[1] = 1e-5  # mean_sq 1e-10 -> eps-dominated
+        got = self._run_latent_eps(self._latent_eps_layer(eps=eps), coef)["moe_health/layer_0/latent_eps_ratio"]
+        want_per_token = (eps / (1.0 + eps) + eps / (1e-10 + eps)) / 2
+        self.assertAlmostEqual(got, want_per_token, places=5)
+
+        global_form = eps / (float(coef.reshape(-1, 4).square().mean()) + eps)
+        self.assertLess(global_form, 1e-4)  # the form we did NOT use
+        self.assertGreater(got, 0.4)
+
+    def test_latent_eps_ratio_absent_without_layernorm_epsilon(self):
+        """No config eps => no guessing a default; the metric is simply not emitted."""
+        layer = FakeLatentMoELayer(hidden_size=8, latent_size=4, num_experts=4)  # no .config
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            self.assertIsNone(monitor._layernorm_eps_of(layer))
+            layer(torch.randn(4, 1, 8))
+            monitor.step()
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertNotIn("moe_health/layer_0/latent_eps_ratio", latest)
+            # The magnitude metrics are unaffected.
+            self.assertIn("moe_health/layer_0/latent_combine_rms", latest)
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_eps_ratio_is_mean_aggregated(self):
+        """Already a per-token average describing the typical token -> mean-composed,
+        unlike its max-aggregated latent_combine_* siblings."""
+        name = "latent_eps_ratio"
+        self.assertNotIn(name, MoESpecialistMonitor.MAX_AGGREGATED)
+        self.assertNotIn(name, MoESpecialistMonitor.MIN_AGGREGATED)
+        self.assertFalse(training_logs._is_max_metric(f"moe_health/layer_0/{name}"))
+        self.assertFalse(training_logs._is_min_metric(f"moe_health/layer_0/{name}"))
+
     # ---------------- latent-combine magnitude ----------------
 
     def test_latent_combine_metrics_measure_combine_postprocess_output(self):

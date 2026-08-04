@@ -226,7 +226,7 @@ def compute_combine_coef_sharpness(probs: torch.Tensor, topk: int) -> torch.Tens
     return per_token.mean()
 
 
-def compute_latent_combine_stats(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
+def compute_latent_combine_stats(hidden_states: torch.Tensor, eps: float | None = None) -> dict[str, torch.Tensor]:
     """Magnitude stats for the k-way-combined expert output, in LATENT dim.
 
     The measured tensor is what ``token_dispatcher.combine_postprocess`` RETURNS inside
@@ -238,6 +238,9 @@ def compute_latent_combine_stats(hidden_states: torch.Tensor) -> dict[str, torch
 
     Args:
         hidden_states: ``combine_postprocess`` output, ``[..., latent_size]``.
+        eps: the RMSNorm epsilon the downstream latent norm uses
+            (``config.layernorm_epsilon``). When given, ``latent_eps_ratio`` is emitted.
+            Pass ``None`` on models with no latent norm.
 
     Returns:
         - ``latent_combine_rms``: RMS over all elements, the overall scale of the
@@ -250,22 +253,40 @@ def compute_latent_combine_stats(hidden_states: torch.Tensor) -> dict[str, torch
           is robust to the outlier channels the metric is meant to detect — a mean
           denominator is itself inflated by the spike, which damps the very signal
           being measured.
+        - ``latent_eps_ratio`` (only when ``eps`` is given): ``eps / (mean(h**2) + eps)``,
+          i.e. how much of the RMSNorm denominator is the epsilon floor rather than the
+          signal. ~0 means the activations dominate and the norm behaves as intended;
+          ->1 means ``eps`` dominates, so the norm is dividing by a constant instead of
+          the token's own scale — the "epsilon swamps the hidden" failure. Computed
+          per-token then averaged, because the norm applies per token: a global
+          ``mean(h**2)`` would let large-norm tokens mask the small-norm ones that are
+          actually being floored.
 
-    Both are MAX-aggregated (per-layer -> global, and across ranks): they exist to catch
-    magnitude blow-up, so the worst observation is the informative one and a mean would
-    average a spike away.
+    The first two are MAX-aggregated (per-layer -> global, and across ranks): they exist
+    to catch magnitude blow-up, so the worst observation is the informative one and a
+    mean would average a spike away. ``latent_eps_ratio`` is MEAN-aggregated — it is
+    already a per-token average and describes the typical token.
 
-    Both are 0-dim GPU tensors — no host sync (perf-rules Rule 1).
+    All are 0-dim GPU tensors — no host sync (perf-rules Rule 1).
     """
     h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
     if h.shape[0] == 0:
         zero = torch.zeros((), device=hidden_states.device)
-        return {"latent_combine_rms": zero, "latent_combine_channel_max_median_ratio": zero}
+        out = {"latent_combine_rms": zero, "latent_combine_channel_max_median_ratio": zero}
+        if eps is not None:
+            out["latent_eps_ratio"] = zero
+        return out
     per_channel_max = h.abs().amax(dim=0)
-    return {
+    metrics = {
         "latent_combine_rms": h.square().mean().sqrt(),
         "latent_combine_channel_max_median_ratio": per_channel_max.max() / per_channel_max.median().clamp(min=1e-8),
     }
+    if eps is not None:
+        # Per-token mean square, matching how RMSNorm forms its denominator
+        # (mean over the last dim), then average the ratio over tokens.
+        mean_sq = h.square().mean(dim=-1)
+        metrics["latent_eps_ratio"] = (eps / (mean_sq + eps)).mean()
+    return metrics
 
 
 def compute_shared_routed_ratio(

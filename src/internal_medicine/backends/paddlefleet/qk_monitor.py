@@ -562,6 +562,8 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 self.declare_layer_metric(layer_idx, m, attn_type=item.attn_type)
             if self._is_sparse_layer(item):
                 self.declare_layer_metric(layer_idx, "attn_sink_logit", attn_type=item.attn_type)
+            elif self._learnable_sink(_attn_module) is not None:
+                self.declare_layer_metric(layer_idx, "attn_sink_logit", attn_type=item.attn_type)
 
         self.allocate_buffers()
 
@@ -593,6 +595,29 @@ class PaddleQKStatsMonitor(PaddleProbe):
         core = getattr(item.layer, "self_attn", None) or getattr(item.layer, "self_attention", None)
         core = getattr(core, "core_attention", None)
         return hasattr(core, "compressed_sparse_attn")
+
+    @staticmethod
+    def _learnable_sink(attn_module):
+        """Return a full-attention learnable sink logit tensor, or ``None``.
+
+        Non-sparse layers get a per-head sink bias when
+        ``add_full_attention_sink_bias`` / ``add_swa_attention_sink_bias``
+        promotes ``softmax_type`` to ``"learnable"``: PaddleFleet keeps it on the
+        core attention as ``softmax_offset`` and passes it to the kernel as
+        ``learnable_sink``. Sparse layers instead receive their own ``attn_sink``
+        as a ``compressed_sparse_attn`` argument, recorded in
+        ``_patch_sparse_attn`` — so both layer kinds report ``attn_sink_logit``,
+        from different sources.
+
+        The ``"off-by-one"`` softmax also sets ``softmax_offset``, but to a frozen
+        zero buffer; ``stop_gradient`` separates it from the learned parameter so
+        a constant-0 series is never logged.
+        """
+        core = getattr(attn_module, "core_attention", None)
+        offset = getattr(core, "softmax_offset", None)
+        if offset is None or offset.stop_gradient:
+            return None
+        return offset
 
     def _patch_sparse_attn(self, layer_idx: int, attn_module, item):
         """Wrap ``CompressedSparseAttention.compressed_sparse_attn``.
@@ -780,6 +805,16 @@ class PaddleQKStatsMonitor(PaddleProbe):
                             stats[key_name] = t / float(self.cp_size)
 
                 self._record_common_stats(layer_idx, attn_type, stats)
+                # ``layer`` is the core attention here (that is where this hook is
+                # registered), so the learnable sink bias is read straight off it.
+                sink_logit = getattr(layer, "softmax_offset", None)
+                if sink_logit is not None and not sink_logit.stop_gradient:
+                    self.record_layer_metric(
+                        layer_idx,
+                        "attn_sink_logit",
+                        sink_logit.detach().astype("float32").mean(),
+                        attn_type=attn_type,
+                    )
             except Exception as e:
                 logger.error(f"[PaddleQKMonitor] Error layer {layer_idx}: {e}")
 

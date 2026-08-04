@@ -725,6 +725,35 @@ class CompressRatioLayerClassificationTest(unittest.TestCase):
         self.assertEqual([item.compress_ratio for item in result], [128, 128, -2])
 
 
+class LearnableSinkDetectionTest(unittest.TestCase):
+    """Full-attention layers carry their sink bias as core_attention.softmax_offset.
+
+    ``add_full_attention_sink_bias=true`` promotes softmax_type to "learnable", so
+    MLA/MQA layers own a trainable per-head sink logit even though they never see
+    the sparse ``attn_sink`` kernel argument. They must report attn_sink_logit too.
+    """
+
+    @staticmethod
+    def _attn(offset):
+        return SimpleNamespace(core_attention=SimpleNamespace(softmax_offset=offset))
+
+    def test_trainable_offset_is_detected(self):
+        offset = paddle.zeros([4], dtype="float32")
+        offset.stop_gradient = False
+        self.assertIsNotNone(PaddleQKStatsMonitor._learnable_sink(self._attn(offset)))
+
+    def test_frozen_offset_is_ignored(self):
+        # "off-by-one" softmax uses a frozen zero buffer: a constant-0 series is
+        # not worth a chart.
+        offset = paddle.zeros([4], dtype="float32")
+        offset.stop_gradient = True
+        self.assertIsNone(PaddleQKStatsMonitor._learnable_sink(self._attn(offset)))
+
+    def test_vanilla_softmax_has_no_sink(self):
+        self.assertIsNone(PaddleQKStatsMonitor._learnable_sink(self._attn(None)))
+        self.assertIsNone(PaddleQKStatsMonitor._learnable_sink(SimpleNamespace()))
+
+
 class SparseBoundsTest(unittest.TestCase):
     """Window/compressed segment bounds derived from the model's real indices."""
 

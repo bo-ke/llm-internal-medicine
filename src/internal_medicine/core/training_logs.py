@@ -20,7 +20,12 @@ MAX_AGGREGATED_SUFFIXES = (
     "channel_p95",
     "channel_p99",
     "activation_rms",
+    "massive_act_channel_count",
 )
+
+# Absolute-threshold channel counts: the threshold is the trailing token
+# (``channel_count_gt_10``), so this cannot be a fixed suffix.
+CHANNEL_COUNT_GT_MARKER = "channel_count_gt_"
 
 
 class SmoothedValue:
@@ -109,13 +114,11 @@ class TrainingLogs:
 
     @staticmethod
     def _is_max_metric(key: str) -> bool:
-        metric_name = key.rsplit("/", 1)[-1]
         return (
             "/max" in key
             or key.endswith("_max")
             or key.endswith(MAX_AGGREGATED_SUFFIXES)
-            or metric_name == "massive_act_channel_count"
-            or metric_name.startswith("channel_count_gt_")
+            or CHANNEL_COUNT_GT_MARKER in key
         )
 
     @staticmethod

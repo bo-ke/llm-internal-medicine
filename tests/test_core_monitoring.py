@@ -99,6 +99,10 @@ class CoreMonitoringTest(unittest.TestCase):
             "massive_act/global_spectral_norm_max",
             "massive_act/layer_0/lipschitz_max",
             "massive_act/global_lipschitz_max",
+            # attn_type-tagged keys (paddlefleet prepends mla_/hca_/csa_/...)
+            "massive_act/layer_0/hca_massive_act_channel_count",
+            "massive_act/layer_0/hca_channel_count_gt_10",
+            "massive_act/global_hca_channel_count_gt_10",
         ):
             self.assertTrue(training_logs._is_max_metric(key), key)
 

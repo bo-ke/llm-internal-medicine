@@ -228,13 +228,18 @@ setup_internal_medicine()
 
 指标语义：
 
-- `sink`：该 row **可达的最早 key** 的权重。有压缩段时指向首个压缩块（概括序列/文档开头），
+- `sink`：该 row **可达的最早真实 key** 的权重。有压缩段时指向首个压缩块（概括序列/文档开头），
   否则是窗口内最旧位置；dense causal 层下退化为 token-0。
+- `entropy` / `sink` 的分布口径：**learned sink 会被 fold 进 softmax**，即分布跨越「真实 key + 1 个
+  无对应 key 的 sink 列」，与模型实际计算的分布一致。稀疏层由 `compressed_sparse_attn` 的 `attn_sink`
+  入参提供，full 层由 `core_attention.softmax_offset` 提供（`off-by-one` softmax 的冻结零 buffer 同样
+  fold——`exp(0)` 照样进分母）。`max` / `mean` 只描述真实 key，不受 sink 影响。
 - `attn_sink_logit`：learned sink 参数的均值，用于观察它在训练中的漂移。两类层的来源不同但语义一致
   （都是 per-head sink logit）：CSA/HCA 等稀疏层读 `compressed_sparse_attn` 的 `attn_sink` 入参；
   MLA/MQA 等 full 层在 `add_full_attention_sink_bias=true`（或 SWA 层的 `add_swa_attention_sink_bias`）
   时读 `core_attention.softmax_offset`——此时 `softmax_type` 被提升为 `learnable`，kernel 以
-  `learnable_sink` 接收它。`off-by-one` softmax 的 `softmax_offset` 是冻结的零 buffer，不记录。
+  `learnable_sink` 接收它。`off-by-one` softmax 的 `softmax_offset` 是冻结的零 buffer，没有可追踪的
+  学习量级，故不单独上报这条曲线（但如上所述仍会 fold 进分布）。
 
 启用 learned indexer 的层（`compress_ratio` 在 `[2, 127]` 且未开 `csa_dense_mode`）压缩 key
 是运行时 top-k 选出的，统计会覆盖真实 key 的超集，注册 hook 时会打一条 warning。

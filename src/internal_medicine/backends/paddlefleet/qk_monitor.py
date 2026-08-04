@@ -112,6 +112,7 @@ def _compute_qk_stats_triton(
     heads_per_group: int = 1,
     row_stride: int = 1,
     q_row_offset: int = 0,
+    attn_sink: paddle.Tensor | None = None,
 ) -> dict:
     """Triton kernel path for paddle tensors.
 
@@ -152,9 +153,15 @@ def _compute_qk_stats_triton(
 
     grid = (batch * num_heads, num_m_blocks)
 
+    # A None pointer is not a valid kernel argument, so pass a dummy buffer and
+    # gate the fold on HAS_SINK (same pattern as the sparse path).
+    sink_present = attn_sink is not None
+    sink_buf = attn_sink if sink_present else paddle.zeros([num_heads], dtype="float32")
+
     qk_stats_partial_kernel[grid](
         q,
         k,
+        sink_buf,
         partial_max,
         partial_sum_logit,
         partial_sum_row_mean,
@@ -183,6 +190,7 @@ def _compute_qk_stats_triton(
         partial_max.strides[2],
         scale=scale,
         apply_causal_mask=causal,
+        HAS_SINK=sink_present,
         ROW_STRIDE=row_stride,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -214,6 +222,7 @@ def compute_qk_stats_paddle(
     causal: bool = True,
     row_stride: int = 1,
     q_row_offset: int = 0,
+    attn_sink: paddle.Tensor | None = None,
 ) -> dict:
     """Compute QK stats via Triton kernel.
 
@@ -224,6 +233,11 @@ def compute_qk_stats_paddle(
         q_row_offset: global row-index start for this Q shard. Zero unless the
             caller is running with Context-Parallel and Q is kept local. Used
             only by the kernel's causal-mask logic.
+        attn_sink: per-head sink logit ``[H]`` (float32), folded into the softmax
+            as an extra key-less column. Pass the layer's
+            ``core_attention.softmax_offset`` whenever it exists — without it the
+            reported distribution is renormalised over the real keys only and does
+            not match what the model computes.
 
     The [B, S, H, D] -> [B, H, S, D] reordering is expressed via strides
     (no contiguous copy); the triton kernel reads strided memory directly.
@@ -247,6 +261,7 @@ def compute_qk_stats_paddle(
         heads_per_group=heads_per_group,
         row_stride=row_stride,
         q_row_offset=q_row_offset,
+        attn_sink=attn_sink,
     )
 
 
@@ -788,12 +803,19 @@ class PaddleQKStatsMonitor(PaddleProbe):
                         effective_stride = 1
                     # GQA grouping is handled inside the kernel; do NOT
                     # repeat_interleave the KV tensor on the hot path.
+                    # ``layer`` is the core attention (that is where this hook is
+                    # registered), so its sink bias is read straight off it. Fold
+                    # it whenever it exists — including the frozen zero buffer of
+                    # "off-by-one" softmax, which still adds exp(0) to the
+                    # denominator and so changes entropy and sink.
+                    sink_logit = getattr(layer, "softmax_offset", None)
                     stats = compute_qk_stats_paddle(
                         query,
                         key,
                         causal=self.causal,
                         row_stride=effective_stride,
                         q_row_offset=q_row_offset,
+                        attn_sink=None if sink_logit is None else sink_logit.detach().astype("float32"),
                     )
 
                     if self.cp_size > 1 and self.cp_group is not None:
@@ -805,9 +827,8 @@ class PaddleQKStatsMonitor(PaddleProbe):
                             stats[key_name] = t / float(self.cp_size)
 
                 self._record_common_stats(layer_idx, attn_type, stats)
-                # ``layer`` is the core attention here (that is where this hook is
-                # registered), so the learnable sink bias is read straight off it.
-                sink_logit = getattr(layer, "softmax_offset", None)
+                # A frozen offset ("off-by-one") has no learned magnitude to
+                # track, so only the trainable one gets its own series.
                 if sink_logit is not None and not sink_logit.stop_gradient:
                     self.record_layer_metric(
                         layer_idx,

@@ -202,7 +202,7 @@ setup_internal_medicine()
 | 7 | `sink_head_ratio` | `qk_stats/.../sink_head_ratio` | `count(sink>θ)/N_heads` | 每层+全局 | Sink head 占比 |
 | 8 | `sink_head_max` | `qk_stats/.../sink_head_max` | `max(sink_per_head)` | 每层+全局 | 最强 sink head 权重 |
 | 9 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
-| 10 | `attn_sink_logit` | `qk_stats/.../attn_sink_logit` | `mean(attn_sink)` | 每层+全局 | 仅 CSA/HCA 层；learned sink logit 量级漂移 |
+| 10 | `attn_sink_logit` | `qk_stats/.../attn_sink_logit` | `mean(sink_logit)` | 每层+全局 | learned sink logit 量级漂移；稀疏层取 `attn_sink`，full 层取 `softmax_offset` |
 
 ### 混合注意力栈的层类型标签 (attn_type)
 
@@ -230,7 +230,11 @@ setup_internal_medicine()
 
 - `sink`：该 row **可达的最早 key** 的权重。有压缩段时指向首个压缩块（概括序列/文档开头），
   否则是窗口内最旧位置；dense causal 层下退化为 token-0。
-- `attn_sink_logit`：learned sink 参数的均值，用于观察它在训练中的漂移。
+- `attn_sink_logit`：learned sink 参数的均值，用于观察它在训练中的漂移。两类层的来源不同但语义一致
+  （都是 per-head sink logit）：CSA/HCA 等稀疏层读 `compressed_sparse_attn` 的 `attn_sink` 入参；
+  MLA/MQA 等 full 层在 `add_full_attention_sink_bias=true`（或 SWA 层的 `add_swa_attention_sink_bias`）
+  时读 `core_attention.softmax_offset`——此时 `softmax_type` 被提升为 `learnable`，kernel 以
+  `learnable_sink` 接收它。`off-by-one` softmax 的 `softmax_offset` 是冻结的零 buffer，不记录。
 
 启用 learned indexer 的层（`compress_ratio` 在 `[2, 127]` 且未开 `csa_dense_mode`）压缩 key
 是运行时 top-k 选出的，统计会覆盖真实 key 的超集，注册 hook 时会打一条 warning。
@@ -439,7 +443,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **QK** | `sink_head_ratio` | `count(sink>threshold)/N_heads` | mean | Sink head 占比 |
 | **QK** | `sink_head_max` | `max(sink_per_head)` | max | 最强 sink head |
 | **QK** | `sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | mean | Sink vs 非Sink gap |
-| **QK** | `attn_sink_logit` | `mean(attn_sink)` | mean | CSA/HCA 层；learned sink 量级 |
+| **QK** | `attn_sink_logit` | `mean(sink_logit)` | mean | learned sink 量级（稀疏层 `attn_sink` / full 层 `softmax_offset`） |
 | **MassiveAct** | `channel_max` | `max(abs(H_i))` | max | 通道峰值激活 |
 | **MassiveAct** | `channel_median` | `median(per_channel_max)` | max | 通道峰值基准量级 |
 | **MassiveAct** | `channel_p95` | `p95(per_channel_max)` | max | 高分位通道幅度 |

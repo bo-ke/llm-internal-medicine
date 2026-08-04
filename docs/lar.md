@@ -115,10 +115,47 @@ internal_medicine_monitors:
 
 ## Perf notes
 
-- Hooks: three sum-of-squares kernels + one `F.linear` (router only) per site
-  per microbatch, on fp32. All 0-dim GPU tensors — no `.item()/.cpu()` on the
-  hot path, no dist calls.
-- Weight sum-of-squares recomputed once per step per site (constant within a
-  step; guarded by `w_done` flag), not once per microbatch.
+### Compute
+
+- **`lm_head`: nothing is recomputed.** Both `hidden` and `logits` are already
+  materialised by the forward pass; the hook only reduces them. Cost is three
+  sum-of-squares reductions, and the weight one runs once per step (see below).
+- **Routers: one small extra matmul each.** `TopKRouter.forward` returns
+  `(probs, routing_map)`, not raw gating logits, so the hook recomputes
+  `F.linear(hidden, weight)` — `T x H x E` FLOPs per MoE layer, negligible next
+  to the expert GEMMs.
+- Weight sum-of-squares runs once per step per site (constant within a step;
+  guarded by the `w_done` flag), not once per microbatch — on a `[200019, 1024]`
+  tied head that matters.
+- All hook outputs are 0-dim GPU tensors: no `.item()/.cpu()` and no collectives
+  on the hot path. Reductions happen at flush on `(sum_sq, count)` scalar pairs.
+
+### Memory: why the sums avoid the obvious form
+
+The lm_head `Z` is the **full logits tensor** — `[4096, 200019]` bf16 is 1.53 GiB
+at seq 4096 / mbs 1, and it scales with `vocab x seq`. Two naive idioms each cost
+multiples of that, so `_sum_of_squares` avoids both (measured on a
+`[512, 200019]` bf16 slice = 195 MiB):
+
+| form | extra peak | note |
+|---|---|---|
+| `Z.float().pow(2).sum()` | **+781 MiB** (~4x input) | fp32 cast **and** squares |
+| `Z[mask].float().pow(2).sum()` | **+604 MiB** | plus the masked copy |
+| `vector_norm(Z, dtype=fp32).square()` | **+0 MiB** | fp32 accumulate, reads in place |
+| `vector_norm(Z, dim=-1, dtype=fp32).square()[mask].sum()` | **+0 MiB** | per-row norms are `[T]` |
+
+Extrapolated to a real L12 microbatch the naive form would have peaked ~6.1 GiB
+of transients per monitored step. Values agree to fp32 round-off (~1e-7 relative).
+
+The masked path is why the loss mask is passed **into** `_accumulate` rather than
+applied by the caller: `z_flat[mask]` would copy a vocab-wide tensor. The router
+hook masks eagerly instead — its matmul is ours to pay for, so dropping invalid
+rows first makes it cheaper, and the copy is `[T_valid, H]`, not vocab-wide.
+
+Token **counts** are fp64: `valid_tokens x vocab` runs to ~1e8-1e9, past fp32's
+`2**24` exact-integer limit, and the counts are all-reduced as fp64 anyway.
+
+### Not done online
+
 - SVD-based spectral metrics (spec §5, Appendix) are NOT computed online. Run
   offline at checkpoint boundaries if wanted.

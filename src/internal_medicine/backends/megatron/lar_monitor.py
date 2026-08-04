@@ -36,6 +36,49 @@ logger = logging.getLogger(__name__)
 _IGNORE_INDEX_DEFAULT = -100  # Megatron convention for ``labels`` padding
 
 
+def _sum_of_squares(t: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """fp32 sum-of-squares of ``t`` (optionally over ``mask``-selected rows only),
+    without materialising any full-size temporary.
+
+    Two allocation traps this avoids, both of which bite hard on the lm_head logits
+    (a ``[4096, 200019]`` bf16 tensor is 1.53 GiB, and the cost scales with
+    ``vocab x seq``):
+
+    1. ``t.float().pow(2).sum()`` allocates TWO full fp32 temporaries — the cast, then
+       the squares — i.e. ~4x the bf16 input, measured 781 MiB against a 195 MiB input.
+       ``vector_norm(dtype=torch.float32)`` accumulates in fp32 while reading the source
+       dtype in place: measured 0 extra bytes, and squaring the resulting 0-dim scalar is
+       exact, so the value is bit-identical to the naive form.
+    2. ``t[mask]`` materialises a masked COPY (~valid_frac x the tensor). Instead take
+       per-row fp32 norms — ``[T]``, negligible — square them, and select there. Summing
+       squared row norms is algebraically the same sum; measured agreement is fp32
+       round-off (~1e-7 relative).
+
+    ``mask`` is a boolean over ``t``'s first dim; ``t`` must be 2-D when it is given.
+    """
+    if mask is None:
+        return torch.linalg.vector_norm(t, dtype=torch.float32).square()
+    row_sq = torch.linalg.vector_norm(t, dim=-1, dtype=torch.float32).square()
+    return row_sq[mask].sum()
+
+
+def _masked_numel(t: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """Element count of ``t`` restricted to ``mask``'s rows, as a 0-dim GPU tensor.
+
+    ``mask.sum()`` stays a tensor (no ``.item()``) so the hot path never syncs; the
+    trailing dim comes from a shape read, which is free.
+
+    fp64, not fp32: the logits count is ``T * vocab`` (~8.2e8 for seq 4096 x 200k vocab),
+    well past fp32's exact-integer limit of 2**24, so an fp32 count silently rounds (a
+    measured 79207520 for a true 79207524). The error is ~1e-7 relative and harmless for
+    ``lar``, but the counts are all-reduced as fp64 downstream anyway, so there is no
+    reason to introduce rounding here.
+    """
+    if mask is None:
+        return torch.as_tensor(float(t.numel()), device=t.device, dtype=torch.float64)
+    return mask.sum().to(torch.float64) * float(t.shape[-1])
+
+
 class LARMonitor(TorchProbe):
     """Log-Alignment Ratio for lm_head + MoE routers.
 
@@ -252,29 +295,43 @@ class LARMonitor(TorchProbe):
     # Hot path
     # ------------------------------------------------------------------
 
-    def _accumulate(self, site: str, X: torch.Tensor, W: torch.Tensor, Z: torch.Tensor) -> None:
+    def _accumulate(
+        self,
+        site: str,
+        X: torch.Tensor,
+        W: torch.Tensor,
+        Z: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> None:
         """Update per-site (ss, n) with the SUM-of-squares + numel of X, W, Z.
+
+        ``mask`` (boolean over the token dim) restricts X and Z to the valid tokens
+        WITHOUT the caller having to index them first — indexing would copy a
+        ``[T, vocab]`` logits tensor. W is token-independent so the mask never applies.
+
+        Sums go through ``_sum_of_squares``, which accumulates in fp32 without casting
+        the input — important because ``Z`` is the ``[T, vocab]`` logits and an fp32 copy
+        of it would dwarf the tensor itself.
 
         ``W``'s stats are computed once per step per site (weight is constant within
         a step; sums are data-independent) to avoid redundant kernels across
         microbatches on a potentially large ``[V,H]`` tensor.
         """
         s = self._sites[site]
-        Xf = X.float()
-        Zf = Z.float()
-        # numel returns python int (shape read, not a tensor value) — safe on hot path.
-        s_ssX = Xf.pow(2).sum()
-        s_ssZ = Zf.pow(2).sum()
-        nX = torch.as_tensor(float(Xf.numel()), device=Xf.device)
-        nZ = torch.as_tensor(float(Zf.numel()), device=Zf.device)
-        s["ss"]["X"] = s["ss"].get("X", torch.zeros((), device=s_ssX.device)) + s_ssX
-        s["ss"]["Z"] = s["ss"].get("Z", torch.zeros((), device=s_ssZ.device)) + s_ssZ
-        s["n"]["X"] = s["n"].get("X", torch.zeros((), device=nX.device)) + nX
-        s["n"]["Z"] = s["n"].get("Z", torch.zeros((), device=nZ.device)) + nZ
+        s_ssX = _sum_of_squares(X, mask)
+        s_ssZ = _sum_of_squares(Z, mask)
+        nX = _masked_numel(X, mask)
+        nZ = _masked_numel(Z, mask)
+        # Accumulators inherit each value's dtype (sums fp32, counts fp64) via
+        # ``zeros_like``; a bare ``torch.zeros(())`` would be fp32 and would silently
+        # downcast the fp64 counts on the first add.
+        s["ss"]["X"] = s["ss"].get("X", torch.zeros_like(s_ssX)) + s_ssX
+        s["ss"]["Z"] = s["ss"].get("Z", torch.zeros_like(s_ssZ)) + s_ssZ
+        s["n"]["X"] = s["n"].get("X", torch.zeros_like(nX)) + nX
+        s["n"]["Z"] = s["n"].get("Z", torch.zeros_like(nZ)) + nZ
         if not s["w_done"]:
-            Wf = W.float()
-            s["ss"]["W"] = Wf.pow(2).sum()
-            s["n"]["W"] = torch.as_tensor(float(Wf.numel()), device=Wf.device)
+            s["ss"]["W"] = _sum_of_squares(W)
+            s["n"]["W"] = _masked_numel(W, None)
             s["w_done"] = True
 
     def _make_lm_head_hook(self, weight: torch.Tensor):
@@ -296,10 +353,11 @@ class LARMonitor(TorchProbe):
                     x_flat = x.reshape(-1, x.shape[-1])
                     z_flat = z.reshape(-1, z.shape[-1])
                     mask = self._valid_mask(x)
-                    if mask is not None and mask.shape[0] == x_flat.shape[0]:
-                        x_flat = x_flat[mask]
-                        z_flat = z_flat[mask]
-                    self._accumulate("lm_head", x_flat, weight, z_flat)
+                    if mask is not None and mask.shape[0] != x_flat.shape[0]:
+                        mask = None
+                    # Pass the mask down instead of indexing here: ``z_flat[mask]`` would
+                    # copy a [T, vocab] logits tensor.
+                    self._accumulate("lm_head", x_flat, weight, z_flat, mask=mask)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[LARMonitor] lm_head hook error: {e}")
@@ -323,6 +381,9 @@ class LARMonitor(TorchProbe):
                     # Skip masking on routers under SP (documented gotcha).
                     mask = None if self._sequence_parallel else self._valid_mask(x)
                     if mask is not None and mask.shape[0] == x_flat.shape[0]:
+                        # Unlike lm_head, mask EAGERLY here: the gating matmul below is
+                        # ours to pay for, so dropping invalid rows first makes it
+                        # cheaper. The copy is [T_valid, H] (H ~ 1e3), not vocab-wide.
                         x_flat = x_flat[mask]
                     elif self._sequence_parallel and not self._warned_router_sp and self.verbose:
                         logger.warning(

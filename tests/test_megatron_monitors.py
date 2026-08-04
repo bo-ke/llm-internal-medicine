@@ -2297,6 +2297,128 @@ class MegatronLARMonitorTest(unittest.TestCase):
         want, *_ = _lar_analytical(hidden_masked, router_weight, logits=hidden_masked @ router_weight.t())
         self.assertAlmostEqual(got, want, places=4)
 
+    # ---------------- sum-of-squares helper: allocation-free forms ----------------
+
+    def test_sum_of_squares_matches_naive_form_across_dtypes(self):
+        """``vector_norm(dtype=fp32).square()`` replaced ``t.float().pow(2).sum()`` to
+        avoid two full fp32 temporaries of the [T, vocab] logits. It must stay
+        numerically equivalent for the dtypes training actually uses."""
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                t = (torch.randn(64, 128) * 3.0).to(dtype)
+                got = lar_module._sum_of_squares(t)
+                want = t.float().pow(2).sum()
+                self.assertEqual(got.dtype, torch.float32, "must accumulate in fp32")
+                self.assertEqual(got.dim(), 0)
+                self.assertAlmostEqual(float(got) / float(want), 1.0, places=5, msg=f"{float(got)} vs {float(want)}")
+
+    def test_sum_of_squares_masked_matches_indexed_form(self):
+        """The masked path sums squared per-row norms instead of materialising
+        ``t[mask]`` (which on the logits would copy ~valid_frac x [T, vocab]). Same sum,
+        up to fp32 round-off."""
+        t = torch.randn(32, 48)
+        mask = torch.zeros(32, dtype=torch.bool)
+        mask[::3] = True
+        got = lar_module._sum_of_squares(t, mask)
+        want = t[mask].float().pow(2).sum()
+        self.assertAlmostEqual(float(got) / float(want), 1.0, places=5)
+
+    def test_sum_of_squares_masked_all_false_is_zero(self):
+        t = torch.randn(8, 4)
+        got = lar_module._sum_of_squares(t, torch.zeros(8, dtype=torch.bool))
+        self.assertEqual(float(got), 0.0)
+
+    def test_masked_numel_counts_selected_rows_without_host_sync(self):
+        t = torch.randn(10, 7)
+        mask = torch.zeros(10, dtype=torch.bool)
+        mask[:4] = True
+        got = lar_module._masked_numel(t, mask)
+        self.assertIsInstance(got, torch.Tensor, "stays a tensor: no .item() on the hot path")
+        self.assertEqual(got.dim(), 0)
+        self.assertEqual(float(got), 4 * 7)
+        self.assertEqual(float(lar_module._masked_numel(t, None)), 10 * 7)
+
+    def test_masked_numel_is_fp64_and_exact_at_logits_scale(self):
+        """The logits element count is valid_tokens*vocab (~1e8-1e9 at seq 4096 / 200k
+        vocab), past fp32's 2**24 exact-integer limit, so an fp32 count rounds for a
+        general token count. Pin fp64 and exactness at realistic magnitude.
+
+        Note a FULL 4096-row count (2**12 * 200019) happens to be exactly representable
+        in fp32; it is the partially-masked counts — the normal case once padding is
+        dropped — that round, so this test uses one of those.
+        """
+        n_rows, n_valid, vocab = 4096, 3277, 200019
+        t = torch.empty(n_rows, vocab, device="meta")
+        mask = torch.zeros(n_rows, dtype=torch.bool)
+        mask[:n_valid] = True
+        got = lar_module._masked_numel(t, mask)
+        self.assertEqual(got.dtype, torch.float64)
+        self.assertEqual(int(got), n_valid * vocab)
+        # The fp32 form this replaced does NOT round-trip at this magnitude.
+        as_fp32 = int(torch.tensor(float(n_valid * vocab), dtype=torch.float32))
+        self.assertNotEqual(as_fp32, n_valid * vocab, "fp32 would have been exact here — pick another count")
+
+    def test_accumulator_keeps_fp64_counts_across_microbatches(self):
+        """The (ss, n) accumulators must adopt each value's dtype: a bare fp32 zero seed
+        would downcast the fp64 counts on the first add and reintroduce the rounding."""
+        S, B, H, V = 4, 1, 6, 8
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=False)
+        monitor.register_hooks(model)
+        model.output_layer(torch.randn(S, B, H))
+        model.output_layer(torch.randn(S, B, H))
+        site = monitor._sites["lm_head"]
+        self.assertEqual(site["n"]["X"].dtype, torch.float64)
+        self.assertEqual(site["n"]["Z"].dtype, torch.float64)
+        self.assertEqual(site["ss"]["X"].dtype, torch.float32)
+        self.assertEqual(float(site["n"]["X"]), 2 * S * B * H, "counts accumulate over microbatches")
+        self.assertEqual(float(site["n"]["Z"]), 2 * S * B * V)
+
+    def test_lar_masking_does_not_index_the_logits_tensor(self):
+        """Regression guard for the allocation fix: the lm_head hook must hand the mask
+        to _accumulate rather than indexing the logits. Indexing a [T, vocab] tensor is
+        the expensive step, so assert __getitem__ is never called on it."""
+        S, B, H, V = 5, 1, 4, 6
+        model = FakeGPTModel(num_layers=1, hidden_size=H, vocab_size=V)
+        monitor = LARMonitor(hook_moe_router=False, monitor_interval=1, apply_loss_mask=True)
+        monitor.register_hooks(model)
+
+        hidden = torch.randn(S, B, H)
+        labels = torch.tensor([[1, 2, -100, 4, -100]])
+        model(hidden, labels=labels)
+
+        indexed: list[tuple[int, ...]] = []
+
+        class TattlingTensor(torch.Tensor):
+            """Records boolean-mask indexing of 2-D tensors, so the test can prove the
+            full [T, vocab] logits are never copied. The subclass propagates through ops,
+            so 1-D indexing (the intended ``row_sq[mask]``, shape [T]) is ignored — that
+            is the cheap path we deliberately moved TO."""
+
+            @staticmethod
+            def __new__(cls, data):
+                return torch.Tensor._make_subclass(cls, data, False)
+
+            def __getitem__(self, item):
+                if isinstance(item, torch.Tensor) and item.dtype == torch.bool and self.dim() >= 2:
+                    indexed.append(tuple(self.shape))
+                return super().__getitem__(item)
+
+        logits = TattlingTensor(model.output_layer(hidden).detach())
+        for hook in model.output_layer._forward_hooks.values():
+            hook(model.output_layer, (hidden,), logits)
+        monitor.step()
+
+        self.assertEqual(indexed, [], f"a 2-D tensor was mask-indexed: {indexed}")
+        got = training_logs.get_latest(prefix="lar")
+        mask = labels.transpose(0, 1).reshape(-1) != -100
+        want, *_ = _lar_analytical(
+            hidden.reshape(-1, H)[mask],
+            model.output_layer.weight,
+            logits=model.output_layer(hidden).reshape(-1, V)[mask],
+        )
+        self.assertAlmostEqual(got["lar/lm_head/lar"], want, places=4)
+
 
 class MegatronMonitorRegistryTest(unittest.TestCase):
     """``monitors=["all"]`` expansion — which monitors it does and does not include."""

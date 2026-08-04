@@ -166,14 +166,7 @@ class LARMonitor(TorchProbe):
             hook = model.register_forward_pre_hook(self._make_label_capture_hook(), with_kwargs=True)
             self.hooks.append(hook)
 
-        # LM head: last PP stage only (owns ``output_layer``). Under
-        # ``share_embeddings_and_output_weights`` + PP=1, Megatron builds
-        # ``output_layer`` with ``skip_weight_param_allocation=True`` so
-        # ``module.weight is None`` and the actual tensor lives on the shared
-        # embedding — resolve it via ``shared_embedding_or_output_weight()``
-        # (same accessor MassiveActivationMonitor uses for logit-lens) and close
-        # over it at attach time, since ``module.weight`` inside the hook would
-        # still be ``None``.
+        # LM head: last PP stage only (owns ``output_layer``).
         if self.hook_lm_head:
             output_layer = getattr(base, "output_layer", None)
             weight = self._resolve_lm_head_weight(base, output_layer)
@@ -322,9 +315,6 @@ class LARMonitor(TorchProbe):
         s_ssZ = _sum_of_squares(Z, mask)
         nX = _masked_numel(X, mask)
         nZ = _masked_numel(Z, mask)
-        # Accumulators inherit each value's dtype (sums fp32, counts fp64) via
-        # ``zeros_like``; a bare ``torch.zeros(())`` would be fp32 and would silently
-        # downcast the fp64 counts on the first add.
         s["ss"]["X"] = s["ss"].get("X", torch.zeros_like(s_ssX)) + s_ssX
         s["ss"]["Z"] = s["ss"].get("Z", torch.zeros_like(s_ssZ)) + s_ssZ
         s["n"]["X"] = s["n"].get("X", torch.zeros_like(nX)) + nX
@@ -335,9 +325,6 @@ class LARMonitor(TorchProbe):
             s["w_done"] = True
 
     def _make_lm_head_hook(self, weight: torch.Tensor):
-        # Close over the shared tensor resolved at attach time: under tied
-        # embeddings ``module.weight is None`` and the actual weight lives on
-        # the input embedding. Same nn.Parameter identity survives across steps.
         def hook_fn(module, inputs, output):
             if not self._should_monitor():
                 return
@@ -355,8 +342,6 @@ class LARMonitor(TorchProbe):
                     mask = self._valid_mask(x)
                     if mask is not None and mask.shape[0] != x_flat.shape[0]:
                         mask = None
-                    # Pass the mask down instead of indexing here: ``z_flat[mask]`` would
-                    # copy a [T, vocab] logits tensor.
                     self._accumulate("lm_head", x_flat, weight, z_flat, mask=mask)
             except Exception as e:
                 if self.verbose:
@@ -381,9 +366,6 @@ class LARMonitor(TorchProbe):
                     # Skip masking on routers under SP (documented gotcha).
                     mask = None if self._sequence_parallel else self._valid_mask(x)
                     if mask is not None and mask.shape[0] == x_flat.shape[0]:
-                        # Unlike lm_head, mask EAGERLY here: the gating matmul below is
-                        # ours to pay for, so dropping invalid rows first makes it
-                        # cheaper. The copy is [T_valid, H] (H ~ 1e3), not vocab-wide.
                         x_flat = x_flat[mask]
                     elif self._sequence_parallel and not self._warned_router_sp and self.verbose:
                         logger.warning(
@@ -433,25 +415,11 @@ class LARMonitor(TorchProbe):
             ssX, nX = self._reduce_pair(s["ss"]["X"], s["n"]["X"], self._dp_group)
             ssZ, nZ = self._reduce_pair(s["ss"]["Z"], s["n"]["Z"], self._dp_group)
         eps = 1e-12
-        # rms_* are flush-time locals only: they are the inputs to ``lar`` and are not
-        # logged. Their absolute scale is uninformative on its own (it tracks whatever
-        # the residual/logit scale happens to be) and it is already covered by
-        # ``massive_act``'s activation_rms / spectral-norm metrics.
         rms_w = (ssW / nW.clamp_min(1)).clamp_min(eps).sqrt()
         rms_x = (ssX / nX.clamp_min(1)).clamp_min(eps).sqrt()
         rms_z = (ssZ / nZ.clamp_min(1)).clamp_min(eps).sqrt()
         ratio = rms_z / (rms_w * rms_x).clamp_min(eps)
         lar = ratio.log() / torch.log(torch.tensor(H, device=ratio.device, dtype=ratio.dtype))
-        # No ``k = H ** (2*(1-lar))``: it is a pure monotone reparametrisation of ``lar``
-        # (bijective, carries zero extra information) and its literal "effective rank"
-        # reading only holds for a uniform weight spectrum — which does not hold at
-        # 200k-vocab scale. Derive it offline from ``lar`` if you want it.
-        #
-        # No ``valid_frac``: reporting the mask's keep-rate needs a pre-mask token count,
-        # but the hooks index ``x_flat[mask]`` before ``_accumulate``, so only post-mask
-        # counts survive to flush. Deriving it from ``nX`` is not possible (``nX`` is an
-        # element count, ``T*H``). The masking of the sums is unaffected — see
-        # ``_valid_mask`` / ``_make_lm_head_hook``.
         return {f"{key}/lar": lar}
 
     def _flush_buffers(self) -> None:

@@ -263,11 +263,8 @@ class FakeLatentMoELayer(nn.Module):
 
     def forward(self, hidden_states, expert_outputs=None, probs=None):
         latent = self.fc1_latent_proj(hidden_states)
-        # mcore's MoELayer.route() runs the router first; do the same so the monitor's
-        # router forward hook fires on this fixture too.
         self.router(latent)
         if expert_outputs is None:
-            # topk expert outputs in latent dim; combine with uniform weights.
             expert_outputs = [latent for _ in range(self.topk)]
             probs = [1.0 / self.topk] * self.topk
         combined = self.token_dispatcher.combine_postprocess(expert_outputs, probs)
@@ -512,8 +509,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             monitor.remove_hooks()
             fmg.get_updated_expert_bias = original
 
-    # ---------------- combine-coefficient sharpness ----------------
-
     def _sharpness_monitor(self):
         monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
         for name in moe_monitor_module._ROUTER_METRICS:
@@ -621,8 +616,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         finally:
             monitor.remove_hooks()
 
-    # ---------------- latent eps dominance ----------------
-
     def _latent_eps_layer(self, hidden_size=8, latent_size=4, num_experts=4, eps=1e-5):
         layer = FakeLatentMoELayer(hidden_size=hidden_size, latent_size=latent_size, num_experts=num_experts)
         layer.config = SimpleNamespace(layernorm_epsilon=eps)
@@ -699,7 +692,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             monitor.step()
             latest = training_logs.get_latest(prefix="moe_health")
             self.assertNotIn("moe_health/layer_0/latent_eps_ratio", latest)
-            # The magnitude metrics are unaffected.
             self.assertIn("moe_health/layer_0/latent_combine_rms", latest)
         finally:
             monitor.remove_hooks()
@@ -712,8 +704,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         self.assertNotIn(name, MoESpecialistMonitor.MIN_AGGREGATED)
         self.assertFalse(training_logs._is_max_metric(f"moe_health/layer_0/{name}"))
         self.assertFalse(training_logs._is_min_metric(f"moe_health/layer_0/{name}"))
-
-    # ---------------- latent-combine magnitude ----------------
 
     def test_latent_combine_metrics_measure_combine_postprocess_output(self):
         """The metrics must describe exactly what combine_postprocess returned — the
@@ -756,7 +746,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         monitor.allocate_buffers(torch.device("cpu"))
         monitor._attach_hooks([(0, layer)])
         try:
-            # Combined output is deliberately far from unit scale.
             big = torch.full((S, B, L), 40.0)
             big[..., 0] = 400.0
             layer(torch.randn(S, B, H), expert_outputs=[big], probs=[1.0])
@@ -769,13 +758,10 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             want_rms = float(combined.square().mean().sqrt())
             self.assertAlmostEqual(got_rms, want_rms, places=4)
 
-            # The norm did fire and did flatten the scale, so this test is meaningful.
             normed_rms = float(layer.up_proj_input.detach().reshape(-1, L).float().square().mean().sqrt())
             self.assertAlmostEqual(normed_rms, 1.0, places=3)
             self.assertGreater(got_rms, 100.0, "must report the pre-norm magnitude")
 
-            # Same story for the channel ratio: the norm is per-token, so it rescales
-            # rows and would change the per-channel peak distribution.
             got_ratio = latest["moe_health/layer_0/latent_combine_channel_max_median_ratio"]
             per_channel_max = combined.abs().amax(dim=0)
             self.assertAlmostEqual(got_ratio, float(per_channel_max.max() / per_channel_max.median()), places=4)
@@ -832,10 +818,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             ratio_spiked = training_logs.get_latest(prefix="moe_health")[
                 "moe_health/layer_0/latent_combine_channel_max_median_ratio"
             ]
-            # per-channel maxima = [100, 1, 1, 1]; torch.median takes the lower middle
-            # value of the sorted [1, 1, 1, 100] => 1.0, so the ratio is the full 100.
-            # A mean denominator would give 100/25.75 ~= 3.88 — the spike inflating its
-            # own denominator, which is exactly why median is the right choice here.
             self.assertAlmostEqual(ratio_spiked, 100.0, places=4)
             self.assertGreater(ratio_spiked, ratio_flat)
         finally:
@@ -882,7 +864,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         monitor.allocate_buffers(torch.device("cpu"))
         monitor._attach_hooks(list(enumerate(layers)))
         try:
-            # layer 0 quiet, layer 1 hot: global must follow layer 1.
             layers[0](torch.randn(S, B, H), expert_outputs=[torch.ones(S, B, L)], probs=[1.0])
             hot = torch.ones(S, B, L) * 3.0
             hot[..., 0] = 300.0
@@ -893,7 +874,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             for name in moe_monitor_module._LATENT_COMBINE_METRICS:
                 per_layer = [latest[f"moe_health/layer_{i}/{name}"] for i in range(2)]
                 self.assertAlmostEqual(latest[f"moe_health/global_{name}"], max(per_layer), places=5)
-                # A mean would sit strictly below the max given these two layers differ.
                 self.assertGreater(max(per_layer), sum(per_layer) / 2)
         finally:
             monitor.remove_hooks()
@@ -951,7 +931,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         self.assertIsNot(dispatcher.combine_postprocess, original, "patch installed")
         self.assertTrue(dispatcher._im_combine_patched)
 
-        # Transparency: the value the model sees is exactly what the original returned.
         expert_out = torch.randn(S, B, L)
         out = layer(torch.randn(S, B, H), expert_outputs=[expert_out], probs=[1.0])
         self.assertTrue(torch.allclose(layer.combined, expert_out))
@@ -960,8 +939,6 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         self.assertIn("moe_health/layer_0/latent_combine_rms", training_logs.get_latest(prefix="moe_health"))
 
         monitor.remove_hooks()
-        # Reverted by deleting our instance attribute, so lookup falls back to the class
-        # method again (comparing __func__ since bound methods are recreated per access).
         self.assertNotIn("combine_postprocess", vars(dispatcher))
         self.assertIs(dispatcher.combine_postprocess.__func__, original.__func__)
         self.assertFalse(hasattr(dispatcher, "_im_combine_patched"))
@@ -1578,10 +1555,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         training_logs.reset()
         import tempfile
 
-        # Scratch under the repo, NOT /tmp: act_dump's dump_dir validation rejects
-        # /tmp (small, shared — filling it takes down the node), and the project rule
-        # is that no test output lands there either. Keeping the fixture on a real
-        # volume also means these tests exercise the same path checks production does.
         scratch = Path(__file__).resolve().parent / ".scratch"
         scratch.mkdir(parents=True, exist_ok=True)
         self._tmp = tempfile.TemporaryDirectory(dir=str(scratch))
@@ -1806,8 +1779,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertEqual(meta["step"], "0")
         self.assertIn("global_rank", meta)
 
-    # ---------------- dump_dir validation ----------------
-
     def test_relative_dump_dir_is_resolved_against_cwd(self):
         """A relative dump_dir is supported (the default) — it lands under the run
         directory. It is stored resolved so a later os.chdir cannot move the dump."""
@@ -1855,8 +1826,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             setup_activation_dump_monitor(model, dump_dir="/outputs/act_dumps")
 
-    # ---------------- full-hidden dump (default) ----------------
-
     def test_full_hidden_dumped_by_default(self):
         """Default n_sample_tokens=None must dump every token row, not a 512 subsample:
         a subsample cannot be lined up against the batch's input_ids / labels."""
@@ -1874,7 +1843,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertEqual(meta["full_dump"], "True")
         self.assertEqual(meta["n_tokens"], str(S * B))
         self.assertEqual(meta["n_sample_tokens"], str(S * B))
-        # token_index is the identity permutation on a full dump.
         self.assertTrue(torch.equal(tensors["token_index"], torch.arange(S * B)))
 
     def test_hidden_values_match_layer_output_on_full_dump(self):
@@ -1903,8 +1871,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertEqual(tuple(tensors["hidden"].shape), (6, H))
         self.assertEqual(meta["full_dump"], "False")
 
-    # ---------------- input-batch dump ----------------
-
     def test_input_batch_dumped_alongside_hidden(self):
         """input_ids / labels / position_ids land in a batch_*.safetensors next to the
         activations, byte-identical to what was fed to the forward."""
@@ -1930,7 +1896,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertEqual(meta["kind"], "input_batch")
         self.assertEqual(meta["step"], "0")
         self.assertEqual(meta["input_ids_shape"], str((B, S)))
-        # attention_mask was None; must not appear as a key.
         self.assertNotIn("attention_mask", tensors)
 
     def test_packed_seq_params_dumped_without_cp_group(self):
@@ -1952,7 +1917,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertEqual(meta["packed_seq_params.total_tokens"], "12")
         for key in list(tensors) + list(meta):
             self.assertNotIn("cp_group", key, "cp_group is a ProcessGroup; must never be persisted")
-        # cu_seqlens_q_padded is None on this batch -> absent, not a null entry.
         self.assertNotIn("packed_seq_params.cu_seqlens_q_padded", tensors)
 
     def test_packed_seq_params_tensor_max_seqlen_avoids_host_sync(self):
@@ -1975,7 +1939,6 @@ class MegatronActivationDumpMonitorTest(unittest.TestCase):
         self.assertIn("packed_seq_params.max_seqlen_q", tensors)
         self.assertEqual(int(tensors["packed_seq_params.max_seqlen_q"]), 4)
         self.assertNotIn("packed_seq_params.max_seqlen_q", meta, "tensor must not be stringified")
-        # qkv_format is a genuine python str -> still metadata.
         self.assertEqual(meta["packed_seq_params.qkv_format"], "thd")
 
     def test_batch_dump_disabled(self):
@@ -2221,8 +2184,6 @@ class MegatronLARMonitorTest(unittest.TestCase):
         hidden = torch.randn(S, B, H)
         logits = model.output_layer(hidden)
         monitor.step()
-        # ``lar`` depends on ||W||_rms, so matching the analytical value computed from
-        # ``shared`` pins that the shared tensor (not a stale one) fed the weight stats.
         want_lar, *_ = _lar_analytical(hidden, shared, logits=logits)
         self.assertAlmostEqual(training_logs.get_latest(prefix="lar")["lar/lm_head/lar"], want_lar, places=4)
 
@@ -2240,13 +2201,11 @@ class MegatronLARMonitorTest(unittest.TestCase):
         self.assertIn("lm_head", monitor._sites)
         self.assertEqual(monitor._sites["lm_head"]["H"], H)
 
-        # Drive the real forward so the hook fires with module.weight still None.
         hidden = torch.randn(S, B, H)
         logits = model(hidden)
         monitor.step()
 
         got = training_logs.get_latest(prefix="lar")
-        # ``hidden`` is the decoder input; the head sees the decoder output.
         head_input = model.decoder(hidden)
         want_lar, *_ = _lar_analytical(head_input, model.shared_weight, logits=logits)
         self.assertAlmostEqual(got["lar/lm_head/lar"], want_lar, places=4)
@@ -2296,8 +2255,6 @@ class MegatronLARMonitorTest(unittest.TestCase):
         hidden_masked = hidden.reshape(-1, H)[mask]
         want, *_ = _lar_analytical(hidden_masked, router_weight, logits=hidden_masked @ router_weight.t())
         self.assertAlmostEqual(got, want, places=4)
-
-    # ---------------- sum-of-squares helper: allocation-free forms ----------------
 
     def test_sum_of_squares_matches_naive_form_across_dtypes(self):
         """``vector_norm(dtype=fp32).square()`` replaced ``t.float().pow(2).sum()`` to
@@ -2354,7 +2311,6 @@ class MegatronLARMonitorTest(unittest.TestCase):
         got = lar_module._masked_numel(t, mask)
         self.assertEqual(got.dtype, torch.float64)
         self.assertEqual(int(got), n_valid * vocab)
-        # The fp32 form this replaced does NOT round-trip at this magnitude.
         as_fp32 = int(torch.tensor(float(n_valid * vocab), dtype=torch.float32))
         self.assertNotEqual(as_fp32, n_valid * vocab, "fp32 would have been exact here — pick another count")
 
@@ -2439,8 +2395,6 @@ class MegatronMonitorRegistryTest(unittest.TestCase):
     def test_all_expands_to_the_all_monitors_set(self):
         names = set(megatron_backend._expand_monitor_names(["all"]))
         self.assertEqual(names, set(megatron_backend._ALL_MONITORS))
-        # The full registry is the "all" set plus the opt-in-only monitors, so a future
-        # cheap monitor added to _ALL_MONITORS is picked up by "all" with no test change.
         self.assertEqual(
             set(megatron_backend._MONITOR_MAP) - set(megatron_backend._ALL_MONITORS),
             set(self.OPT_IN_ONLY),

@@ -53,8 +53,6 @@ from .base import TorchProbe
 
 logger = logging.getLogger(__name__)
 
-# PackedSeqParams fields worth persisting. ``cp_group`` (a ProcessGroup) is
-# deliberately excluded — it is not serialisable and carries no analysis value.
 _PACKED_SEQ_TENSOR_FIELDS = (
     "cu_seqlens_q",
     "cu_seqlens_kv",
@@ -69,17 +67,10 @@ _PACKED_SEQ_SCALAR_FIELDS = (
     "total_tokens",
     "local_cp_size",
 )
-# Batch tensors pulled from the model-forward kwargs. ``attention_mask`` is excluded:
-# it is often None (fused/causal paths) or a huge [b,1,s,s] bool tensor.
 _BATCH_TENSOR_KWARGS = ("input_ids", "labels", "position_ids", "loss_mask")
 
-# Filesystem roots a dump must never land in. These are small, shared, often tmpfs;
-# filling one takes down the node and clobbers other jobs on it. A full-hidden dump is
-# easily tens of GB, so this is a live hazard, not a theoretical one.
 _FORBIDDEN_DUMP_ROOTS = ("/tmp", "/var/tmp", "/dev/shm", "/run", "/usr", "/etc", "/boot")
 
-# Deployments can pin an allowed prefix (e.g. a large scratch volume) so a mistyped or
-# CWD-relative dump_dir fails at setup instead of silently filling the wrong disk.
 _DUMP_ROOT_ENV = "INTERNAL_MEDICINE_DUMP_ROOT"
 
 
@@ -119,10 +110,6 @@ def resolve_dump_dir(dump_dir: str) -> str:
                 f"act_dump dump_dir resolves under {bad!r} ({resolved!r}), which is small/shared; "
                 f"filling it takes down the node. Point it at a large writable volume {hint}."
             )
-    # Top-level ancestor must already exist. ``/outputs/act_dumps`` would create
-    # ``/outputs`` — writing to root directly, which is not allowed here. A relative
-    # path under a real run directory (``/root/paddlejob/...``) passes because ``/root``
-    # exists. This is the check that catches a job launched from ``/``.
     top_level = os.sep + resolved.lstrip(os.sep).split(os.sep)[0]
     if not os.path.isdir(top_level):
         raise ValueError(
@@ -181,8 +168,6 @@ class ActivationDumpMonitor(TorchProbe):
             raise ValueError(f"max_dump_steps must be >= 1 or None, got {max_dump_steps!r}")
         if min_channel_max_ratio is not None and min_channel_max_ratio < 0:
             raise ValueError(f"min_channel_max_ratio must be >= 0 or None, got {min_channel_max_ratio!r}")
-        # Store the RESOLVED absolute path: validates the target up-front and makes the
-        # dump location immune to a later os.chdir() mid-run.
         self.dump_dir = resolve_dump_dir(dump_dir)
         self.which = which
         self.sample_layers = set(sample_layers) if sample_layers else None
@@ -281,8 +266,6 @@ class ActivationDumpMonitor(TorchProbe):
             )
             self.hooks.append(hook)
             registered += 1
-        # Batch capture: one model-level pre-hook per unique root module. Fires before
-        # the layer hooks, so the batch is already stashed when the activations land.
         if self.dump_input_batch and model is not None and not any(m is model for m in self._batch_capture_models):
             self._batch_capture_models.append(model)
             hook = model.register_forward_pre_hook(
@@ -394,7 +377,7 @@ class ActivationDumpMonitor(TorchProbe):
         return cpu_tensor, event
 
     # ------------------------------------------------------------------
-    # Hot path: capture the hidden states (no D2H sync, no collectives)
+    # Hot path: capture a random-position sample (no D2H sync, no collectives)
     # ------------------------------------------------------------------
 
     def _make_dump_hook(self, layer_idx: int):
@@ -419,8 +402,6 @@ class ActivationDumpMonitor(TorchProbe):
                     n_tokens = flat.shape[0]
                     ratio_gpu = self._channel_max_ratio(flat)
                     idx_cpu, idx_dev = self._token_indices(n_tokens, flat.device)
-                    # Full dump (the default): skip index_select entirely — the gather
-                    # would copy every row for nothing.
                     sample = flat if idx_cpu.numel() == n_tokens else flat.index_select(0, idx_dev)
                     cpu_tensor, event = self._async_copy_to_cpu(sample)
                     ratio_cpu, ratio_event = self._async_copy_to_cpu(ratio_gpu)
@@ -466,10 +447,6 @@ class ActivationDumpMonitor(TorchProbe):
         """0-dim GPU tensor: max / median of per-channel |activation| max. No host sync."""
         per_channel_max = flat.abs().amax(dim=0).float()
         return per_channel_max.max() / per_channel_max.median().clamp(min=1e-8)
-
-    # ------------------------------------------------------------------
-    # Hot path: capture the input batch (model-level forward pre-hook)
-    # ------------------------------------------------------------------
 
     def _make_batch_capture_hook(self):
         """Stash the batch feeding this forward: ids, labels, position_ids, pack params.
@@ -531,12 +508,6 @@ class ActivationDumpMonitor(TorchProbe):
                     value = getattr(psp, field, None)
                     if value is None:
                         continue
-                    # ``max_seqlen_q/kv`` are ints in the mcore dataclass, but this repo's
-                    # own get_packed_seq_params (src/trainers/gpt_step_fix_cp.py) builds
-                    # them from ``batch["max_seqlen"].squeeze()`` — i.e. 0-dim GPU
-                    # tensors. ``str()``/``int()`` on those would D2H-sync inside a
-                    # forward pre-hook (perf-rules Rule 1), so route tensors through the
-                    # async copy and only stringify genuine python scalars.
                     if isinstance(value, torch.Tensor):
                         cpu_tensor, event = self._async_copy_to_cpu(value.detach())
                         tensors[f"packed_seq_params.{field}"] = cpu_tensor
@@ -634,8 +605,6 @@ class ActivationDumpMonitor(TorchProbe):
                 written += 1
             except Exception as e:
                 logger.error(f"[ActivationDumpMonitor] failed writing {path}: {e}")
-            # Write the batch once, into the same step dir, only if a hidden dump
-            # actually survived the ratio gate — otherwise the batch would be orphaned.
             if written and not batch_written:
                 batch_written = self._write_batch(save_file, step_dir, step_id)
         if self.verbose and (written or skipped):

@@ -20,9 +20,6 @@ MAX_AGGREGATED_SUFFIXES = (
     "channel_p95",
     "channel_p99",
     "activation_rms",
-    # Latent-combine magnitude (moe_health): both compose across token-partitioned
-    # ranks with max, not mean — they exist to catch a spike, and averaging would
-    # dilute it against the healthy ranks. Neither ends in _max, hence listed here.
     "latent_combine_rms",
     "latent_combine_channel_max_median_ratio",
 )

@@ -282,8 +282,6 @@ def compute_latent_combine_stats(hidden_states: torch.Tensor, eps: float | None 
         "latent_combine_channel_max_median_ratio": per_channel_max.max() / per_channel_max.median().clamp(min=1e-8),
     }
     if eps is not None:
-        # Per-token mean square, matching how RMSNorm forms its denominator
-        # (mean over the last dim), then average the ratio over tokens.
         mean_sq = h.square().mean(dim=-1)
         metrics["latent_eps_ratio"] = (eps / (mean_sq + eps)).mean()
     return metrics

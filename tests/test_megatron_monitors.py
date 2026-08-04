@@ -200,23 +200,66 @@ class FakeLatentProj(nn.Module):
         return self.linear(x), None
 
 
-class FakeLatentMoELayer(nn.Module):
-    """Latent MoE layer reproducing mcore's combine -> fc2_latent_proj ordering.
+class FakeTokenDispatcher:
+    """Stand-in for mcore's MoETokenDispatcher.
 
-    ``forward`` mimics ``MoELayer``: experts produce per-expert outputs in LATENT dim,
-    those are combined k-way with router weights, and the combined latent tensor is fed
-    to ``fc2_latent_proj``. The monitor's pre-hook on ``fc2_latent_proj`` must observe
-    exactly that combined tensor — ``self.combined`` is stashed so a test can assert it.
+    Deliberately a PLAIN object, not an nn.Module — the real
+    ``megatron.core.transformer.moe.token_dispatcher.MoETokenDispatcher`` is too, which
+    is why the monitor patches ``combine_postprocess`` on the instance instead of
+    registering a forward hook.
     """
 
-    def __init__(self, hidden_size, latent_size, num_experts, topk=2):
+    def __init__(self):
+        self.combined = None
+
+    def combine_postprocess(self, expert_outputs, probs):
+        combined = sum(p * e for p, e in zip(expert_outputs, probs, strict=True))
+        self.combined = combined
+        return combined
+
+
+class FakeLatentRMSNorm(nn.Module):
+    """RMSNorm on the latent dim, as some models insert between combine and up-proj.
+
+    Its output RMS is ~1 by construction, so a monitor that measured
+    ``fc2_latent_proj``'s INPUT would read a constant regardless of how large the
+    combined expert output actually was.
+    """
+
+    def __init__(self, latent_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(latent_size))
+        self.eps = eps
+
+    def forward(self, x):
+        rms = x.float().square().mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return (x.float() / rms).type_as(x) * self.weight
+
+
+class FakeLatentMoELayer(nn.Module):
+    """Latent MoE layer reproducing mcore's MoELayer.postprocess ordering.
+
+    ``forward`` mirrors the real path: experts produce per-expert outputs in LATENT dim,
+    ``token_dispatcher.combine_postprocess`` sums them k-way with router probs, then
+    ``fc2_latent_proj`` projects latent -> hidden. With ``latent_norm=True`` an RMSNorm
+    sits between the two, which is the case that forced the measurement point to move to
+    the combine's output.
+    """
+
+    def __init__(self, hidden_size, latent_size, num_experts, topk=2, latent_norm=False):
         super().__init__()
         self.router = _FakeRouter(latent_size, num_experts)
         self.fc1_latent_proj = nn.Linear(hidden_size, latent_size, bias=False)
         self.fc2_latent_proj = FakeLatentProj(latent_size, hidden_size)
+        self.token_dispatcher = FakeTokenDispatcher()
+        self.latent_norm = FakeLatentRMSNorm(latent_size) if latent_norm else None
         self.topk = topk
         self.num_experts = num_experts
-        self.combined = None
+
+    @property
+    def combined(self):
+        """The tensor combine_postprocess returned on the last forward."""
+        return self.token_dispatcher.combined
 
     def forward(self, hidden_states, expert_outputs=None, probs=None):
         latent = self.fc1_latent_proj(hidden_states)
@@ -224,9 +267,9 @@ class FakeLatentMoELayer(nn.Module):
             # topk expert outputs in latent dim; combine with uniform weights.
             expert_outputs = [latent for _ in range(self.topk)]
             probs = [1.0 / self.topk] * self.topk
-        combined = sum(p * e for p, e in zip(expert_outputs, probs, strict=True))
-        self.combined = combined
-        out, _ = self.fc2_latent_proj(combined)
+        combined = self.token_dispatcher.combine_postprocess(expert_outputs, probs)
+        self.up_proj_input = self.latent_norm(combined) if self.latent_norm is not None else combined
+        out, _ = self.fc2_latent_proj(self.up_proj_input)
         return out
 
 
@@ -468,9 +511,9 @@ class MegatronMoEMonitorTest(unittest.TestCase):
 
     # ---------------- latent-combine magnitude ----------------
 
-    def test_latent_combine_metrics_measure_post_combine_pre_up_proj_tensor(self):
-        """The pre-hook on fc2_latent_proj must see the k-way-combined LATENT tensor —
-        after expert combine, before the up-projection back to hidden_size."""
+    def test_latent_combine_metrics_measure_combine_postprocess_output(self):
+        """The metrics must describe exactly what combine_postprocess returned — the
+        k-way-combined expert output in LATENT dim."""
         S, B, H, L, E = 4, 2, 8, 5, 4
         layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
         monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
@@ -493,6 +536,45 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             )
             self.assertIn("moe_health/global_latent_combine_rms", latest)
             self.assertIn("moe_health/global_latent_combine_channel_max_median_ratio", latest)
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_combine_survives_rmsnorm_before_up_projection(self):
+        """THE reason the measurement point is combine_postprocess and not
+        fc2_latent_proj's input: with an RMSNorm in between, the up-proj input has RMS
+        ~1 by construction. Measuring there would report ~1 no matter how large the
+        combined expert output grew — a silently useless magnitude metric."""
+        S, B, H, L, E = 4, 2, 8, 6, 4
+        layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E, latent_norm=True)
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+        try:
+            # Combined output is deliberately far from unit scale.
+            big = torch.full((S, B, L), 40.0)
+            big[..., 0] = 400.0
+            layer(torch.randn(S, B, H), expert_outputs=[big], probs=[1.0])
+            monitor.step()
+
+            latest = training_logs.get_latest(prefix="moe_health")
+            got_rms = latest["moe_health/layer_0/latent_combine_rms"]
+
+            combined = layer.combined.detach().reshape(-1, L).float()
+            want_rms = float(combined.square().mean().sqrt())
+            self.assertAlmostEqual(got_rms, want_rms, places=4)
+
+            # The norm did fire and did flatten the scale, so this test is meaningful.
+            normed_rms = float(layer.up_proj_input.detach().reshape(-1, L).float().square().mean().sqrt())
+            self.assertAlmostEqual(normed_rms, 1.0, places=3)
+            self.assertGreater(got_rms, 100.0, "must report the pre-norm magnitude")
+
+            # Same story for the channel ratio: the norm is per-token, so it rescales
+            # rows and would change the per-channel peak distribution.
+            got_ratio = latest["moe_health/layer_0/latent_combine_channel_max_median_ratio"]
+            per_channel_max = combined.abs().amax(dim=0)
+            self.assertAlmostEqual(got_ratio, float(per_channel_max.max() / per_channel_max.median()), places=4)
         finally:
             monitor.remove_hooks()
 
@@ -630,7 +712,7 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         finally:
             monitor.remove_hooks()
 
-    def test_latent_combine_hook_respects_monitor_interval(self):
+    def test_latent_combine_respects_monitor_interval(self):
         S, B, H, L, E = 4, 1, 8, 4, 4
         layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
         monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True, monitor_interval=2)
@@ -644,6 +726,70 @@ class MegatronMoEMonitorTest(unittest.TestCase):
             monitor.step()
             latest = training_logs.get_latest(prefix="moe_health")
             self.assertNotIn("moe_health/layer_0/latent_combine_rms", latest)
+        finally:
+            monitor.remove_hooks()
+
+    def test_combine_postprocess_patch_is_restored_and_transparent(self):
+        """The patch must return combine_postprocess's value untouched and be fully
+        reverted by remove_hooks — a monkey-patch that leaks would corrupt the model for
+        any later run in the same process."""
+        S, B, H, L, E = 4, 1, 8, 4, 4
+        layer = FakeLatentMoELayer(hidden_size=H, latent_size=L, num_experts=E)
+        dispatcher = layer.token_dispatcher
+        original = dispatcher.combine_postprocess
+
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks([(0, layer)])
+
+        self.assertIsNot(dispatcher.combine_postprocess, original, "patch installed")
+        self.assertTrue(dispatcher._im_combine_patched)
+
+        # Transparency: the value the model sees is exactly what the original returned.
+        expert_out = torch.randn(S, B, L)
+        out = layer(torch.randn(S, B, H), expert_outputs=[expert_out], probs=[1.0])
+        self.assertTrue(torch.allclose(layer.combined, expert_out))
+        self.assertEqual(out.shape[-1], H)
+        monitor.step()
+        self.assertIn("moe_health/layer_0/latent_combine_rms", training_logs.get_latest(prefix="moe_health"))
+
+        monitor.remove_hooks()
+        # Reverted by deleting our instance attribute, so lookup falls back to the class
+        # method again (comparing __func__ since bound methods are recreated per access).
+        self.assertNotIn("combine_postprocess", vars(dispatcher))
+        self.assertIs(dispatcher.combine_postprocess.__func__, original.__func__)
+        self.assertFalse(hasattr(dispatcher, "_im_combine_patched"))
+        self.assertFalse(hasattr(dispatcher, "_im_original_combine_postprocess"))
+
+    def test_combine_postprocess_patch_is_not_applied_twice(self):
+        layer = FakeLatentMoELayer(hidden_size=8, latent_size=4, num_experts=4)
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        try:
+            monitor._attach_hooks([(0, layer)])
+            patched_once = layer.token_dispatcher.combine_postprocess
+            monitor._patch_combine_postprocess(0, layer)  # idempotent
+            self.assertIs(layer.token_dispatcher.combine_postprocess, patched_once)
+            self.assertEqual(len(monitor._patched_dispatchers), 1)
+        finally:
+            monitor.remove_hooks()
+
+    def test_latent_combine_skipped_when_dispatcher_absent(self):
+        """A latent MoE whose dispatcher lacks combine_postprocess must not crash setup;
+        the metrics are simply not recorded."""
+        layer = FakeLatentMoELayer(hidden_size=8, latent_size=4, num_experts=4)
+        layer.token_dispatcher = None
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor._find_moe_layers = lambda _model: [(0, layer)]
+        monitor._prepare_layers(object())
+        monitor.allocate_buffers(torch.device("cpu"))
+        try:
+            monitor._attach_hooks([(0, layer)])  # must not raise
+            self.assertEqual(monitor._patched_dispatchers, [])
         finally:
             monitor.remove_hooks()
 

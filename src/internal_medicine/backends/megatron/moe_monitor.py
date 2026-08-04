@@ -68,10 +68,11 @@ _EXPERT_METRICS = (
     "shared_routed_ratio",
 )
 
-# Magnitude of the k-way-combined expert output while still in LATENT dim — the tensor
-# ``MoELayer.postprocess`` hands to ``fc2_latent_proj``. Only declared on latent-MoE
-# models (``config.moe_latent_size`` set); a no-op elsewhere. Captured by wrapping
-# ``fc2_latent_proj``'s forward pre-hook, which sees exactly that tensor.
+# Magnitude of the k-way-combined expert output while still in LATENT dim — the value
+# returned by ``token_dispatcher.combine_postprocess``, i.e. the raw sum of the topk
+# expert outputs weighted by their router probs. Only declared on latent-MoE models
+# (``config.moe_latent_size`` set); a no-op elsewhere. Captured by patching
+# ``combine_postprocess`` per dispatcher instance (see _patch_combine_postprocess).
 _LATENT_COMBINE_METRICS = (
     "latent_combine_rms",
     "latent_combine_channel_max_median_ratio",
@@ -117,6 +118,8 @@ class MoESpecialistMonitor(TorchProbe):
         self._global_lb_enabled = False
         self._load_balance_routers: list[tuple[int, weakref.ref]] = []
         self._orig_reset_model_temporary_tensors = None
+        # Dispatchers whose combine_postprocess we wrapped for latent-combine metrics.
+        self._patched_dispatchers: list[weakref.ref] = []
 
     def register_hooks(self, model: nn.Module):
         self._init_parallel_state()
@@ -182,16 +185,13 @@ class MoESpecialistMonitor(TorchProbe):
                     self.timed_hook("router", self._make_router_hook(layer_idx, moe_layer))
                 )
                 self.hooks.append(hook)
-            # fc2_latent_proj's INPUT is the k-way-combined expert output in latent
-            # dim, so a forward PRE-hook there reads exactly the tensor we want with
-            # no extra copy and no dependence on MoELayer.postprocess internals.
+            # Latent-combine magnitude is read from ``combine_postprocess``'s RETURN
+            # value, not from ``fc2_latent_proj``'s input: models may insert an RMSNorm
+            # between the two, which would pin the measured RMS to ~1 and destroy the
+            # signal. See _patch_combine_postprocess.
             latent_proj = self._latent_proj_of(moe_layer)
             if latent_proj is not None:
-                hook = latent_proj.register_forward_pre_hook(
-                    self.timed_hook("latent_combine", self._make_latent_combine_hook(layer_idx)),
-                    with_kwargs=True,
-                )
-                self.hooks.append(hook)
+                self._patch_combine_postprocess(layer_idx, moe_layer)
 
         logger.info(f"[MoEMonitor] Registered {len(self.hooks)} hooks on {len(targets)} layers.")
 
@@ -199,13 +199,71 @@ class MoESpecialistMonitor(TorchProbe):
     def _latent_proj_of(moe_layer: nn.Module):
         """Return the layer's ``fc2_latent_proj`` (latent -> hidden), else ``None``.
 
-        Present only when ``config.moe_latent_size`` is set: mcore's ``MoELayer``
-        builds ``fc1_latent_proj`` / ``fc2_latent_proj`` as a pair, and
-        ``postprocess`` runs ``fc2_latent_proj`` immediately after
-        ``combine_postprocess``. Non-latent MoE models return ``None`` and the
-        latent-combine metrics are simply never declared.
+        Used only as the "is this a latent MoE?" predicate: mcore's ``MoELayer`` builds
+        ``fc1_latent_proj`` / ``fc2_latent_proj`` as a pair when ``config.moe_latent_size``
+        is set. Non-latent MoE models return ``None`` and the latent-combine metrics are
+        simply never declared. The metrics themselves are measured on
+        ``combine_postprocess``'s output, NOT on this module's input.
         """
         return getattr(moe_layer, "fc2_latent_proj", None)
+
+    def _patch_combine_postprocess(self, layer_idx: int, moe_layer: nn.Module):
+        """Measure the k-way-combined latent tensor at its true source.
+
+        ``MoELayer.postprocess`` runs::
+
+            output = self.token_dispatcher.combine_postprocess(output)   # <- measure HERE
+            output, _ = self.fc2_latent_proj(output)                     # latent -> hidden
+
+        An earlier version hooked ``fc2_latent_proj``'s forward pre-hook instead. That is
+        wrong whenever the model inserts an **RMSNorm between the combine and the
+        up-projection**: the norm pins the tensor's RMS to ~1 by construction, so
+        ``latent_combine_rms`` would read a constant and the channel ratio would describe
+        post-normalisation shape rather than the combine's own magnitude — silently
+        reporting a healthy number no matter how large the combined output grew.
+
+        ``token_dispatcher`` is a plain object, not an ``nn.Module`` (see
+        ``megatron.core.transformer.moe.token_dispatcher.MoETokenDispatcher``), so it has
+        no ``register_forward_hook``. We therefore bind a wrapper onto the instance, the
+        same technique ``_patch_router_cache`` uses for ``router._apply_aux_loss``.
+        Per-instance (not per-class) so each layer keeps its own ``layer_idx``, and the
+        original is restored in ``remove_hooks``.
+        """
+        dispatcher = getattr(moe_layer, "token_dispatcher", None)
+        original = getattr(dispatcher, "combine_postprocess", None)
+        if dispatcher is None or original is None:
+            if self.verbose:
+                logger.warning(
+                    f"[MoEMonitor] layer {layer_idx}: no token_dispatcher.combine_postprocess; "
+                    "latent-combine metrics unavailable"
+                )
+            return
+        if getattr(dispatcher, "_im_combine_patched", False):
+            return
+        monitor = self
+
+        def patched_combine_postprocess(*args, **kwargs):
+            output = original(*args, **kwargs)
+            if monitor._should_monitor() and isinstance(output, torch.Tensor) and output.dim() >= 2:
+                try:
+                    with torch.no_grad():
+                        for name, val in compute_latent_combine_stats(output.detach()).items():
+                            monitor.record_layer_metric(layer_idx, name, val)
+                except Exception as e:
+                    if monitor.verbose:
+                        logger.error(f"[MoEMonitor] latent-combine error layer {layer_idx}: {e}")
+            return output
+
+        dispatcher._im_original_combine_postprocess = original
+        # Remember whether the name lived on the INSTANCE before we patched. Normally it
+        # is a class method, so the correct revert is to delete our instance attribute
+        # and let class lookup take over again — reassigning ``original`` would leave a
+        # bound method in the instance dict, i.e. an instance->bound-method->instance
+        # reference cycle that keeps the dispatcher alive.
+        dispatcher._im_combine_was_instance_attr = "combine_postprocess" in vars(dispatcher)
+        dispatcher.combine_postprocess = patched_combine_postprocess
+        dispatcher._im_combine_patched = True
+        self._patched_dispatchers.append(weakref.ref(dispatcher))
 
     def _patch_expert_bias_update(self):
         """Piggyback on mcore's per-global-batch expert-bias update to emit
@@ -424,45 +482,6 @@ class MoESpecialistMonitor(TorchProbe):
 
         return hook_fn
 
-    def _make_latent_combine_hook(self, layer_idx: int):
-        """Forward pre-hook on ``fc2_latent_proj``: measure its input.
-
-        That input is the k-way-combined expert output, still in latent dim — the
-        tensor produced by ``combine_postprocess`` and consumed by the latent
-        up-projection. Records RMS + per-channel max/mean ratio as 0-dim GPU tensors.
-
-        No cross-rank collective here (perf-rules Rule 2). ``fc2_latent_proj`` is built
-        ``parallel_mode="duplicated"``, so the latent dim is NOT TP-sharded and the
-        per-channel reduction is already complete locally; the token dim is
-        DP/CP-partitioned, and flush-time ``gather_and_aggregate`` composes those with
-        MAX for both metrics (see ``MAX_AGGREGATED``).
-        """
-
-        def hook_fn(module, args, kwargs):
-            if not self._should_monitor():
-                return None
-            try:
-                # mcore calls ``self.fc2_latent_proj(output)`` positionally and
-                # ``TELinear.forward(self, x)`` takes a single tensor; the kwargs
-                # fallback covers a non-TE / renamed linear.
-                hidden = args[0] if args else None
-                if hidden is None and kwargs:
-                    for key in ("x", "inp", "input", "hidden_states"):
-                        if isinstance(kwargs.get(key), torch.Tensor):
-                            hidden = kwargs[key]
-                            break
-                if not isinstance(hidden, torch.Tensor) or hidden.dim() < 2:
-                    return None
-                with torch.no_grad():
-                    for name, val in compute_latent_combine_stats(hidden.detach()).items():
-                        self.record_layer_metric(layer_idx, name, val)
-            except Exception as e:
-                if self.verbose:
-                    logger.error(f"[MoEMonitor] latent-combine hook error layer {layer_idx}: {e}")
-            return None
-
-        return hook_fn
-
     def _compute_expert_metrics_for_all_layers(self):
         """Compute expert/shared norms once per step.
 
@@ -588,8 +607,28 @@ class MoESpecialistMonitor(TorchProbe):
             ):
                 if hasattr(router, attr):
                     delattr(router, attr)
+        for dispatcher_ref in self._patched_dispatchers:
+            dispatcher = dispatcher_ref()
+            if dispatcher is None:
+                continue
+            original = getattr(dispatcher, "_im_original_combine_postprocess", None)
+            if original is not None:
+                if getattr(dispatcher, "_im_combine_was_instance_attr", False):
+                    dispatcher.combine_postprocess = original
+                else:
+                    # Was a class method: drop our instance attribute so lookup falls
+                    # back to the class, leaving no bound-method reference cycle.
+                    dispatcher.__dict__.pop("combine_postprocess", None)
+            for attr in (
+                "_im_original_combine_postprocess",
+                "_im_combine_was_instance_attr",
+                "_im_combine_patched",
+            ):
+                if hasattr(dispatcher, attr):
+                    delattr(dispatcher, attr)
         self._monitored_moe_layers = []
         self._patched_routers = []
+        self._patched_dispatchers = []
         self._load_balance_routers = []
 
     def get_health_summary(self) -> dict[str, Any]:

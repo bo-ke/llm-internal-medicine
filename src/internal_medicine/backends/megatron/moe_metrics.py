@@ -191,16 +191,17 @@ def compute_shared_expert_norm(shared_expert_weights: list[torch.Tensor]) -> tor
 
 
 def compute_latent_combine_stats(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Magnitude stats for the post-combine, pre-``fc2_latent_proj`` tensor.
+    """Magnitude stats for the k-way-combined expert output, in LATENT dim.
 
-    This is the k-way-combined expert output still in LATENT dim, i.e. the tensor
-    ``MoELayer.postprocess`` feeds into ``fc2_latent_proj``. It is the point where
-    ``topk`` expert contributions have just been summed with their router weights, so
-    it is where combine-side magnitude blow-up shows up first — before the latent
-    up-projection smears it back across ``hidden_size``.
+    The measured tensor is what ``token_dispatcher.combine_postprocess`` RETURNS inside
+    ``MoELayer.postprocess`` — the raw sum of the ``topk`` expert outputs weighted by
+    their router probs, before anything downstream touches it. That is deliberately
+    upstream of ``fc2_latent_proj``: a model may put an RMSNorm between the combine and
+    the latent up-projection, which would pin the RMS to ~1 and make this metric
+    constant. Measuring at the combine keeps it a true magnitude signal.
 
     Args:
-        hidden_states: post-combine latent tensor, ``[..., latent_size]``.
+        hidden_states: ``combine_postprocess`` output, ``[..., latent_size]``.
 
     Returns:
         - ``latent_combine_rms``: RMS over all elements, the overall scale of the

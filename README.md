@@ -2,15 +2,15 @@
 
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
-包含五大监控模块：
+`all` 默认打开的五个轻量监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (20 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (21 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
-- **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信）
 
-外加一个非指标类工具：
+另有两个**需显式点名**的模块（不被 `all` 包含，理由见下方说明）：
+- **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信；但每步要读一遍 `[T, vocab]` logits）
 - **[Activation Dump](./docs/activation_dump.md)** — 按 monitor 间隔把残差流 hidden states（默认全量）连同产生它们的输入 batch（`input_ids` / `labels` / `PackedSeqParams`）落盘 (safetensors)，供离线结构分析 (`spec_entropy_explorer.py`)，不上报任何 training_logs 指标
 
 ---
@@ -25,7 +25,7 @@ from internal_medicine import setup_internal_medicine
 # 创建 monitor_dict 用于存储 monitor 实例
 monitor_dict = {}
 
-# 启用全部指标类监控 (默认)
+# 启用一组开销低的指标监控 (默认；不含 act_dump / lar)
 model = setup_internal_medicine(
     model,
     monitors=['all'],              # 或指定 ['moe_health', 'qk_stats', 'massive_act', 'ple_health']
@@ -35,11 +35,19 @@ model = setup_internal_medicine(
 )
 ```
 
-> **`all` 不包含 `act_dump`**。`all` 的语义是"打开全部**指标**监控"，而 `act_dump` 不上报
-> 任何指标、只往磁盘写 hidden-state 张量（当前默认是全量 `[s*b, h]` × 全部层，单个被监控
-> step 就是几十 GB，且 `dump_dir` 必须指向真实大容量卷）。让 `all` 顺带把它打开，会让只想
-> 看指标的人写爆磁盘。需要落盘时显式点名：`act_dump: {...}`（dict 形式）或
-> `monitors=['all', 'act_dump']` —— 与 `all` 并列点名属于显式 opt-in，不会被排除掉。
+> **`all` 不包含 `act_dump` 与 `lar`**。`all` 的语义是"打开一组**开销低的**指标监控"，
+> 这两个都要显式点名才启用：
+>
+> - `act_dump` 不上报任何指标、只往磁盘写 hidden-state 张量（当前默认是全量 `[s*b, h]` ×
+>   全部层，单个被监控 step 就是几十 GB，且 `dump_dir` 必须指向真实大容量卷）。让 `all`
+>   顺带把它打开，会让只想看指标的人写爆磁盘。
+> - `lar` 每个被监控 step 都要读一遍 `[T, vocab]` 的 logits（L12 下 1.5 GiB/microbatch），
+>   并给每个 MoE router 挂 hook、各自重算一次 gating matmul。求和本身已经做到零额外分配
+>   （见 `docs/lar.md` 的 Perf notes），但读带宽与 router hook 数量仍在，所以不和轻量探针
+>   一起默认打开。
+>
+> 启用方式：dict 形式写 `act_dump: {...}` / `lar: {...}`，或
+> `monitors=['all', 'lar']` —— 与 `all` 并列点名属于显式 opt-in，不会被排除掉。
 
 ```python
 # 训练循环

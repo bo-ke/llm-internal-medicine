@@ -84,6 +84,11 @@ Globals:
 
 ## Config
 
+**Not part of `monitors=["all"]`** — LAR reads the `[T, vocab]` logits on every
+monitored step and adds a hook plus a recomputed gating matmul per MoE router, so
+it is opt-in rather than swept in with the cheap probes. Name it explicitly (this
+also works alongside `all`, e.g. `monitors=['all', 'lar']`).
+
 ```yaml
 internal_medicine_monitor_interval: 50
 internal_medicine_monitors:

@@ -14,24 +14,31 @@ from .qk_monitor import QKStatsMonitor, setup_qk_monitor
 
 logger = logging.getLogger(__name__)
 
-# What ``monitors=["all"]`` expands to: the metric monitors, i.e. everything that
-# reports scalars to training_logs.
+# What ``monitors=["all"]`` expands to: the cheap metric monitors.
 _ALL_MONITORS = {
     "qk_stats": setup_qk_monitor,
     "moe_health": setup_moe_monitor,
     "ple_health": setup_ple_monitor,
     "massive_act": setup_massive_activation_monitor,
     "mhc_health": setup_mhc_monitor,
-    "lar": setup_lar_monitor,
 }
 
-# Full registry = the "all" set plus the opt-in-only tools. ``act_dump`` is registry-only
-# on purpose: it reports no metrics and instead writes hidden-state tensors to disk —
-# with the current defaults (full ``[s*b, h]``, all layers) tens of GB per monitored
-# step, against a ``dump_dir`` that has to be a real volume. Sweeping that in via ``all``
-# would fill a disk on a run whose author only wanted metrics, so it must be named:
-# ``act_dump: {...}`` or ``monitors=[..., "act_dump"]``.
-_MONITOR_MAP = {**_ALL_MONITORS, "act_dump": setup_activation_dump_monitor}
+# Full registry = the "all" set plus the opt-in-only monitors. Both extras below are
+# registry-only on purpose; name them to enable (``<name>: {...}`` in the dict form, or
+# ``monitors=[..., "<name>"]``, which is honoured even alongside ``"all"``):
+#
+# - ``act_dump``: reports no metrics at all, instead writing hidden-state tensors to disk
+#   — with the current defaults (full ``[s*b, h]``, all layers) tens of GB per monitored
+#   step, against a ``dump_dir`` that has to be a real volume.
+# - ``lar``: touches the ``[T, vocab]`` logits every monitored step and recomputes a
+#   gating matmul per MoE router. The sums are allocation-free (see ``lar_monitor``'s
+#   ``_sum_of_squares``), but it still reads a 1.5 GiB tensor per microbatch and adds a
+#   hook to every router, so it is opt-in rather than swept in with the cheap probes.
+_MONITOR_MAP = {
+    **_ALL_MONITORS,
+    "act_dump": setup_activation_dump_monitor,
+    "lar": setup_lar_monitor,
+}
 
 
 def _expand_monitor_names(monitors) -> list[str]:

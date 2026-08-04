@@ -172,6 +172,17 @@ class PaddleMoEMonitor(PaddleProbe):
             f"{len(self._expert_norm_layers)} expert-norm layers on {len(moe_layers)} MoE layers."
         )
 
+    @staticmethod
+    def _uses_split_routing(gate) -> bool:
+        """True when the router scores on the sum of two gate projections.
+
+        ``moe_split_feature_routing`` gives the router a second projection
+        (``weight_1``) and routes on ``f(logits_0) + f(logits_1)``. Hash layers
+        opt out (``use_split = split and not is_hash_layer`` in moe_router) and
+        capture their scores through the ``_hash_routing`` patch instead.
+        """
+        return bool(getattr(gate, "moe_split_feature_routing", False)) and not getattr(gate, "is_hash_layer", False)
+
     def _patch_gate_cache(self, gate):
         """Monkey-patch gate.gate_score_func to cache pre-bias gates."""
         if not hasattr(gate, "gate_score_func"):
@@ -187,10 +198,22 @@ class PaddleMoEMonitor(PaddleProbe):
 
         def cached_gate_score_func(logits):
             result = original_fn(logits)
-            if monitor._should_monitor():
-                gate._cached_gates = result.detach()
-            else:
+            if not monitor._should_monitor():
                 gate._cached_gates = None
+                return result
+            scores = result.detach()
+            # Split-feature routing calls this twice per forward and routes on the
+            # SUM of the two views (moe_router: gates = f(logits_0) + f(logits_1)),
+            # so overwriting would leave us with view 1 alone — half of the routing
+            # signal. Accumulate instead. The gate post-hook clears _cached_gates
+            # after every forward, so nothing leaks across forwards. Only the split
+            # path accumulates, so a stray double call elsewhere stays visible
+            # rather than being silently summed.
+            if monitor._uses_split_routing(gate):
+                previous = getattr(gate, "_cached_gates", None)
+                if previous is not None and previous.shape == scores.shape:
+                    scores = previous + scores
+            gate._cached_gates = scores
             return result
 
         gate._im_original_gate_score_func = original_fn

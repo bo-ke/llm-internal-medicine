@@ -382,6 +382,88 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertIsNone(gate._cached_gates)
 
 
+class SplitFeatureRoutingCaptureTest(unittest.TestCase):
+    """``moe_split_feature_routing`` routes on the SUM of two gate views.
+
+    ``moe_router`` computes ``gates = f(logits_0) + f(logits_1)``, so the patched
+    ``gate_score_func`` fires twice per forward. Overwriting the cache would leave
+    the monitor with view 1 alone — half the routing signal — which silently skews
+    every metric derived from it (router_entropy, score_sum_*, bias_affinity_jaccard).
+    """
+
+    class FakeGate:
+        def __init__(self, split):
+            self.moe_split_feature_routing = split
+            self.num_experts_per_tok = 2
+
+        def gate_score_func(self, logits):
+            return paddle.nn.functional.sigmoid(logits)
+
+    def _patched_gate(self, split):
+        monitor = PaddleMoEMonitor()
+        gate = self.FakeGate(split)
+        monitor._patch_gate_cache(gate)
+        return monitor, gate
+
+    def test_split_routing_accumulates_both_views(self):
+        _monitor, gate = self._patched_gate(split=True)
+        logits_0 = paddle.to_tensor([[1.0, -1.0, 0.5, 0.0]], dtype="float32")
+        logits_1 = paddle.to_tensor([[-2.0, 2.0, 0.0, 0.25]], dtype="float32")
+
+        gate.gate_score_func(logits_0)
+        gate.gate_score_func(logits_1)
+
+        expected = paddle.nn.functional.sigmoid(logits_0) + paddle.nn.functional.sigmoid(logits_1)
+        self.assertTrue(paddle.allclose(gate._cached_gates, expected, atol=1e-6).item())
+
+    def test_split_routing_top_experts_come_from_the_sum(self):
+        """View 1 alone ranks experts differently from the sum the router uses."""
+        _monitor, gate = self._patched_gate(split=True)
+        logits_0 = paddle.to_tensor([[4.0, 4.0, -4.0, -4.0]], dtype="float32")
+        logits_1 = paddle.to_tensor([[-1.0, -2.0, 3.0, 2.0]], dtype="float32")
+
+        gate.gate_score_func(logits_0)
+        gate.gate_score_func(logits_1)
+
+        summed_top = paddle.topk(gate._cached_gates, 2, axis=-1)[1].numpy().flatten().tolist()
+        view1_top = paddle.topk(paddle.nn.functional.sigmoid(logits_1), 2, axis=-1)[1].numpy().flatten().tolist()
+        self.assertEqual(sorted(summed_top), [0, 1])
+        self.assertNotEqual(sorted(summed_top), sorted(view1_top))
+
+    def test_single_view_router_keeps_last_write(self):
+        """Without split routing the cache must not accumulate."""
+        _monitor, gate = self._patched_gate(split=False)
+        logits_0 = paddle.to_tensor([[1.0, -1.0, 0.5, 0.0]], dtype="float32")
+        logits_1 = paddle.to_tensor([[-2.0, 2.0, 0.0, 0.25]], dtype="float32")
+
+        gate.gate_score_func(logits_0)
+        gate.gate_score_func(logits_1)
+
+        expected = paddle.nn.functional.sigmoid(logits_1)
+        self.assertTrue(paddle.allclose(gate._cached_gates, expected, atol=1e-6).item())
+
+    def test_hash_layers_opt_out_of_split_accumulation(self):
+        """Hash layers bypass split routing and capture via _hash_routing instead."""
+        gate = self.FakeGate(split=True)
+        gate.is_hash_layer = True
+        self.assertFalse(PaddleMoEMonitor._uses_split_routing(gate))
+
+    def test_cache_cleared_between_forwards_prevents_leakage(self):
+        """The gate post-hook clears the cache, so forwards never accumulate."""
+        _monitor, gate = self._patched_gate(split=True)
+        logits = paddle.to_tensor([[1.0, -1.0, 0.5, 0.0]], dtype="float32")
+
+        gate.gate_score_func(logits)
+        gate.gate_score_func(logits)
+        two_views = gate._cached_gates.clone()
+
+        gate._cached_gates = None  # what _make_gate_hook's finally block does
+        gate.gate_score_func(logits)
+        gate.gate_score_func(logits)
+
+        self.assertTrue(paddle.allclose(gate._cached_gates, two_views, atol=1e-6).item())
+
+
 class PaddleMassiveActivationMonitorTest(unittest.TestCase):
     def setUp(self):
         training_logs.reset()

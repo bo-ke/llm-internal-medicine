@@ -8,6 +8,7 @@
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 8 指标；仅在开启 mHC 层时生效)
+- **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 
 ---
 
@@ -128,7 +129,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health`
+- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health`
 - `global_idx`: 考虑 PP (Pipeline Parallelism) 的全局层索引 = `pp_rank × local_layers + local_idx`
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
 
@@ -367,6 +368,61 @@ hc 模块处重置）——PP=1 时精确，PP>1 时为 stage 局部近似。
 
 ---
 
+## 六、VHA Health Monitor (vha_health)
+
+> **仅 paddlefleet 后端**。只在 `use_vha_attention=true` 时生效——模型不含 VHA postmix 参数时该 monitor 为彻底
+> no-op（不 wrap、不产生指标）。
+
+VHA (Virtual Head Attention) 把**物理 query head 减半**、`H_kv` 设为 2，再用两个**严格线性**的算子把表达力
+补回来：
+
+- **Q Premix** — 在每个 KV group 内对 query 做**近恒等**线性变换，把减半的物理 query head 扩展成
+  `H_v = H'_q × H_kv` 个虚拟头，恢复注意力多样性。PaddleFleet 初始化为 `I + 0.1/√d · N(0,1)`
+  （`q_head_dim == head_dim` 时；否则退化为缩放正交初始化）。需开 `use_vha_premix`，未开启不声明 premix 指标。
+- **Linear Postmix** — 在注意力输出的 head 轴上做低秩恒等残差 `I + A Bᵗ`（`r = H'_q`），融合跨组的 inter-head
+  特征。位置在 gate 与 `o_proj` **之前**；PaddleFleet 的参数名是 `vha_postmix_U` / `vha_postmix_V`，即 `A` / `B`。
+  `B` 零初始化，故初始为**精确恒等**、`delta ≡ 0`。
+
+两者在推理时都会被折叠（Premix 进 `q_proj`、Postmix 进 `o_proj`），模型退化成标准 GQA-2。**也就是说这两个矩阵
+只在训练期存在，训练期是唯一能观测其结构的时机。**
+
+这两处对其他 monitor 都不可见：`qk_stats` 采样点在 `core_attention` 的**输入**（Postmix 发生在其后），
+`massive_act` 只看残差流（Postmix 的效果被 `o_proj` 和残差加法稀释）。
+
+| # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
+|---|------|--------|------|------|----------|
+| 1 | `{b}_postmix_delta_rel_mean` | `vha_health/layer_{i}/{b}_postmix_delta_rel_mean` | `mean_t(‖delta_t‖₂ / ‖mixed_t‖₂)` | 每层+全局 | **首要指标**：从 0 起长，回答「Postmix 是否在学」 |
+| 2 | `{b}_postmix_delta_rel_max` | `vha_health/layer_{i}/{b}_postmix_delta_rel_max` | `max_t(‖delta_t‖₂ / ‖mixed_t‖₂)` | 每层+全局 | 最坏 token 的修正幅度，看突刺 |
+| 3 | `{b}_postmix_amax_gain_max` | `vha_health/layer_{i}/{b}_postmix_amax_gain_max` | `max_t(‖out_t‖_∞ / ‖mixed_t‖_∞)` | 每层+全局 | 低精度溢出余量（同 mHC `amax_gain` 口径） |
+| 4 | `{b}_postmix_uv_sigma_max` | `vha_health/layer_{i}/{b}_postmix_uv_sigma_max` | `σ_max(A Bᵗ)` | 每层+全局 | 混合算子偏离恒等的强度上界 |
+| 5 | `{b}_postmix_uv_eff_rank` | `vha_health/layer_{i}/{b}_postmix_uv_eff_rank` | `exp(-Σ p log p)`, `p = σ/Σσ` | 每层+全局 | 是否守在低秩预算内（**涨= 警告**，见下） |
+| 6 | `{b}_postmix_offdiag_ratio` | `vha_health/layer_{i}/{b}_postmix_offdiag_ratio` | `‖M − diag(M)‖_F / ‖M‖_F` | 每层+全局 | 趋 0 = 退化成 per-head 缩放，无真实跨头混合 |
+| 7 | `{b}_postmix_u_fro` / `{b}_postmix_v_fro` | `vha_health/layer_{i}/{b}_postmix_{u,v}_fro` | `‖A‖_F` / `‖B‖_F` | 每层+全局 | 哪个因子在长 |
+| 8 | `{b}_head_out_norm_max/min/std` | `vha_health/layer_{i}/{b}_head_out_norm_*` | per-head 输出范数（token 均值）的 max/min/std | 每层+全局 | 某个 head 被压成 0 或被放大 |
+| 9 | `{b}_postmix_head_cos_mean` | `vha_health/layer_{i}/{b}_postmix_head_cos_mean` | token 均值 head 向量间的平均 \|cos\| | 每层+全局 | 趋 1 = 各 head 退化成彼此的复制 |
+| 10 | `premix_identity_dev` | `vha_health/layer_{i}/premix_identity_dev` | 组均值 `‖W_g − I‖_F` | 每层+全局 | Premix 离「无操作」多远 |
+| 11 | `premix_group_div_ratio` | `vha_health/layer_{i}/premix_group_div_ratio` | `mean_{g<g'}‖W_g − W_g'‖²_F / mean_g‖W_g − I‖²_F` | 每层+全局 | group-conditioned query specialization：0 = 各组学成同一个变换，2 = 完全独立 |
+| 12 | `premix_sigma_max` | `vha_health/layer_{i}/premix_sigma_max` | `σ_max(W)` | 每层+全局 | Premix 谱范数（近恒等时约 1） |
+| 13 | `premix_orth_dev` | `vha_health/layer_{i}/premix_orth_dev` | `‖WᵀW − I‖_F` | 每层+全局 | 仅 `q_head_dim ≠ head_dim`（正交初始化）时代替 10~11 |
+
+`{b}` ∈ `{main, sparse}`：MQA 栈的 block-sparse 分支持有独立的 `sparse_vha_postmix_U/V`，两套参数分开统计。
+混合栈上注意力类型同样会前置到指标名，例如 `vha_health/layer_5/hca_main_postmix_delta_rel_max`。
+premix 的指标集由权重形状决定（方阵 → 10~12；非方阵 → 12~13；`H_kv = 1` 时无 11），形状在注册时已知，
+因此仍满足「declare 完再 allocate」。
+
+### 健康判读
+
+- `postmix_delta_rel_mean` 长期贴 0 → Postmix 没在学（检查 `B` 的梯度/学习率是否被误置零）。
+- `postmix_delta_rel_max` 出现数量级突刺，或 `postmix_amax_gain_max` 明显 > 1 → 低精度下有溢出风险。
+- `postmix_offdiag_ratio` 趋 0 而 `postmix_uv_sigma_max` 在长 → 学成了 per-head 缩放，跨头混合的容量没用上。
+- `postmix_uv_eff_rank` 持续爬向配置的 `r` → **警告而非健康**。低秩瓶颈是设计上的结构正则，VHA 论文的消融显示
+  `r = 32/128` 虽然训练 loss 更低但评测更差；有效秩顶满通常伴随过拟合倾向。
+- `postmix_head_cos_mean` 趋 1 或 `head_out_norm_min` 趋 0 → head 退化。
+- `premix_group_div_ratio` 趋 0 → 各 KV group 学成同一个 query 变换，虚拟头没有按组分化；趋 2 → 各组完全独立。
+  论文观测到的是「显著不同但并非独立」，两端都是异常。
+
+---
+
 ## 基础设施
 
 ### TrainingLogs
@@ -477,3 +533,18 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **PLE** | `residual_ratio` | `\|\|Δ\|\|/\|\|h\|\|` | mean | 适中 |
 | **PLE** | `gate_activation_mean` | `mean(\|act(gate)\|)` | mean | 非零 |
 | **PLE** | `gate_sparsity` | `dead_ratio` | mean | 不应持续上升 |
+| **VHA** | `{b}_postmix_delta_rel_mean` | `mean_t(‖delta‖/‖mixed‖)` | mean | postmix 是否在学 (0 起步) |
+| **VHA** | `{b}_postmix_delta_rel_max` | `max_t(‖delta‖/‖mixed‖)` | max | 最坏 token 修正幅度 |
+| **VHA** | `{b}_postmix_amax_gain_max` | `max_t(‖out‖_∞/‖mixed‖_∞)` | max | 低精度溢出余量 |
+| **VHA** | `{b}_postmix_uv_sigma_max` | `σ_max(A Bᵗ)` | max | 偏离恒等的强度上界 |
+| **VHA** | `{b}_postmix_uv_eff_rank` | `exp(-Σ p log p)` | mean | 是否守在低秩预算内 (涨=警告) |
+| **VHA** | `{b}_postmix_offdiag_ratio` | `‖A−diag(A)‖_F/‖I+A‖_F` | mean | 趋 0 = 退化成 per-head 缩放 |
+| **VHA** | `{b}_postmix_u_fro` / `{b}_postmix_v_fro` | `‖A‖_F` / `‖B‖_F` | mean | 哪个因子在长 |
+| **VHA** | `{b}_head_out_norm_max` | per-head 输出范数最大 | max | head 被放大 |
+| **VHA** | `{b}_head_out_norm_min` | per-head 输出范数最小 | min | head 被压成 0 |
+| **VHA** | `{b}_head_out_norm_std` | per-head 输出范数离散度 | mean | head 间幅度分化 |
+| **VHA** | `{b}_postmix_head_cos_mean` | 均值 head 向量间平均 \|cos\| | mean | 趋 1 = head 退化成复制 |
+| **VHA** | `premix_identity_dev` | 组均值 `‖W_g − I‖_F` | mean | Premix 离无操作多远 (需 use_vha_premix) |
+| **VHA** | `premix_group_div_ratio` | `mean‖W_g−W_g'‖²/mean‖W_g−I‖²` | mean | 0=各组同一变换, 2=完全独立 |
+| **VHA** | `premix_sigma_max` | `σ_max(W)` | max | premix 谱范数 (需 use_vha_premix) |
+| **VHA** | `premix_orth_dev` | `‖WᵀW − I‖_F` | mean | 仅非方阵 premix (正交初始化) |

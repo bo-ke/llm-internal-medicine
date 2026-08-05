@@ -8,6 +8,7 @@ from .massive_activation_monitor import PaddleMassiveActivationMonitor, setup_ma
 from .mhc_monitor import PaddleMHCHealthMonitor, setup_mhc_monitor
 from .moe_monitor import PaddleMoEMonitor, setup_moe_monitor
 from .qk_monitor import PaddleQKStatsMonitor, setup_qk_monitor
+from .vha_monitor import PaddleVHAHealthMonitor, setup_vha_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,7 @@ _MONITOR_MAP = {
     "moe_health": setup_moe_monitor,
     "massive_act": setup_massive_activation_monitor,
     "mhc_health": setup_mhc_monitor,
+    "vha_health": setup_vha_monitor,
 }
 
 _MODEL_MONITOR_ATTR = "_internal_medicine_paddlefleet_monitors"
@@ -102,4 +104,6 @@ __all__ = [
     "setup_massive_activation_monitor",
     "PaddleMHCHealthMonitor",
     "setup_mhc_monitor",
+    "PaddleVHAHealthMonitor",
+    "setup_vha_monitor",
 ]

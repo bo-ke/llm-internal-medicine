@@ -181,8 +181,15 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/layer_1/load_max_median_ratio"], 2.5, places=5)
         # CV = population std / mean. layer 0 mean=3, std=sqrt(((2)+(0)+(1)+(1))/4)=sqrt(1.5)
         self.assertAlmostEqual(latest["moe_health/layer_0/load_cv"], (1.5**0.5) / 3.0, places=5)
+        # Normalized load entropy H(p)/log(E) and effective experts exp(H).
+        self.assertAlmostEqual(latest["moe_health/layer_0/load_balance_entropy_norm"], 0.943959, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_1/load_balance_entropy_norm"], 0.742738, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_0/load_effective_experts"], 3.701009, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_1/load_effective_experts"], 2.800094, places=5)
         self.assertIn("moe_health/global_load_max_min_ratio", latest)
         self.assertIn("moe_health/global_load_cv", latest)
+        self.assertIn("moe_health/global_load_balance_entropy_norm", latest)
+        self.assertIn("moe_health/global_load_effective_experts", latest)
 
     def test_load_balance_metrics_absent_without_any_source(self):
         # When no router exposes global_tokens_per_expert and none has expert-bias

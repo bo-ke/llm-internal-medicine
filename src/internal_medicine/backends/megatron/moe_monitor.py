@@ -56,6 +56,8 @@ _LOAD_BALANCE_METRICS = (
     "load_max_min_ratio",
     "load_max_median_ratio",
     "load_cv",
+    "load_balance_entropy_norm",
+    "load_effective_experts",
 )
 
 _EXPERT_METRICS = (
@@ -285,14 +287,11 @@ class MoESpecialistMonitor(TorchProbe):
         ratios = compute_load_balance_ratios(tokens_per_expert)
         if ratios is None:
             return
-        max_min = ratios["load_max_min_ratio"]
-        max_median = ratios["load_max_median_ratio"]
-        load_cv = ratios["load_cv"]
-        n = min(max_min.shape[0], len(layer_order))
+        # Every metric shares the same leading (layer) dim; align to layer_order.
+        n = min(next(iter(ratios.values())).shape[0], len(layer_order))
         for row, layer_idx in zip(range(n), layer_order[:n], strict=False):
-            self.record_layer_metric(layer_idx, "load_max_min_ratio", max_min[row])
-            self.record_layer_metric(layer_idx, "load_max_median_ratio", max_median[row])
-            self.record_layer_metric(layer_idx, "load_cv", load_cv[row])
+            for name in _LOAD_BALANCE_METRICS:
+                self.record_layer_metric(layer_idx, name, ratios[name][row])
 
     def _patch_router_cache(self, router):
         if not hasattr(router, "_apply_aux_loss"):

@@ -621,6 +621,10 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         layer.config = SimpleNamespace(layernorm_epsilon=eps)
         return layer
 
+    @staticmethod
+    def _latent_eps_layer_resolved_eps(layer):
+        return MoESpecialistMonitor._layernorm_eps_of(layer)
+
     def _run_latent_eps(self, layer, expert_out):
         monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
         monitor._find_moe_layers = lambda _model: [(0, layer)]
@@ -704,6 +708,44 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         self.assertNotIn(name, MoESpecialistMonitor.MIN_AGGREGATED)
         self.assertFalse(training_logs._is_max_metric(f"moe_health/layer_0/{name}"))
         self.assertFalse(training_logs._is_min_metric(f"moe_health/layer_0/{name}"))
+
+    def test_latent_eps_ratio_prefers_the_latent_norms_own_eps(self):
+        """A latent norm may carry its own eps; the ratio must use THAT, not the global
+        knob. Normalising u (natural scale ~1e-3) is a different regime from a unit-scale
+        hidden state, and moving layernorm_epsilon would move five other norms with it —
+        so a model that sets moe_latent_norm_eps is running a norm the global value does
+        not describe, and a ratio computed from the global value would read identically
+        to the un-modified baseline."""
+        layer = self._latent_eps_layer(eps=1e-5)
+        layer.config.moe_latent_norm_eps = 1e-8
+        self.assertEqual(self._latent_eps_layer_resolved_eps(layer), 1e-8)
+        latest = self._run_latent_eps(layer, torch.full((4, 2, 4), 1e-3))
+        got = latest["moe_health/layer_0/latent_eps_ratio"]
+        # mean(h**2) == 1e-6, so the eps that is actually in the denominator is decisive:
+        # 1e-8 -> ~0.01 (the norm normalises), 1e-5 -> ~0.91 (eps swamps it).
+        self.assertAlmostEqual(got, 1e-8 / (1e-6 + 1e-8), places=5)
+        self.assertLess(got, 0.02)
+
+    def test_latent_eps_ratio_falls_back_to_the_global_knob(self):
+        """Regression guard: a model WITHOUT the per-norm field must read exactly as
+        before — every model that does not set it is unaffected."""
+        layer = self._latent_eps_layer(eps=1e-5)
+        self.assertFalse(hasattr(layer.config, "moe_latent_norm_eps"))
+        self.assertEqual(self._latent_eps_layer_resolved_eps(layer), 1e-5)
+        latest = self._run_latent_eps(layer, torch.full((4, 2, 4), 1e-3))
+        self.assertAlmostEqual(latest["moe_health/layer_0/latent_eps_ratio"], 1e-5 / (1e-6 + 1e-5), places=5)
+
+        # An explicit None means "not materialised" and must behave like absent.
+        layer_none = self._latent_eps_layer(eps=1e-5)
+        layer_none.config.moe_latent_norm_eps = None
+        self.assertEqual(self._latent_eps_layer_resolved_eps(layer_none), 1e-5)
+
+        # 0.0 is NOT a fallback trigger: a norm running at eps=0 is described by 0, and
+        # reporting the global 1e-5 instead would be the same silent mismatch the
+        # prefers-the-real-eps rule exists to prevent.
+        layer_zero = self._latent_eps_layer(eps=1e-5)
+        layer_zero.config.moe_latent_norm_eps = 0.0
+        self.assertEqual(self._latent_eps_layer_resolved_eps(layer_zero), 0.0)
 
     def test_latent_combine_metrics_measure_combine_postprocess_output(self):
         """The metrics must describe exactly what combine_postprocess returned — the

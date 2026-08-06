@@ -198,15 +198,31 @@ class MoESpecialistMonitor(TorchProbe):
 
     @staticmethod
     def _layernorm_eps_of(moe_layer: nn.Module) -> float | None:
-        """Return ``config.layernorm_epsilon`` for this layer, else ``None``.
+        """Return the eps this layer's latent norm uses, else ``None``.
 
-        This is the eps a latent RMSNorm sitting before ``fc2_latent_proj`` would use
-        (mcore's single knob for every LayerNorm/RMSNorm, ``transformer_config.py:184``,
-        default ``1e-5``). Used only to parameterise ``latent_eps_ratio``; absent config
-        means the ratio is not emitted rather than guessed.
+        ``layernorm_epsilon`` is mcore's single knob for every LayerNorm/RMSNorm
+        (``transformer_config.py:184``, default ``1e-5``), so it is the right answer for
+        a model whose latent norm just inherits the global value. But a model may give
+        the latent norm its OWN eps — normalising ``u`` (natural scale ~1e-3) is a very
+        different regime from normalising a unit-scale hidden state, and moving the
+        global knob would move five other norms with it. When such a field is present it
+        is what that norm actually runs with, so prefer it; ``latent_eps_ratio`` computed
+        from the global value would otherwise describe a norm that does not exist and
+        read identically to the un-modified baseline.
+
+        Used only to parameterise ``latent_eps_ratio``; absent config means the ratio is
+        not emitted rather than guessed. ``None`` in the per-norm field means "not set"
+        and also falls back; any other value, ``0.0`` included, is taken as given —
+        reporting the global eps for a norm that runs at 0.0 would be the same silent
+        mismatch this prefers-the-real-eps rule exists to prevent.
         """
         config = getattr(moe_layer, "config", None)
-        eps = getattr(config, "layernorm_epsilon", None) if config is not None else None
+        if config is None:
+            return None
+        eps = getattr(config, "moe_latent_norm_eps", None)
+        if eps is None:
+            # No per-norm field (every other model) -> the global knob, i.e. unchanged.
+            eps = getattr(config, "layernorm_epsilon", None)
         return float(eps) if isinstance(eps, int | float) else None
 
     def _patch_combine_postprocess(self, layer_idx: int, moe_layer: nn.Module):

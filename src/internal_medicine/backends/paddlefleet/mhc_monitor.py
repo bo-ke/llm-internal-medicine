@@ -4,24 +4,32 @@ Paddle port of ``backends/megatron/mhc_monitor.py``. Monitors the three
 per-token mappings of every ``HyperConnectionModule`` in an mHC
 (Manifold-Constrained Hyper-Connections) model:
 
-- ``h_pre`` / ``h_post`` — the aggregation / expansion gates: mean and std.
+- ``h_pre`` / ``h_post`` — the aggregation / expansion gates: mean and std, plus
+  the stream concentration and token sensitivity of ``h_post``.
 - ``h_res``              — the doubly-stochastic residual-mixing matrix: the
   paper's ``amax_gain`` forward (max-abs row sum) and backward (max-abs column
   sum), computed both on this layer's ``h_res`` and on the running **composite
   mapping** (cumulative product of ``h_res`` across the layers local to this
   pipeline stage / VPP chunk).
+- the **two update terms** of ``x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)``:
+  their relative magnitude, i.e. how much this layer still writes into the
+  residual streams.
 
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 8
-mean-aggregated series, name-prefixed by component:
+Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 12
+series, name-prefixed by component:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
+    {attn,mlp}_h_post_stream_concentration  {attn,mlp}_h_post_token_std
+    {attn,mlp}_branch_residual_share  {attn,mlp}_branch_residual_share_max
     {attn,mlp}_amax_gain_fwd            {attn,mlp}_amax_gain_bwd
     {attn,mlp}_composite_amax_gain_fwd  {attn,mlp}_composite_amax_gain_bwd
 
 ``h_pre`` is not part of ``HyperConnectionModule.forward``'s return, so we
 cannot use a forward hook. Instead we wrap the module's ``compute_mappings``
 bound method to capture its real ``(h_pre, h_post, h_res)`` — no recompute.
+The branch/residual ratio needs the sublayer output too, which only exists where
+the two terms are combined, so ``fused_h_res_h_post_bda`` is wrapped as well.
 Everything is detached and computed under ``no_grad`` (see the VRAM-safety
 notes on the hook).
 
@@ -40,7 +48,7 @@ import paddle.nn as nn
 
 from .base import PaddleProbe
 from .layer_discovery import get_decoder_layers, iter_monitor_layers
-from .mhc_metrics import amax_gain, gate_stats
+from .mhc_metrics import amax_gain, branch_residual_share, gate_stats, h_post_structure_stats
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +69,20 @@ _METRIC_NAMES = (
     "h_pre_std",
     "h_post_mean",
     "h_post_std",
+    "h_post_stream_concentration",
+    "h_post_token_std",
+    "branch_residual_share",
+    "branch_residual_share_max",
     "amax_gain_fwd",
     "amax_gain_bwd",
     "composite_amax_gain_fwd",
     "composite_amax_gain_bwd",
 )
+
+# Only the worst-token branch ratio keeps extremum semantics across
+# microbatches / layers / ranks; everything else is a mean. The name ends in
+# `_max`, so training_logs' suffix classifier agrees on the full key too.
+_MAX_METRICS = frozenset({"branch_residual_share_max"})
 
 # (component_name, layer attribute) — attn runs before mlp in the layer forward.
 _COMPONENTS = (
@@ -103,10 +120,10 @@ class PaddleMHCHealthMonitor(PaddleProbe):
     """Monitor the h_pre / h_post / h_res mappings of mHC hyper-connection layers."""
 
     METRIC_PREFIX = "mhc_health"
-    # Every metric is a mean over tokens/batch (and over microbatches/ranks at
-    # flush). No max/min series, so both classification sets stay empty. The
-    # metric names end in _mean/_std/_fwd/_bwd — never a `_max`/`_min` boundary —
-    # so training_logs' suffix classifier also keeps them as "mean".
+    # All metrics but one are means over tokens/batch (and over microbatches /
+    # ranks at flush); `branch_residual_share_max` is the single extremum series.
+    # Component-prefixed names are registered in __init__, because
+    # record_layer_metric classifies on the name it is handed.
     MAX_AGGREGATED: set[str] = set()
     MIN_AGGREGATED: set[str] = set()
 
@@ -117,6 +134,7 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         monitor_interval: int = 1,
         verbose: bool = False,
     ):
+        self.MAX_AGGREGATED = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _MAX_METRICS}
         super().__init__(
             log_per_layer=log_per_layer,
             log_global=log_global,
@@ -125,8 +143,8 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         )
         # chunk_id -> running composite mapping [s*b, n, n], detached (no graph).
         self._composite: dict[int, paddle.Tensor] = {}
-        # (module, original_compute_mappings) pairs, for remove_hooks() restoration.
-        self._wrapped: list[tuple[nn.Layer, object]] = []
+        # (module, attribute name, original bound method) triples, for remove_hooks().
+        self._wrapped: list[tuple[nn.Layer, str, object]] = []
 
     # ------------------------------------------------------------------
     # Discovery
@@ -204,8 +222,15 @@ class PaddleMHCHealthMonitor(PaddleProbe):
             for layer_idx, comp, mod, chunk_id, is_root in entries:
                 orig = mod.compute_mappings
                 mod.compute_mappings = self._make_capture(orig, layer_idx, comp, chunk_id, is_root)
-                self._wrapped.append((mod, orig))
-        logger.info(f"[PaddleMHCMonitor] Wrapped {len(self._wrapped)} hyper-connection modules.")
+                self._wrapped.append((mod, "compute_mappings", orig))
+                # The branch/residual ratio needs the sublayer output, which only
+                # exists at the point where the two update terms are combined.
+                orig_bda = getattr(mod, "fused_h_res_h_post_bda", None)
+                if orig_bda is None:
+                    continue
+                mod.fused_h_res_h_post_bda = self._make_bda_capture(orig_bda, layer_idx, comp)
+                self._wrapped.append((mod, "fused_h_res_h_post_bda", orig_bda))
+        logger.info(f"[PaddleMHCMonitor] Wrapped {len(self._wrapped)} hyper-connection methods.")
 
     def register_hooks(self, model):
         """Discover, declare, allocate, and attach — the whole three-phase setup."""
@@ -219,14 +244,14 @@ class PaddleMHCHealthMonitor(PaddleProbe):
     def remove_hooks(self):
         # Restore the original bound methods and drop all cross-call state so
         # the monitor holds no module references or composite tensors after
-        # teardown. ``del mod.compute_mappings`` removes the instance attribute
-        # and falls back to the class method; if that fails (e.g. slots), we
-        # re-bind the captured original.
-        for mod, orig in self._wrapped:
+        # teardown. ``del mod.<attr>`` removes the instance attribute and falls
+        # back to the class method; if that fails (e.g. slots), we re-bind the
+        # captured original.
+        for mod, attr, orig in self._wrapped:
             try:
-                del mod.compute_mappings
+                delattr(mod, attr)
             except AttributeError:
-                mod.compute_mappings = orig
+                setattr(mod, attr, orig)
         self._wrapped = []
         self._composite.clear()
         super().remove_hooks()
@@ -276,6 +301,8 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                     self.record_layer_metric(layer_idx, f"{component}_h_pre_std", pre_std)
                     self.record_layer_metric(layer_idx, f"{component}_h_post_mean", post_mean)
                     self.record_layer_metric(layer_idx, f"{component}_h_post_std", post_std)
+                    for name, value in h_post_structure_stats(h_post).items():
+                        self.record_layer_metric(layer_idx, f"{component}_{name}", value)
 
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_fwd", amax_gain(h_res, axis=-1))
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_bwd", amax_gain(h_res, axis=-2))
@@ -303,6 +330,56 @@ class PaddleMHCHealthMonitor(PaddleProbe):
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[PaddleMHCMonitor] Error layer {layer_idx}/{component}: {e}")
+            return out
+
+        return wrapped
+
+    def _make_bda_capture(self, orig, layer_idx: int, component: str):
+        """Wrap ``fused_h_res_h_post_bda`` to record the branch/residual ratio.
+
+        This is the only place where both terms of the mHC update are available:
+        the call receives ``h_res`` + ``original_residual`` (the residual term's
+        inputs) and ``layer_output_with_bias`` (the branch term's input). Metrics
+        are derived from the **arguments**, so both the fused fast path and the
+        sequential dropout path are covered identically, and the call itself is
+        forwarded untouched.
+
+        Arguments are read by keyword with a positional fallback: PaddleFleet's
+        transformer layer calls this with keywords today, but relying on that
+        alone would silently stop recording if it ever switched.
+        """
+
+        def wrapped(*args, **kwargs):
+            out = orig(*args, **kwargs)
+            if not self._should_monitor():
+                return out
+            try:
+
+                def pick(name, pos):
+                    if name in kwargs:
+                        return kwargs[name]
+                    return args[pos] if len(args) > pos else None
+
+                h_res = pick("h_res", 0)
+                original_residual = pick("original_residual", 1)
+                h_post = pick("h_post", 2)
+                layer_output_with_bias = pick("layer_output_with_bias", 3)
+                if h_res is None or original_residual is None or h_post is None:
+                    return out
+                if isinstance(layer_output_with_bias, tuple):
+                    layer_output, bias = layer_output_with_bias
+                else:
+                    layer_output, bias = layer_output_with_bias, None
+                if layer_output is None:
+                    return out
+
+                with paddle.no_grad():
+                    stats = branch_residual_share(h_res, original_residual, h_post, layer_output, bias)
+                    for name, value in stats.items():
+                        self.record_layer_metric(layer_idx, f"{component}_{name}", value)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[PaddleMHCMonitor] Error bda layer {layer_idx}/{component}: {e}")
             return out
 
         return wrapped

@@ -62,7 +62,8 @@ internal_medicine_monitors:
 
 ## 监控指标
 
-每个 hc 模块产出 8 个指标，指标名以 `attn_` / `mlp_` 前缀区分，全部按 token/batch 求均值
+每个 hc 模块产出 12 个指标（megatron 后端 8 个，「结构指标」一节的 4 个为 paddlefleet 独有），指标名以
+`attn_` / `mlp_` 前缀区分，除 `branch_residual_share_max` 取极值外全部按 token/batch 求均值
 （并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
 对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
 
@@ -74,6 +75,23 @@ internal_medicine_monitors:
 | `{c}_h_pre_std`   | `std(h_pre)`   | 聚合门离散度 |
 | `{c}_h_post_mean` | `mean(h_post)` | 扩展门均值 |
 | `{c}_h_post_std`  | `std(h_post)`  | 扩展门离散度 |
+
+### 结构指标（paddlefleet 独有）
+
+`h_post_mean` / `h_post_std` 把 token 轴和 stream 轴一起池化，因此「n 个流一起变弱」与「n-1 个流死掉、
+剩一个扛全部」在均值上不可分；`branch_residual_share` 则回答 `h_post_mean` 回答不了的问题：门变小可能被
+`F(·)` 变大抵消，只有两项的相对大小能说明该层是否还在写入。
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_h_post_stream_concentration` | `mean_t( max_i h_post[t,i] / mean_i h_post[t,i] )` | 流间集中度，区间 `[1, n]`。1 = 各流等权；趋 `n` = 质量压到单流，该层退化成普通单流残差，`num_residual_streams` 预算未被使用 |
+| `{c}_h_post_token_std` | `std_t( mean_i h_post[t,i] )` | 门对输入的敏感度（`h = r · proj · α + bias`）。→0 = 门不再区分 token，等价于常数标量 |
+| `{c}_branch_residual_share` | `mean_t( b / (b + r) )`，`b = ‖H_postᵀ F(·)‖_F`、`r = ‖H_resᵀ x_l‖_F` | 本层写入量在「写入 + 残差重混」中的占比，区间 `[0, 1]`。0.5 = 两项等量；趋 0 = 该层退化为纯残差搬运。|
+| `{c}_branch_residual_share_max` | `max_t( b / (b + r) )` | 最坏 token 的写入占比；贴 1 表示存在残差近零的 token。唯一按极值跨 microbatch/层/rank 归约的指标 |
+
+两个范数都是精确值，但不物化 `[tokens, n, C]` 中间量：分支项是外积（`‖h_post_t ⊗ xb_t‖_F = ‖h_post_t‖₂·‖xb_t‖₂`），
+残差项用 `[tokens, n, n]` 的 Gram/mix 收缩得到，`n = 4` 时开销约为本层投影的 `C/n²` 分之一。
+分支项在 dropout **之前**测量，`hidden_dropout_prob > 0` 的配置会略微高估分支幅度（此处预训练配置为 0）。
 
 ### amax-gain（h_res 与复合映射）
 

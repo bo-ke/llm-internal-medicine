@@ -159,8 +159,10 @@ setup_internal_medicine()
 | 14 | `load_max_min_ratio` | `moe_health/.../load_max_min_ratio` | `max(tokens) / min(tokens)` | 每层+全局 | 最忙/最闲专家 token 数比值 |
 | 15 | `load_max_median_ratio` | `moe_health/.../load_max_median_ratio` | `max(tokens) / median(tokens)` | 每层+全局 | 最忙/中位专家 token 数比值 |
 | 16 | `load_cv` | `moe_health/.../load_cv` | `std(tokens) / mean(tokens)` | 每层+全局 | 专家负载变异系数 (均衡=0) |
+| 17 | `load_balance_entropy_norm` | `moe_health/.../load_balance_entropy_norm` | `H(p) / log(E)` | 每层+全局 | 归一化负载熵 (均衡=1, 坍缩=0) |
+| 18 | `load_effective_experts` | `moe_health/.../load_effective_experts` | `exp(H)` | 每层+全局 | 有效专家数 (均衡=E, 坍缩=1) |
 
-> **注**: 指标 14-16 (`load_*`) 在满足以下**任一**条件时输出, 优先使用前者:
+> **注**: 指标 14-18 (`load_*`) 在满足以下**任一**条件时输出, 优先使用前者:
 > 1. `global_aux_loss` 已开启 (`get_aux_loss_coeff("global_aux_loss") > 0`): 复用
 >    router 的 `global_tokens_per_expert` 缓冲区 (已跨 TPxDPxCP all-reduce 并在
 >    global batch 内累加)。该缓冲区在 `finalize_model_grads` →
@@ -204,6 +206,12 @@ setup_internal_medicine()
 | 8 | `sink_head_max` | `qk_stats/.../sink_head_max` | `max(sink_per_head)` | 每层+全局 | 最强 sink head 权重 |
 | 9 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
 | 10 | `attn_sink_logit` | `qk_stats/.../attn_sink_logit` | `mean(sink_logit)` | 每层+全局 | learned sink logit 量级漂移；稀疏层取 `attn_sink`，full 层取 `softmax_offset` |
+
+> **learnable / off-by-one softmax 的 sink 折叠**：当 `core_attention.softmax_offset`
+> 存在时（`softmax_type` 为 `learnable` / `off-by-one`），`entropy_avg` / `sink` 会把这个
+> per-head sink logit 作为一列额外的无 key 列折进 softmax 分母，使统计与模型真实分布一致
+> （`sink` 分子与 `max` / `mean` 仍只统计真实 key）。vanilla softmax（无 offset）行为不变。
+> megatron 与 paddlefleet 两个后端语义一致。
 
 ### 混合注意力栈的层类型标签 (attn_type)
 
@@ -522,6 +530,8 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MoE** | `load_max_min_ratio` | `max/min(tokens)` | mean | 越接近 1 越均衡 (global_aux_loss 或 expert_bias) |
 | **MoE** | `load_max_median_ratio` | `max/median(tokens)` | mean | 越接近 1 越均衡 (global_aux_loss 或 expert_bias) |
 | **MoE** | `load_cv` | `std/mean(tokens)` | mean | 越接近 0 越均衡 (global_aux_loss 或 expert_bias) |
+| **MoE** | `load_balance_entropy_norm` | `H(p)/log(E)` | mean | 越接近 1 越均衡 (global_aux_loss 或 expert_bias) |
+| **MoE** | `load_effective_experts` | `exp(H)` | mean | 越接近专家数 E 越均衡 (global_aux_loss 或 expert_bias) |
 | **QK** | `max` | `max(QK^T/√d)` | max | 不应暴增 |
 | **QK** | `mean` | `mean(logits)` | mean | 稳定 |
 | **QK** | `entropy_avg` | `-Σ(p log p)` avg | mean | 适中 |

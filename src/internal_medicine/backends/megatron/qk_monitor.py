@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from .base import TorchProbe
 from .sink_head_metrics import compute_sink_head_classification
-from .triton_kernels import compute_qk_stats
+from .triton_kernels import compute_qk_stats, compute_qk_stats_packed
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,8 @@ class QKStatsMonitor(TorchProbe):
         for layer_idx, attention_module in targets:
             if hasattr(attention_module, "core_attention"):
                 hook = attention_module.core_attention.register_forward_pre_hook(
-                    self.timed_hook("compute", self._make_compute_hook(layer_idx))
+                    self.timed_hook("compute", self._make_compute_hook(layer_idx)),
+                    with_kwargs=True,
                 )
                 self.hooks.append(hook)
         logger.info(f"[QKMonitor] Registered {len(self.hooks)} hooks.")
@@ -129,19 +130,52 @@ class QKStatsMonitor(TorchProbe):
         return attention_layers
 
     def _make_compute_hook(self, layer_idx: int):
-        def hook_fn(module, args):
+        def hook_fn(module, args, kwargs=None):
             if not self._should_monitor():
                 return
             try:
-                query, key = args[0].detach(), args[1].detach()
-                if query.dim() == 3:
-                    query = query.unsqueeze(1)
-                    key = key.unsqueeze(1)
-                seq_len = query.shape[0]
-                if seq_len > _MAX_SEQ_LEN_FOR_QK and not self.use_triton:
+                if len(args) < 2:
                     return
+                query, key = args[0].detach(), args[1].detach()
+
+                # Packed (THD) sequences carry cu_seqlens via packed_seq_params;
+                # honor per-sequence boundaries instead of treating the whole
+                # packed row as one giant sequence.
+                cu_seqlens = None
+                psp = (kwargs or {}).get("packed_seq_params")
+                if psp is not None:
+                    cu_seqlens = getattr(psp, "cu_seqlens_q", None)
+                    if cu_seqlens is None:
+                        cu_seqlens = getattr(psp, "cu_seqlens_q_padded", None)
+
+                is_thd = query.dim() == 3
+
+                # Learned per-head sink logit (learnable/off-by-one softmax);
+                # None for vanilla. `module` is core_attention. Keep on-device.
+                attn_sink = getattr(module, "softmax_offset", None)
+                if attn_sink is not None:
+                    attn_sink = attn_sink.detach()
+
                 with torch.no_grad():
-                    stats = compute_qk_stats(query, key, causal=self.causal, use_triton=self.use_triton)
+                    if is_thd and cu_seqlens is not None:
+                        stats = compute_qk_stats_packed(
+                            query,
+                            key,
+                            cu_seqlens.detach(),
+                            causal=self.causal,
+                            use_triton=self.use_triton,
+                            attn_sink=attn_sink,
+                        )
+                    else:
+                        if is_thd:
+                            query = query.unsqueeze(1)
+                            key = key.unsqueeze(1)
+                        seq_len = query.shape[0]
+                        if seq_len > _MAX_SEQ_LEN_FOR_QK and not self.use_triton:
+                            return
+                        stats = compute_qk_stats(
+                            query, key, causal=self.causal, use_triton=self.use_triton, attn_sink=attn_sink
+                        )
 
                 # NOTE: TP cross-rank aggregation is intentionally NOT done here.
                 # gather_and_aggregate() at flush time pools across all ranks

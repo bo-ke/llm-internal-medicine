@@ -111,10 +111,20 @@ def compute_load_balance_ratios(tokens_per_expert: torch.Tensor) -> dict[str, to
       - load_max_min_ratio    = #tokens(most-routed) / #tokens(least-routed)
       - load_max_median_ratio = #tokens(most-routed) / #tokens(median expert)
       - load_cv               = std(counts) / mean(counts)  (变异系数, 完全均衡=0)
+      - load_balance_entropy_norm = H(p) / log(E)  (归一化负载熵, 完全均衡=1, 坍缩到
+        单专家=0). p_e = count_e / sum(count) 是本 batch 的专家负载分布, H = -sum(p log p).
+      - load_effective_experts = exp(H)  (有效专家数 / perplexity, 完全均衡=E, 坍缩=1).
+        比裸熵更好读: "256 个专家实际只有效用到了 40 个".
+
+    熵与 CV 在接近均衡区间数学上近似 (H/log(E) ≈ 1 - CV²/(2 log E)), 但熵有界 [0,1],
+    可跨专家数配置比较, 且 exp(H) 直接给出"有效专家数". 熵对分布做全体求和, 不像
+    max/min 比值被单个死专家主导, 更平滑. 三者都 scale-invariant (与总 token 数无关),
+    因此无需除 ga_steps.
 
     median 用 torch.median (偶数个专家时取下中位, 即某个真实专家的计数, 不做插值).
     极值比值分母 clamp(min=1.0) 防止死专家 (count=0) 产生 inf/NaN. CV 用 population
-    std (unbiased=False) 除以 mean, mean clamp(min=1.0) 防止空批次除零. 全程 GPU
+    std (unbiased=False) 除以 mean, mean clamp(min=1.0) 防止空批次除零. 熵用 p*log(p)
+    并对 p clamp(min=1e-12) 防止 0*log0 的 NaN (死专家贡献 0, 是熵的正确极限). 全程 GPU
     tensor, 不在 hot path 上运行 (调用点在 finalize_model_grads, forward hook 之外).
 
     Args:
@@ -139,10 +149,22 @@ def compute_load_balance_ratios(tokens_per_expert: torch.Tensor) -> dict[str, to
     mean_count = counts.mean(dim=-1)
     std_count = counts.std(dim=-1, unbiased=False)
 
+    # Load distribution p_e = count_e / sum(count), then Shannon entropy per layer.
+    # clamp the total (not per-expert) to avoid divide-by-zero on an empty batch;
+    # clamp p only inside log to make dead experts (p=0) contribute 0*log(~0)->0,
+    # the correct 0*log0 limit, without NaN. num_experts drives the log(E) norm.
+    num_experts = counts.shape[-1]
+    total_count = counts.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    probs = counts / total_count
+    entropy = -(probs * probs.clamp(min=1e-12).log()).sum(dim=-1)  # [num_layers]
+    log_e = torch.log(torch.tensor(float(num_experts), device=counts.device))
+
     return {
         "load_max_min_ratio": max_count / min_count.clamp(min=1.0),
         "load_max_median_ratio": max_count / median_count.clamp(min=1.0),
         "load_cv": std_count / mean_count.clamp(min=1.0),
+        "load_balance_entropy_norm": entropy / log_e,
+        "load_effective_experts": torch.exp(entropy),
     }
 
 

@@ -219,6 +219,17 @@ sink    = s_i / d_i
 
 默认启用因果 mask (`causal=True`)，适用于 GPT 类自回归模型。注意力矩阵中 `query_pos < key_pos` 的位置被设为 `-1e10`。
 
+### THD Packed 序列
+
+当一个 batch 内多条变长序列被打包成单条 `[T, H, D]` 张量（THD 布局，`total_tokens = ΣLᵢ`）时，`core_attention` 通过 `packed_seq_params.cu_seqlens_q`（回退 `cu_seqlens_q_padded`）携带各序列边界。此时 QK monitor 走 **packed 专用路径** `compute_qk_stats_packed` → `qk_stats_packed_kernel`（split-M，grid `(num_heads, num_m_blocks)`）：
+
+- **逐序列边界**：`_cu_seqlens_to_token_arrays` 用 `torch.searchsorted` 在 GPU 上把 `cu_seqlens` 展开成每 token 的 `seq_start`/`seq_end`（int32），全程无 `.item()`/`.cpu()`/`.tolist()`，可安全在 forward hook 内调用而不破坏 compute/comm overlap。kernel 内用 `same_seq = seq_start[m] ≤ n < seq_end[m]` 屏蔽跨序列注意力，**不会跨序列泄露**。
+- **逐序列 sink**：sink token 是每条序列自己的首 token（`seq_start[m]` 列），而非全局 token-0。因此每条 packed 序列各自独立统计 attention sink。
+- **padding 安全**：当张量的 `T` 维大于 `cu_seqlens[-1]`（padding slot）时，这些 token 的 `seq_start == seq_end == 0`，`same_seq` 使其有效范围为空，不贡献任何统计，也不会越界读取。
+- **mean 语义**：与 dense split-M kernel 一致，采用 **row-first 均值**（先算每行均值，再对全体有效行取平均），而非按有效位置计数加权。
+
+> 注：packed 路径当前不支持 SWA / 滑动窗口与 CP（`q_row_offset` / 非对称 Q/K 长度）的组合；如需叠加，须同时补充对应的正确性测试。
+
 ---
 
 ## 使用方式
@@ -299,9 +310,9 @@ qk_stats/global_sink_nonsink_gap
 
 | Hook 位置 | 类型 | 捕获内容 | 产出指标 |
 |-----------|------|----------|----------|
-| `attention.core_attention` | forward **pre**-hook | `args[0]` = Query, `args[1]` = Key | 全部 9 个指标 |
+| `attention.core_attention` | forward **pre**-hook | `args[0]` = Query, `args[1]` = Key；`kwargs["packed_seq_params"]` = packed 边界（若有） | 全部 9 个指标 |
 
-注意: 使用 `forward_pre_hook` 而非 `forward_hook`，直接拦截送入 `core_attention` 的 Q/K 张量。
+注意: 使用 `forward_pre_hook` 而非 `forward_hook`，直接拦截送入 `core_attention` 的 Q/K 张量。hook 以 `with_kwargs=True` 注册，以便读取 `packed_seq_params`：当 Q 为 3 维（`[T, H, D]`）且带 `cu_seqlens_q` 时走 THD packed 路径（见上文「THD Packed 序列」），否则走常规 dense 路径。
 
 ---
 

@@ -58,6 +58,19 @@ class FakeVHAAttention(nn.Layer):
         return (mixed + delta).reshape([b, sq, self.num_heads * self.v_head_dim])
 
 
+class FakeVHAAttentionHeadSpaceInput(FakeVHAAttention):
+    """DSv4 hybrid on the fused inverse-RoPE path: 4D input, flat 3D output.
+
+    ``dsv4_hybrid_attention._full_attn_forward`` reshapes ``core_attn_out`` to
+    ``[b, sq, nh, v_head_dim]`` for the inverse RoPE and only the *unfused*
+    branch reshapes it back, so with ``apply_rope_fusion=True`` the postmix call
+    receives the unflattened layout while still returning the flat one.
+    """
+
+    def _apply_vha_postmix(self, attn_out, U=None, V=None):
+        return super()._apply_vha_postmix(attn_out.reshape([attn_out.shape[0], attn_out.shape[1], -1]), U, V)
+
+
 class FakeLayer(nn.Layer):
     def __init__(self, attn):
         super().__init__()
@@ -115,6 +128,18 @@ class VHAMetricsTest(unittest.TestCase):
         # delta == mixed, so the relative correction is exactly 1.
         self.assertAlmostEqual(float(doubled["postmix_delta_rel_mean"]), 1.0, places=5)
         self.assertAlmostEqual(float(doubled["postmix_amax_gain_max"]), 2.0, places=5)
+
+    def test_delta_stats_accepts_head_space_input(self):
+        # DSv4 hybrid's fused inverse-RoPE path hands postmix a 4D
+        # [b, sq, nh, v_head_dim] input while the return stays flat 3D. Both
+        # sides must fold to the flat width, otherwise the subtraction sees
+        # [sq, nh*d] against [sq*nh, d] and raises a broadcast error.
+        flat = paddle.to_tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype="float32")
+        head_space = flat.reshape([1, 1, 2, 2])
+        stats = vha_metrics.postmix_delta_stats(head_space, flat * 2.0)
+        reference = vha_metrics.postmix_delta_stats(flat, flat * 2.0)
+        for key in reference:
+            self.assertAlmostEqual(float(stats[key]), float(reference[key]), places=6, msg=key)
 
     def test_head_output_stats(self):
         # Two heads of dim 2: norms 1 and 2, pointing the same direction.
@@ -209,6 +234,35 @@ class VHAMonitorTest(unittest.TestCase):
         self.assertGreater(latest["vha_health/layer_0/main_postmix_delta_rel_max"], 0.0)
         self.assertAlmostEqual(latest["vha_health/layer_0/main_postmix_uv_sigma_max"], 1.0, places=5)
         monitor.remove_hooks()
+
+    def test_head_space_input_still_records(self):
+        # Regression: on DSv4 hybrid + apply_rope_fusion the postmix input stays
+        # 4D, which used to make every layer throw inside the wrapper and record
+        # nothing at all.
+        u = _factor(4, [1.0, 0.0, 0.0, 0.0])
+        v = _factor(4, [0.0, 1.0, 0.0, 0.0])
+        attn = FakeVHAAttentionHeadSpaceInput(4, 2, u, v)
+        monitor = PaddleVHAHealthMonitor()
+        monitor.register_hooks(_model([FakeLayer(attn)]))
+
+        attn._apply_vha_postmix(self._attn_out().reshape([1, 3, 4, 2]))
+        monitor.step()
+        head_space = training_logs.get_latest(prefix="vha_health")
+        monitor.remove_hooks()
+
+        training_logs.reset()
+        flat_attn = FakeVHAAttention(4, 2, u, v)
+        flat_monitor = PaddleVHAHealthMonitor()
+        flat_monitor.register_hooks(_model([FakeLayer(flat_attn)]))
+        flat_attn._apply_vha_postmix(self._attn_out())
+        flat_monitor.step()
+        flat = training_logs.get_latest(prefix="vha_health")
+        flat_monitor.remove_hooks()
+
+        self.assertEqual(set(head_space), set(flat))
+        self.assertGreater(head_space["vha_health/layer_0/main_postmix_delta_rel_max"], 0.0)
+        for key in flat:
+            self.assertAlmostEqual(head_space[key], flat[key], places=5, msg=key)
 
     def test_sparse_branch_keys_do_not_collide(self):
         u = _factor(4, [1.0, 0.0, 0.0, 0.0])

@@ -100,9 +100,17 @@ def postmix_operator_stats(U: paddle.Tensor, V: paddle.Tensor) -> dict[str, padd
 def postmix_delta_stats(attn_out: paddle.Tensor, out: paddle.Tensor) -> dict[str, paddle.Tensor]:
     """Per-token effect of the postmix correction on the attention output.
 
-    Both tensors are the flat head-space layout ``[..., nh * v_head_dim]``:
     ``attn_out`` is the input of ``_apply_vha_postmix`` and ``out`` its return
     value, so ``delta = out − attn_out`` needs no recomputation.
+
+    The **return** value is always the flat head-space layout
+    ``[..., nh * v_head_dim]`` (every backend ends with that reshape), but the
+    **input** is not: the DSv4 hybrid attention leaves ``core_attn_out`` in the
+    unflattened ``[b, sq, nh, v_head_dim]`` layout on the fused inverse-RoPE
+    path (``apply_rope_fusion`` without ``high_precision_rope``). So the flat
+    width is taken from ``out`` and both sides are folded to
+    ``[tokens, nh * v_head_dim]`` — using each tensor's own last dim would put
+    heads on the token axis for one side and break the subtraction.
 
     Returns:
         ``postmix_delta_rel_mean`` / ``postmix_delta_rel_max`` — per-token
@@ -112,10 +120,10 @@ def postmix_delta_stats(attn_out: paddle.Tensor, out: paddle.Tensor) -> dict[str
         low-precision overflow headroom of the correction (same reading as the
         mHC ``amax_gain`` family).
     """
-    mixed = attn_out.detach().astype("float32")
-    mixed = mixed.reshape([-1, mixed.shape[-1]])
     result = out.detach().astype("float32")
-    result = result.reshape([-1, result.shape[-1]])
+    width = result.shape[-1]
+    result = result.reshape([-1, width])
+    mixed = attn_out.detach().astype("float32").reshape([-1, width])
     delta = result - mixed
 
     mixed_norm = paddle.clip(mixed.norm(axis=-1), min=_EPS)

@@ -182,14 +182,14 @@ class MHCMonitorTest(unittest.TestCase):
                 n=n,
                 h_pre=paddle.full([s, b, n], 0.5),
                 h_post=paddle.ones([s, b, n]),
-                h_res=paddle.assign(ident),  # own storage so composite.clone can't alias
+                h_res=paddle.assign(ident),  # own storage, not a view of the shared eye
             )
 
         return FakeLayer(attn=make_hc(), mlp=make_hc())
 
     def _drive(self, targets, x_dim):
         # Fire each wrapped compute_mappings; grad is enabled by default in dygraph.
-        for _, _, mod, _, _ in targets:
+        for _, _, mod in targets:
             mod.compute_mappings(paddle.randn([4, 2, x_dim]))
 
     def _prepare_and_attach(self, monitor, model):
@@ -199,7 +199,7 @@ class MHCMonitorTest(unittest.TestCase):
         # Return a single flat list of entries for convenience.
         return [entry for chunk_entries in all_targets for entry in chunk_entries]
 
-    def test_identity_composite_stays_unit_gain(self):
+    def test_gate_and_amax_metrics_are_recorded(self):
         n, s, b = 4, 2, 3
         layer = self._identity_layer(n, s, b)
         model = _mhc_model([layer])
@@ -213,25 +213,42 @@ class MHCMonitorTest(unittest.TestCase):
 
         latest = training_logs.get_latest(prefix="mhc_health")
         for comp in ("attn", "mlp"):
-            for key in (
-                "h_pre_mean",
-                "h_pre_std",
-                "h_post_mean",
-                "h_post_std",
-                "amax_gain_fwd",
-                "amax_gain_bwd",
-                "composite_amax_gain_fwd",
-                "composite_amax_gain_bwd",
-            ):
+            for key in ("h_pre_mean", "h_pre_std", "h_post_mean", "h_post_std"):
                 self.assertIn(f"mhc_health/layer_0/{comp}_{key}", latest)
-            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_amax_gain_fwd"], 1.0, places=4)
-            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_composite_amax_gain_fwd"], 1.0, places=4)
-            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_composite_amax_gain_bwd"], 1.0, places=4)
             # h_pre == 0.5 everywhere, h_post == 1.0 everywhere.
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_pre_mean"], 0.5, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_mean"], 1.0, places=5)
-        # global aggregate is derived too.
-        self.assertIn("mhc_health/global_attn_amax_gain_fwd", latest)
+            # amax_gain_fwd is a gatekeeper: global only, no per-layer series.
+            self.assertNotIn(f"mhc_health/layer_0/{comp}_amax_gain_fwd", latest)
+            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_amax_gain_fwd"], 1.0, places=4)
+        # The retired series must stay gone.
+        for comp in ("attn", "mlp"):
+            for key in ("amax_gain_bwd", "composite_amax_gain_fwd", "composite_amax_gain_bwd"):
+                self.assertNotIn(f"mhc_health/layer_0/{comp}_{key}", latest)
+                self.assertNotIn(f"mhc_health/global_{comp}_{key}", latest)
+
+    def test_amax_gain_fwd_is_the_row_sum(self):
+        # An asymmetric, row-stochastic (but not column-stochastic) h_res pins the
+        # convention: amax_gain_fwd must read the ROW sums (1.0 here), never the
+        # column sums (1.5 here). Identity matrices cannot tell the two apart,
+        # which is how the fwd/bwd label mix-up stayed invisible.
+        n, s, b = 2, 1, 1
+        h_res = paddle.to_tensor([[0.75, 0.25], [0.75, 0.25]]).reshape([1, 1, n, n]).expand([s, b, n, n])
+        hc = FakeHC(
+            n=n,
+            h_pre=paddle.full([s, b, n], 0.5),
+            h_post=paddle.ones([s, b, n]),
+            h_res=paddle.assign(h_res),
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = PaddleMHCHealthMonitor()
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertAlmostEqual(latest["mhc_health/global_attn_amax_gain_fwd"], 1.0, places=5)
 
     def test_branch_residual_share_is_recorded_from_bda(self):
         n, s, b, c = 4, 2, 3, 6
@@ -243,7 +260,7 @@ class MHCMonitorTest(unittest.TestCase):
 
         streams = paddle.randn([s, b, n * c])
         x = paddle.randn([s, b, c])
-        for _, _, mod, _, _ in targets:
+        for _, _, mod in targets:
             mod.fused_h_res_h_post_bda(
                 h_res=mod._h_res,
                 original_residual=streams,
@@ -308,7 +325,6 @@ class MHCMonitorTest(unittest.TestCase):
             FakeHC.compute_mappings,
         )
         self.assertEqual(monitor._wrapped, [])
-        self.assertEqual(monitor._composite, {})
 
     def test_no_graph_retention(self):
         n, s, b = 4, 2, 3
@@ -325,14 +341,14 @@ class MHCMonitorTest(unittest.TestCase):
 
         monitor = PaddleMHCHealthMonitor()
         targets = self._prepare_and_attach(monitor, model)
-        for _, _, mod, _, _ in targets:
+        for _, _, mod in targets:
             mod.compute_mappings(paddle.randn([4, 2, n * 8]))
 
-        stored = monitor._composite[0]
-        # detach() sets stop_gradient=True; the composite must not be graph-tracked.
-        self.assertTrue(stored.stop_gradient)
+        # The 0-dim accumulators must not be graph-tracked: if the wrapper forgot
+        # to detach, the graph stays pinned through them until backward.
+        for key, acc in monitor._gpu_acc.items():
+            self.assertTrue(acc.stop_gradient, msg=key)
         monitor.step()
-        self.assertEqual(monitor._composite, {})  # cleared between steps
 
 
 class MHCMonitorNoOpTest(unittest.TestCase):

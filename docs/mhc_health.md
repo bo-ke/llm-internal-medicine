@@ -47,13 +47,13 @@ internal_medicine_monitors:
 
 ### VRAM 安全（无泄漏）
 
-跨调用状态仅有 `self._composite`（每 chunk 一个小 `[s*b, n, n]` 张量）与固定的 0 维累加器。规则：
+wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则：
 
-- 捕获后立即对 `h_pre/h_post/h_res` `.detach()`，并在 `torch.no_grad()` 下做全部指标/复合计算——否则一个仍带梯度的
+- 捕获后立即对 `h_pre/h_post/h_res` `.detach()`，并在 `no_grad()` 下做全部指标计算——否则一个仍带梯度的
   张量会通过反向把整层 autograd graph 钉住（大泄漏）。
 - wrapper 原样返回 `out`，除 0 维标量外不保留任何对它/其视图的引用。
-- 复合映射 seed 用 `hb.clone()`（而非 `h_res` 的 reshape 视图），使 slot 不会 alias 模型的 `h_res` 存储。
-- `step()` 每步清空 `self._composite`，`remove_hooks()` 一并清空。
+- `remove_hooks()` 恢复原始方法，不残留模块引用。
+
 
 热路径纪律见 `.claude/skills/monitor-hook-perf-rules`：hook 内无 D2H 同步、无集合通信，schema 在 `allocate_buffers`
 前声明。TP 不沿 `n` 切分映射，故无需 hook 内通信；跨 rank 归约在 flush 时由 `gather_and_aggregate` 完成（mean）。
@@ -62,7 +62,7 @@ internal_medicine_monitors:
 
 ## 监控指标
 
-每个 hc 模块产出 12 个指标（megatron 后端 8 个，「结构指标」一节的 4 个为 paddlefleet 独有），指标名以
+每个 hc 模块产出 9 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 8 个），指标名以
 `attn_` / `mlp_` 前缀区分，除 `branch_residual_share_max` 取极值外全部按 token/batch 求均值
 （并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
 对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
@@ -93,42 +93,45 @@ internal_medicine_monitors:
 残差项用 `[tokens, n, n]` 的 Gram/mix 收缩得到，`n = 4` 时开销约为本层投影的 `C/n²` 分之一。
 分支项在 dropout **之前**测量，`hidden_dropout_prob > 0` 的配置会略微高估分支幅度（此处预训练配置为 0）。
 
-### amax-gain（h_res 与复合映射）
+### amax-gain（Sinkhorn 收敛哨兵）
 
-paper 定义的最坏情况增益：矩阵的**最大绝对行和**界定前向传播的最坏放大，**最大绝对列和**界定反向传播的最坏放大。
-对每个 token 的 `n×n` 矩阵计算，再对 token 求均值：
+paper 定义的最坏情况增益：矩阵的**最大绝对行和**界定前向传播的最坏放大。对每个 token 的 `n×n` 矩阵计算，
+再对 token 求均值：
 
 ```
-amax_gain_fwd = mean_t( max_i | Σ_j  M_ij | )      # 行和（forward）
-amax_gain_bwd = mean_t( max_j | Σ_i  M_ij | )      # 列和（backward）
+amax_gain_fwd = mean_t( max_i | Σ_j  h_res_ij | )      # 行和（forward）
 ```
 
-| 指标 | `M` 取值 | 诊断意义 |
-|------|----------|----------|
-| `{c}_amax_gain_fwd` | 本层 `h_res` | 单层前向最坏放大（双随机 → ≈1.0） |
-| `{c}_amax_gain_bwd` | 本层 `h_res` | 单层反向最坏放大（≈1.0） |
-| `{c}_composite_amax_gain_fwd` | 复合映射 `M_k = h_res_k @ M_{k-1}` | 跨层累积前向放大 |
-| `{c}_composite_amax_gain_bwd` | 复合映射 | 跨层累积反向放大 |
+| 指标 | 诊断意义 |
+|------|----------|
+| `{c}_amax_gain_fwd` | Sinkhorn 是否收敛 / 有无 NaN。双随机 → 恒 ≈1.0。**只输出 `global_*`** |
 
-单层 `h_res` 经 Sinkhorn 投影为双随机矩阵（行/列和 ≈ 1），故单层 amax-gain ≈ 1.0；复合映射的增益随深度偏离 1.0，
-正是残差流放大/收缩的信号。
+单层 `h_res` 经 Sinkhorn 投影为双随机矩阵，所以这个值**按构造恒为 1**——实测 0.99999905，动态范围 0.0001%，
+偏离量全部来自 Sinkhorn 的 `eps = 1e-6`。它只能当哨兵，不要拿来做诊断。也正因如此它走 `Probe.GLOBAL_ONLY`：
+逐层值照常累加、`global_*` 从中派生，只是不写进日志——任一层漂移仍会把全局曲线带走，但看板上只有 2 条线
+而不是 13 层 × 2 组件。
 
-### 复合映射（composite mapping）
+### 已下线：amax_gain_bwd 与复合映射
 
-复合映射是本 pipeline stage / VPP chunk 内、按 forward 执行顺序（attn→mlp，逐层递增）对 `h_res` 的累乘，每次 forward
-在本 stage 首个 hc 模块（最低层 attn）处重置。
+- `{c}_amax_gain_bwd`（最大绝对列和）：Sinkhorn 的最后一步是列归一（`hyper_connection.py` 的迭代循环），
+  列和被钉在 1，实测四条 run、每一层都与 `amax_gain_fwd` **逐位相同**。
+- `{c}_composite_amax_gain_fwd` / `_bwd`（`M_k = h_res_k @ M_{k-1}` 的行/列和）：双随机矩阵之积仍是双随机矩阵，
+  复合增益同样恒为 1（实测 0.99999~0.999975）。更糟的是它依赖执行顺序：开 `recompute_granularity: full` 时
+  采集实际发生在反向重放，累乘变成逆序——实测每层累乘因子数为 `1, 25.6, 23.6, …, 2.9`，而正序应为
+  `1, 3, 5, …, 25.8`（关掉 recompute 的对照组给出了后者）。让它与顺序无关需要把每层 `h_res` 在整个 step 内
+  驻留（43 层约 45MB 常驻显存），为一个常数付这个代价不值得。
 
-**局限**：在流水并行（PP>1）下，复合映射只跨越本 stage 局部的层，并非整网的全局累乘；不同 stage/chunk 的逐层键因
-层号不同不会冲突，但自动派生的 `global_*` 复合均值会混合深浅复合值——因此 composite 的**逐层视图**更有意义。PP=1 时精确。
-每 chunk 独立 slot，避免后一 chunk 的层污染前一 chunk 的累乘。
+要真正观测残差流放大，应监控 **Sinkhorn 收敛残差**（行和与 1 的偏差）或 `h_res` 的谱性质，两者都尚未实现。
 
 ---
 
 ## 与 microbatch / 激活重算的交互
 
-- 每个梯度累积 microbatch 都会按序重新调用所有 hc 模块；chunk root 先触发并重置复合映射，故复合映射按 microbatch 正确、
-  不跨 microbatch 泄漏。
-- 整个捕获受 `_should_monitor()` 门控；监控步内所有 wrapper 都触发（root 重置 → 同一 forward 内有序 bmm 累积），故复合
-  状态自洽；非监控步不触发，下一监控步的 root 重置会重新 seed。
-- `_should_monitor()` 要求 grad enabled，故若外层 layer 被整体激活重算，仅 grad-enabled 的那次正向记录；`compute_mappings`
-  本身不被 checkpoint，不会重复触发。
+- 每个梯度累积 microbatch 都会按序重新调用所有 hc 模块，每次调用独立记录一条样本，flush 时对 microbatch 求均值。
+- 整个捕获受 `_should_monitor()` 门控；非监控步只是 `orig(x)` + 一次布尔判断。
+- `_should_monitor()` 要求 grad enabled。这个判据的名字暗示"跳过重算"，**实际语义相反**：recompute 的真前向跑在
+  `no_grad` 下，反向重放才开 grad，所以采集实际发生在反向重放。数值不受影响（重算确定性），但依赖执行顺序的指标
+  会出错——这是复合映射被下线的原因之一。
+- 这个判据留着是因为它顺带保证了"每个模块每 step 只取一条样本"：mHC 的 hyper-connection 在一次前向里会被进入
+  两次（`high_precision_mhc` 打开时 AMP 关闭的 fp32 路径 + bf16 路径），两条都记会稀释所有均值（实测单层
+  `amax_gain` 偏离量减半、门控 std 偏移 1~3%）。详见 README「已知限制：采集口径依赖 grad 判据」。

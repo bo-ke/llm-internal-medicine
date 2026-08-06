@@ -228,9 +228,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
                     analysis_input = aggregated
             except Exception as e:
                 if self.verbose and layer_idx not in self._hc_aggregate_failed_layers:
-                    logger.warning(
-                        f"[MassiveActMonitor] hyper_connection aggregate failed at layer {layer_idx}: {e}"
-                    )
+                    logger.warning(f"[MassiveActMonitor] hyper_connection aggregate failed at layer {layer_idx}: {e}")
                     self._hc_aggregate_failed_layers.add(layer_idx)
 
         per_channel_max = compute_per_channel_max(analysis_input)

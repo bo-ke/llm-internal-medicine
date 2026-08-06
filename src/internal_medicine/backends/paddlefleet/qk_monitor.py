@@ -478,6 +478,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
     METRIC_PREFIX = "qk_stats"
     MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
     MIN_AGGREGATED = {"entropy_min"}
+
     def __init__(
         self,
         causal=True,
@@ -547,8 +548,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
         if self.verbose:
             logger.info(
-                f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. "
-                f"TP={self.tp_size} CP={self.cp_size}"
+                f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. TP={self.tp_size} CP={self.cp_size}"
             )
 
         if self.cp_size > 1:
@@ -575,9 +575,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 "sink_nonsink_gap",
             ):
                 self.declare_layer_metric(layer_idx, m, attn_type=item.attn_type)
-            if self._is_sparse_layer(item):
-                self.declare_layer_metric(layer_idx, "attn_sink_logit", attn_type=item.attn_type)
-            elif self._learnable_sink(_attn_module) is not None:
+            if self._is_sparse_layer(item) or self._learnable_sink(_attn_module) is not None:
                 self.declare_layer_metric(layer_idx, "attn_sink_logit", attn_type=item.attn_type)
 
         self.allocate_buffers()
@@ -670,17 +668,13 @@ class PaddleQKStatsMonitor(PaddleProbe):
         def wrapped(query, kv_full, attn_sink, topk_idxs, softmax_scale, topk_length=None):
             out = original(query, kv_full, attn_sink, topk_idxs, softmax_scale, topk_length=topk_length)
             if core.training and monitor._should_monitor():
-                monitor._record_sparse_stats(
-                    layer_idx, attn_type, query, kv_full, attn_sink, topk_idxs, softmax_scale
-                )
+                monitor._record_sparse_stats(layer_idx, attn_type, query, kv_full, attn_sink, topk_idxs, softmax_scale)
             return out
 
         core.compressed_sparse_attn = wrapped
         return _MethodPatch(core, "compressed_sparse_attn", original)
 
-    def _record_sparse_stats(
-        self, layer_idx, attn_type, query, kv_full, attn_sink, topk_idxs, softmax_scale
-    ) -> None:
+    def _record_sparse_stats(self, layer_idx, attn_type, query, kv_full, attn_sink, topk_idxs, softmax_scale) -> None:
         try:
             with paddle.no_grad():
                 stats = compute_qk_stats_sparse_paddle(

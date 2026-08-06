@@ -554,8 +554,6 @@ class BiasAffinityJaccardTest(unittest.TestCase):
         self.assertAlmostEqual(float(jaccard), 1.0, places=6)
 
 
-
-
 class PaddleMassiveActivationMonitorTest(unittest.TestCase):
     def setUp(self):
         training_logs.reset()
@@ -763,12 +761,8 @@ class PaddleQKKernelComputeTest(unittest.TestCase):
         q_a = q[:, :half, :, :]
         q_b = q[:, half:, :, :]
 
-        sub_a = self.qk.compute_qk_stats_paddle(
-            q_a, k, causal=True, row_stride=1, q_row_offset=0
-        )
-        sub_b = self.qk.compute_qk_stats_paddle(
-            q_b, k, causal=True, row_stride=1, q_row_offset=half
-        )
+        sub_a = self.qk.compute_qk_stats_paddle(q_a, k, causal=True, row_stride=1, q_row_offset=0)
+        sub_b = self.qk.compute_qk_stats_paddle(q_b, k, causal=True, row_stride=1, q_row_offset=half)
 
         # Per-head means: average the two halves (rows split evenly).
         for key in ("entropy_per_head", "sink_per_head", "mean_per_head"):
@@ -805,9 +799,7 @@ class PaddleQKKernelComputeTest(unittest.TestCase):
         """Passing q_row_offset=0 must be a no-op vs. the default path."""
         q, k = self._gqa_inputs(seed=4)
         default_pass = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
-        with_zero_offset = self.qk.compute_qk_stats_paddle(
-            q, k, causal=True, row_stride=1, q_row_offset=0
-        )
+        with_zero_offset = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1, q_row_offset=0)
         for key in ("max_global", "mean_global", "entropy_global", "sink_global"):
             self.assertTrue(
                 paddle.allclose(default_pass[key], with_zero_offset[key], atol=1e-6).item(),
@@ -908,7 +900,7 @@ class DenseSinkFoldTest(unittest.TestCase):
         self.assertTrue(paddle.allclose(stats["sink_per_head"], ref_sink, atol=1e-3, rtol=1e-3).item())
 
     def test_zero_sink_still_changes_the_distribution(self):
-        """"off-by-one" softmax: a frozen 0 logit still adds exp(0) to the denominator."""
+        """ "off-by-one" softmax: a frozen 0 logit still adds exp(0) to the denominator."""
         q, k = self._inputs()
         zeros = paddle.zeros([q.shape[2]], dtype="float32")
 
@@ -1130,17 +1122,13 @@ class SparseQKKernelComputeTest(unittest.TestCase):
     def test_sparse_stats_match_masked_reference(self):
         query, kv_full, topk = self._hca_case()
         scale = float(query.shape[-1]) ** -0.5
-        stats = self.qk.compute_qk_stats_sparse_paddle(
-            query, kv_full, topk, scale, attn_sink=None, row_stride=1
-        )
+        stats = self.qk.compute_qk_stats_sparse_paddle(query, kv_full, topk, scale, attn_sink=None, row_stride=1)
         ref = self._reference_stats(query, kv_full, topk, scale, None)
         self.assertTrue(
             paddle.allclose(stats["entropy_per_head"], ref["entropy_per_head"], atol=1e-3, rtol=1e-3).item(),
             f"entropy mismatch: {stats['entropy_per_head']} vs {ref['entropy_per_head']}",
         )
-        self.assertTrue(
-            paddle.allclose(stats["max_per_head"], ref["max_per_head"], atol=1e-3, rtol=1e-3).item()
-        )
+        self.assertTrue(paddle.allclose(stats["max_per_head"], ref["max_per_head"], atol=1e-3, rtol=1e-3).item())
 
     def test_attn_sink_lowers_entropy_and_is_folded_into_denominator(self):
         query, kv_full, topk = self._hca_case(seed=11)
@@ -1148,12 +1136,8 @@ class SparseQKKernelComputeTest(unittest.TestCase):
         heads = query.shape[2]
         sink = paddle.full([heads], 5.0, dtype="float32")  # dominant sink logit
 
-        no_sink = self.qk.compute_qk_stats_sparse_paddle(
-            query, kv_full, topk, scale, attn_sink=None, row_stride=1
-        )
-        with_sink = self.qk.compute_qk_stats_sparse_paddle(
-            query, kv_full, topk, scale, attn_sink=sink, row_stride=1
-        )
+        no_sink = self.qk.compute_qk_stats_sparse_paddle(query, kv_full, topk, scale, attn_sink=None, row_stride=1)
+        with_sink = self.qk.compute_qk_stats_sparse_paddle(query, kv_full, topk, scale, attn_sink=sink, row_stride=1)
         ref = self._reference_stats(query, kv_full, topk, scale, sink)
 
         self.assertTrue(
@@ -1166,9 +1150,7 @@ class SparseQKKernelComputeTest(unittest.TestCase):
             float(no_sink["entropy_global"]),
         )
         # The sink is not a real key, so logit max/mean must be unchanged.
-        self.assertTrue(
-            paddle.allclose(with_sink["max_per_head"], no_sink["max_per_head"], atol=1e-6).item()
-        )
+        self.assertTrue(paddle.allclose(with_sink["max_per_head"], no_sink["max_per_head"], atol=1e-6).item())
 
 
 if __name__ == "__main__":

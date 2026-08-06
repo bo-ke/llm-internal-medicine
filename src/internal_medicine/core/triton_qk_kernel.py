@@ -607,18 +607,10 @@ def qk_stats_sparse_partial_kernel(
 
     bound_ptr = win_lo_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq
     win_lo = tl.load(bound_ptr, mask=m_mask, other=0)
-    win_hi = tl.load(
-        win_hi_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq, mask=m_mask, other=-1
-    )
-    cmp_lo = tl.load(
-        cmp_lo_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq, mask=m_mask, other=0
-    )
-    cmp_hi = tl.load(
-        cmp_hi_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq, mask=m_mask, other=-1
-    )
-    sink_col = tl.load(
-        sink_col_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq, mask=m_mask, other=-1
-    )
+    win_hi = tl.load(win_hi_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq, mask=m_mask, other=-1)
+    cmp_lo = tl.load(cmp_lo_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq, mask=m_mask, other=0)
+    cmp_hi = tl.load(cmp_hi_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq, mask=m_mask, other=-1)
+    sink_col = tl.load(sink_col_ptr + batch_idx * stride_b_batch + m_offsets * stride_b_seq, mask=m_mask, other=-1)
 
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
     d_i = tl.zeros([BLOCK_M], dtype=tl.float32)

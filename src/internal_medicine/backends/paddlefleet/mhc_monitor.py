@@ -7,23 +7,20 @@ per-token mappings of every ``HyperConnectionModule`` in an mHC
 - ``h_pre`` / ``h_post`` — the aggregation / expansion gates: mean and std, plus
   the stream concentration and token sensitivity of ``h_post``.
 - ``h_res``              — the doubly-stochastic residual-mixing matrix: the
-  paper's ``amax_gain`` forward (max-abs row sum) and backward (max-abs column
-  sum), computed both on this layer's ``h_res`` and on the running **composite
-  mapping** (cumulative product of ``h_res`` across the layers local to this
-  pipeline stage / VPP chunk).
+  paper's ``amax_gain`` (max-abs row sum), kept as a NaN / Sinkhorn-divergence
+  sentinel rather than as a diagnostic (see the note below).
 - the **two update terms** of ``x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)``:
   their relative magnitude, i.e. how much this layer still writes into the
   residual streams.
 
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 12
+Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 9
 series, name-prefixed by component:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
     {attn,mlp}_h_post_stream_concentration  {attn,mlp}_h_post_token_std
     {attn,mlp}_branch_residual_share  {attn,mlp}_branch_residual_share_max
-    {attn,mlp}_amax_gain_fwd            {attn,mlp}_amax_gain_bwd
-    {attn,mlp}_composite_amax_gain_fwd  {attn,mlp}_composite_amax_gain_bwd
+    {attn,mlp}_amax_gain_fwd
 
 ``h_pre`` is not part of ``HyperConnectionModule.forward``'s return, so we
 cannot use a forward hook. Instead we wrap the module's ``compute_mappings``
@@ -32,6 +29,25 @@ The branch/residual ratio needs the sublayer output too, which only exists where
 the two terms are combined, so ``fused_h_res_h_post_bda`` is wrapped as well.
 Everything is detached and computed under ``no_grad`` (see the VRAM-safety
 notes on the hook).
+
+Retired metrics (do not re-add without a new argument):
+
+- ``composite_amax_gain_fwd`` / ``_bwd`` — the cumulative product of ``h_res``
+  across layers. A product of doubly-stochastic matrices is itself doubly
+  stochastic, so the composite gain is **1 by construction**; measured range was
+  0.99999 ~ 0.999975, i.e. pure Sinkhorn ``eps`` accumulation. Worse, the value
+  is order-dependent: it was built in execution order, which under recompute is
+  the reverse-layer backward replay (measured: per-layer factor counts came out
+  ``1, 25.6, 23.6, ..., 2.9`` instead of ``1, 3, 5, ..., 25.8``). Making it
+  order-proof needs the per-layer ``h_res`` resident for the whole step
+  (~45MB at 43 layers), which is not worth paying for a constant.
+- ``amax_gain_bwd`` (max-abs **column** sum) — Sinkhorn's last step is a column
+  normalization, so columns are pinned to 1 by construction. Measured bit-equal
+  to ``amax_gain_fwd`` on every layer of four runs.
+
+To actually watch for residual-stream amplification, monitor Sinkhorn
+convergence residual (row sums vs 1) or the spectrum of ``h_res`` — neither is
+implemented yet.
 
 The monitor is a hard no-op unless the model actually uses the mHC layer: if
 the mHC classes cannot be imported, or no ``HyperConnectionTransformerLayer``
@@ -74,15 +90,18 @@ _METRIC_NAMES = (
     "branch_residual_share",
     "branch_residual_share_max",
     "amax_gain_fwd",
-    "amax_gain_bwd",
-    "composite_amax_gain_fwd",
-    "composite_amax_gain_bwd",
 )
 
 # Only the worst-token branch ratio keeps extremum semantics across
 # microbatches / layers / ranks; everything else is a mean. The name ends in
 # `_max`, so training_logs' suffix classifier agrees on the full key too.
 _MAX_METRICS = frozenset({"branch_residual_share_max"})
+
+# amax_gain_fwd is 1 by construction (Sinkhorn), so it is a gatekeeper for that
+# invariant rather than a per-layer diagnostic: one global curve per component
+# carries the same signal as 13 layers x 2 components of flat lines. Any layer
+# drifting still moves the global mean.
+_GLOBAL_ONLY_METRICS = frozenset({"amax_gain_fwd"})
 
 # (component_name, layer attribute) — attn runs before mlp in the layer forward.
 _COMPONENTS = (
@@ -95,9 +114,8 @@ def _iter_chunks(model):
     """Yield ``(chunk_id, chunk)`` pairs for VPP-aware discovery.
 
     PaddleFleet exposes VPP model chunks via ``_model_chunks`` on the pipeline
-    layer. When present, each chunk owns its own ``run_function`` and executes
-    in its own forward pass — so the running composite mapping must reset at
-    each chunk's first hc module, and never carry over.
+    layer; each chunk owns its own ``run_function`` and executes in its own
+    forward pass, so discovery has to walk all of them.
 
     Falls back to a single chunk ``(0, model)`` when no VPP chunking is present.
     """
@@ -135,14 +153,13 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         verbose: bool = False,
     ):
         self.MAX_AGGREGATED = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _MAX_METRICS}
+        self.GLOBAL_ONLY = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _GLOBAL_ONLY_METRICS}
         super().__init__(
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,
             verbose=verbose,
         )
-        # chunk_id -> running composite mapping [s*b, n, n], detached (no graph).
-        self._composite: dict[int, paddle.Tensor] = {}
         # (module, attribute name, original bound method) triples, for remove_hooks().
         self._wrapped: list[tuple[nn.Layer, str, object]] = []
 
@@ -150,8 +167,8 @@ class PaddleMHCHealthMonitor(PaddleProbe):
     # Discovery
     # ------------------------------------------------------------------
 
-    def _find_hc_modules(self, chunk, chunk_id: int):
-        """Return ``[(global_idx, comp, hc_module, chunk_id, is_root)]`` for one chunk.
+    def _find_hc_modules(self, chunk):
+        """Return ``[(global_idx, comp, hc_module)]`` for one chunk.
 
         Empty (auto-skip) when the mHC classes are unavailable or the chunk has
         no ``HyperConnectionTransformerLayer``. Uses ``isinstance`` against the
@@ -168,23 +185,17 @@ class PaddleMHCHealthMonitor(PaddleProbe):
             return isinstance(layer, HyperConnectionTransformerLayer)
 
         monitor_layers = iter_monitor_layers(layers, matches, pp_rank=self.pp_rank)
-        entries: list[tuple[int, str, nn.Layer, int, bool]] = []
+        entries: list[tuple[int, str, nn.Layer]] = []
         # is_mtp so we can mark them for `_mtp` suffix in metric keys.
         mtp_layer_ids = [item.idx for item in monitor_layers if item.is_mtp]
         if mtp_layer_ids:
             self.mark_mtp_layers(mtp_layer_ids)
-        first_attn_seen = False
         for item in monitor_layers:
             for comp, attr in _COMPONENTS:
                 mod = getattr(item.layer, attr, None)
                 if not isinstance(mod, HyperConnectionModule):
                     continue
-                # Chunk root = the attn hc of the first monitored layer in this
-                # chunk's execution order; it resets the composite each forward.
-                is_root = comp == "attn" and not first_attn_seen
-                if is_root:
-                    first_attn_seen = True
-                entries.append((item.idx, comp, mod, chunk_id, is_root))
+                entries.append((item.idx, comp, mod))
         return entries
 
     # ------------------------------------------------------------------
@@ -206,12 +217,12 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         every ``declare_layer_metric`` call remains legal.
         """
         self._init_parallel_state()
-        all_targets: list[list[tuple[int, str, nn.Layer, int, bool]]] = []
-        for chunk_id, chunk in _iter_chunks(model):
-            entries = self._find_hc_modules(chunk, chunk_id=chunk_id)
+        all_targets: list[list[tuple[int, str, nn.Layer]]] = []
+        for _chunk_id, chunk in _iter_chunks(model):
+            entries = self._find_hc_modules(chunk)
             if not entries:
                 continue
-            for global_idx, comp, _, _, _ in entries:
+            for global_idx, comp, _ in entries:
                 for name in _METRIC_NAMES:
                     self.declare_layer_metric(global_idx, f"{comp}_{name}")
             all_targets.append(entries)
@@ -219,9 +230,9 @@ class PaddleMHCHealthMonitor(PaddleProbe):
 
     def _attach(self, all_targets):
         for entries in all_targets:
-            for layer_idx, comp, mod, chunk_id, is_root in entries:
+            for layer_idx, comp, mod in entries:
                 orig = mod.compute_mappings
-                mod.compute_mappings = self._make_capture(orig, layer_idx, comp, chunk_id, is_root)
+                mod.compute_mappings = self._make_capture(orig, layer_idx, comp)
                 self._wrapped.append((mod, "compute_mappings", orig))
                 # The branch/residual ratio needs the sublayer output, which only
                 # exists at the point where the two update terms are combined.
@@ -242,50 +253,36 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         self._attach(all_targets)
 
     def remove_hooks(self):
-        # Restore the original bound methods and drop all cross-call state so
-        # the monitor holds no module references or composite tensors after
-        # teardown. ``del mod.<attr>`` removes the instance attribute and falls
-        # back to the class method; if that fails (e.g. slots), we re-bind the
-        # captured original.
+        # Restore the original bound methods so the monitor holds no module
+        # references after teardown. ``del mod.<attr>`` removes the instance
+        # attribute and falls back to the class method; if that fails (e.g.
+        # slots), we re-bind the captured original.
         for mod, attr, orig in self._wrapped:
             try:
                 delattr(mod, attr)
             except AttributeError:
                 setattr(mod, attr, orig)
         self._wrapped = []
-        self._composite.clear()
         super().remove_hooks()
-
-    def step(self):
-        super().step()
-        # Release the running composite between train steps so a [s*b, n, n]
-        # buffer never sits idle in VRAM; the root reseeds it next forward, so
-        # clearing is correctness-neutral.
-        self._composite.clear()
 
     # ------------------------------------------------------------------
     # Capture wrapper (the hot path)
     # ------------------------------------------------------------------
 
-    def _make_capture(self, orig, layer_idx: int, component: str, chunk_id: int, is_root: bool):
+    def _make_capture(self, orig, layer_idx: int, component: str):
         """Wrap ``compute_mappings`` to record metrics from its real return value.
 
         VRAM safety: the mappings arrive attached to the training autograd
-        graph; we ``.detach()`` them and do all metric/composite math under
-        ``no_grad`` so no stored tensor pins the graph through backward. The
-        composite slot holds one detached ``[s*b, n, n]`` tensor per chunk
-        (cloned on seed so it never aliases the model's ``h_res`` storage);
-        ``step()`` clears it.
+        graph; we ``.detach()`` them and do all metric math under ``no_grad`` so
+        no stored tensor pins the graph through backward. The wrapper keeps no
+        state across calls — a deliberate constraint, since a monitored module
+        may be entered more than once per step (recompute replay, and mHC's own
+        fp32 / bf16 paths), and any cross-call accumulator would then depend on
+        execution order.
         """
 
         def wrapped(x):
             out = orig(x)  # the real mappings the model consumes — returned unchanged
-            # Gate the whole capture: metrics are only recorded on monitored
-            # steps, and the composite is reset at the chunk root on each such
-            # step, so gating here keeps the composite self-consistent (root
-            # reset -> ordered bmm builds within one monitored forward).
-            # _should_monitor() also requires grad enabled, selecting the
-            # training (not a no-grad / recompute) forward.
             if not self._should_monitor():
                 return out
             try:
@@ -304,29 +301,9 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                     for name, value in h_post_structure_stats(h_post).items():
                         self.record_layer_metric(layer_idx, f"{component}_{name}", value)
 
+                    # Row sums of a Sinkhorn-projected h_res: 1 by construction,
+                    # so this is a NaN / divergence sentinel, not a diagnostic.
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_fwd", amax_gain(h_res, axis=-1))
-                    self.record_layer_metric(layer_idx, f"{component}_amax_gain_bwd", amax_gain(h_res, axis=-2))
-
-                    # Composite mapping M_k = h_res_k @ M_{k-1} (per token).
-                    # h_res arrives as [..., n, n]; flatten leading dims to a
-                    # single batch axis for bmm.
-                    shape = h_res.shape
-                    n = shape[-1]
-                    hb = h_res.reshape([-1, n, n])
-                    prev = self._composite.get(chunk_id)
-                    # Reset at the chunk root each forward; also self-heal on
-                    # first fire / shape drift (variable s*b across
-                    # microbatches). identity @ h_res == h_res, so seed with
-                    # h_res; clone() so the slot owns a fresh buffer and never
-                    # pins the model's h_res storage.
-                    if is_root or prev is None or prev.shape != hb.shape:  # noqa: SIM108
-                        M = hb.clone()
-                    else:
-                        M = paddle.bmm(hb, prev)  # fresh tensor, no graph
-                    self._composite[chunk_id] = M
-
-                    self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_fwd", amax_gain(M, axis=-1))
-                    self.record_layer_metric(layer_idx, f"{component}_composite_amax_gain_bwd", amax_gain(M, axis=-2))
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[PaddleMHCMonitor] Error layer {layer_idx}/{component}: {e}")
@@ -396,9 +373,7 @@ def setup_mhc_monitor(
     """Enable the mHC health monitor. No-op on any non-mHC model.
 
     Multi-chunk (VPP / interleaved 1F1B) safe: declares the schema across all
-    chunks before ``allocate_buffers`` locks it, then attaches. Each model
-    chunk gets its own composite slot so a later chunk's layers never
-    contaminate an earlier chunk's running product.
+    chunks before ``allocate_buffers`` locks it, then attaches.
     """
     # No-op guarantee #1: mHC classes unavailable -> touch nothing.
     if HyperConnectionTransformerLayer is None or HyperConnectionModule is None:

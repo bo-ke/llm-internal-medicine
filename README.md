@@ -130,7 +130,8 @@ setup_internal_medicine()
 ```
 
 - `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health`
-- `global_idx`: 考虑 PP (Pipeline Parallelism) 的全局层索引 = `pp_rank × local_layers + local_idx`
+- `global_idx`: 全局层索引。优先取模块自带的 `layer.layer_number`（0-based 全局编号）；取不到时回退到
+  `pp_rank × local_layers + local_idx`。`num_empty_layers_add_in_head > 0` 时所有层号整体偏移该值，看板对号要减掉
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
 
 ---
@@ -350,7 +351,7 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 监控 mHC (Manifold-Constrained Hyper-Connections) 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`，
 以及 `x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)` 两项的相对大小。
 只在模型开启 mHC 层时生效——mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
-彻底 no-op（不 wrap、不产生指标）。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 12 个指标，
+彻底 no-op（不 wrap、不产生指标）。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 9 个指标，
 指标名以 `attn_` / `mlp_` 前缀区分；除 `branch_residual_share_max` 取极值外，其余按 token/batch 求均值。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
@@ -363,15 +364,11 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 | 6 | `{c}_h_post_token_std` | `mhc_health/layer_{i}/{c}_h_post_token_std` | `std_t(mean_i h_post)` | 每层+全局 | 门控对输入的区分度，→0 = 退化成常数 |
 | 7 | `{c}_branch_residual_share` | `mhc_health/layer_{i}/{c}_branch_residual_share` | `mean_t(b / (b + r))`，`b = ‖H_postᵀ F(·)‖_F`、`r = ‖H_resᵀ x_l‖_F` | 每层+全局 | **本层是否还在写入残差流**，值域 `[0, 1]`：0.5 = 两项等量 |
 | 8 | `{c}_branch_residual_share_max` | `mhc_health/layer_{i}/{c}_branch_residual_share_max` | 同上取最坏 token | 每层+全局 | 单 token 被分支主导的程度（贴 1 = 存在近零残差 token） |
-| 9 | `{c}_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_amax_gain_fwd` | `mean_t(max_i \|Σ_j h_res_ij\|)` | 每层+全局 | 单层前向最坏放大 (≈1) |
-| 10 | `{c}_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_amax_gain_bwd` | `mean_t(max_j \|Σ_i h_res_ij\|)` | 每层+全局 | 单层反向最坏放大 (≈1) |
-| 11 | `{c}_composite_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd` | 复合映射 `∏ h_res` 的行和 | 每层+全局 | 跨层累积前向放大 |
-| 12 | `{c}_composite_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd` | 复合映射 `∏ h_res` 的列和 | 每层+全局 | 跨层累积反向放大 |
+| 9 | `{c}_amax_gain_fwd` | `mhc_health/global_{c}_amax_gain_fwd` | `mean_t(max_i \|Σ_j h_res_ij\|)` | **仅全局** | Sinkhorn 收敛哨兵（恒 ≈1，见下） |
 
-`{c}` ∈ `{attn, mlp}`。复合映射为本 pipeline stage / VPP chunk 内 `h_res` 的累乘（每次 forward 在本 stage 首个
-hc 模块处重置）——PP=1 时精确，PP>1 时为 stage 局部近似。
+`{c}` ∈ `{attn, mlp}`。
 
-指标 1~6 与 9~12 来自包裹 `compute_mappings`（`h_pre` 不在 `forward` 返回值里，只能从这里拿到真实映射）；
+指标 1~6 与 9 来自包裹 `compute_mappings`（`h_pre` 不在 `forward` 返回值里，只能从这里拿到真实映射）；
 指标 7~8 需要 sublayer 输出，只有两项合并处才同时可见，故额外包裹 `fused_h_res_h_post_bda`，且指标从**入参**
 推导，因此 fused 快路径与带 dropout 的顺序路径口径一致。两个范数都是精确值但不 materialize 任何
 `[tokens, n, C]` 中间张量：branch 项是外积，`‖h_post_t ⊗ x_t‖_F = ‖h_post_t‖₂·‖x_t‖₂`；residual 项用
@@ -391,7 +388,9 @@ hc 模块处重置）——PP=1 时精确，PP>1 时为 stage 局部近似。
   - `stream_concentration`≈n → **退化为单流**，该层放弃了多流结构，`num_residual_streams` 的开销在这些层上没有
     收益；可考虑逐层配置 n。注意这未必是病：HC 允许不同层使用不同的流组合，需结合「是否总是同一条流」判断。
 - `h_post_token_std`→0 → 门控丢失对 token 的区分度，从动态门退化成常数标量。
-- `amax_gain_fwd/bwd` 偏离 1.0 → Sinkhorn 未收敛或初始化异常；复合映射沿深度偏离 1.0 → 残差流放大/收缩。
+- `amax_gain_fwd` 偏离 1.0 → Sinkhorn 未收敛或初始化异常。它按构造恒 ≈1（实测 0.99999905，动态范围
+  0.0001%），**只当哨兵用，不要拿它做诊断**；也因此只输出 `global_*` 而不占逐层曲线（`Probe.GLOBAL_ONLY`
+  机制：逐层值照常累加、global 从中派生，只是不写日志，所以任一层漂移仍会被全局曲线捕获）。
 
 ---
 

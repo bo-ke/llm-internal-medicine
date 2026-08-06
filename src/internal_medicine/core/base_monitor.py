@@ -28,6 +28,11 @@ class Probe(ABC):
     METRIC_PREFIX: str = ""
     MAX_AGGREGATED: set[str] = set()
     MIN_AGGREGATED: set[str] = set()
+    # Metric names whose per-layer series is accumulated (the global value is
+    # derived from it) but never written to the log. For "gatekeeper" metrics
+    # that are constant by construction and only speak when an invariant breaks:
+    # one global curve carries the same signal as N layers x M components.
+    GLOBAL_ONLY: set[str] = set()
 
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         self.log_per_layer = log_per_layer

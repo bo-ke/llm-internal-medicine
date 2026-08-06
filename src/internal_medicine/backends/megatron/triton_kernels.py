@@ -12,11 +12,16 @@ from ...core.triton_qk_kernel import qk_stats_kernel, qk_stats_packed_kernel
 logger = logging.getLogger(__name__)
 
 
-def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = True) -> dict:
+def compute_qk_stats_triton(
+    q: torch.Tensor, k: torch.Tensor, causal: bool = True, attn_sink: torch.Tensor | None = None
+) -> dict:
     """
     Compute QK statistics using optimized Triton kernel.
     Input: [B, H, S, D] (already permuted by compute_qk_stats).
     Returns: Max Logits, Mean Logits, Entropy, Sink Weights.
+
+    ``attn_sink``: optional per-query-head sink logit ``[H]`` folded into the
+    softmax denominator (``None`` = vanilla, real-key-only).
     """
     batch, num_heads, seq_len, head_dim = q.shape
     scale = 1.0 / (head_dim**0.5)
@@ -37,9 +42,14 @@ def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = Tru
     if head_dim > 64:
         BLOCK_K = 128
 
+    # None is not a valid kernel pointer: pass a dummy zero buffer, gate on HAS_SINK.
+    sink_present = attn_sink is not None
+    sink_buf = attn_sink if sink_present else torch.zeros(num_heads, device=q.device, dtype=torch.float32)
+
     qk_stats_kernel[grid](
         q,
         k,
+        sink_buf,
         max_logits,
         mean_logits,
         entropy,
@@ -64,6 +74,7 @@ def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = Tru
         max_logits.stride(1),
         scale=scale,
         apply_causal_mask=causal,
+        HAS_SINK=sink_present,
         ROW_STRIDE=1,  # full-sequence (exact) behavior, unchanged
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -82,10 +93,15 @@ def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = Tru
     }
 
 
-def compute_qk_stats_pytorch(q: torch.Tensor, k: torch.Tensor, causal: bool = True) -> dict:
+def compute_qk_stats_pytorch(
+    q: torch.Tensor, k: torch.Tensor, causal: bool = True, attn_sink: torch.Tensor | None = None
+) -> dict:
     """
     Reference PyTorch implementation including Entropy and Sink.
     Input: [B, H, S, D] (already permuted by compute_qk_stats).
+
+    ``attn_sink``: optional per-query-head sink logit ``[H]`` folded in as one
+    extra key-less softmax column (excluded from max/mean and the sink numerator).
     """
     batch, num_heads, seq_len, head_dim = q.shape
     scale = 1.0 / (head_dim**0.5)
@@ -109,21 +125,25 @@ def compute_qk_stats_pytorch(q: torch.Tensor, k: torch.Tensor, causal: bool = Tr
     mean_per_head = sum_logits / count.clamp(min=1)
 
     # 3. Softmax & Entropy & Sink
-    # Softmax along last dim (keys)
-    probs = torch.softmax(logits, dim=-1)  # [B, H, S, S]
+    # Fold the sink logit in as one extra key-less column: it enters the softmax
+    # denominator and entropy (it's part of the model's distribution), but not
+    # max/mean or the token-0 sink numerator (those describe real keys).
+    if attn_sink is not None:
+        sink_col = attn_sink.reshape(1, num_heads, 1, 1).expand(batch, num_heads, seq_len, 1).to(logits.dtype)
+        ext_logits = torch.cat([logits, sink_col], dim=-1)  # [B, H, S, S+1]
+        ext_valid = torch.cat([valid_mask, torch.ones_like(sink_col, dtype=torch.bool)], dim=-1)
+    else:
+        ext_logits = logits
+        ext_valid = valid_mask
 
-    # Entropy: -sum(p * log(p))
-    # Note: masked positions have p=0, 0*log0=0 (handled by where)
-    log_probs = torch.log_softmax(logits, dim=-1)
+    probs = torch.softmax(ext_logits, dim=-1)  # [B, H, S, S(+1)]
+    log_probs = torch.log_softmax(ext_logits, dim=-1)
     entropy_map = -(probs * log_probs)
-    # Mask out invalid (causal) entries which might be NaN
-    entropy_map = torch.where(valid_mask, entropy_map, torch.tensor(0.0, device=q.device))
+    entropy_map = torch.where(ext_valid, entropy_map, torch.tensor(0.0, device=q.device))
     row_entropy = entropy_map.sum(dim=-1)  # [B, H, S]
-    # Average entropy over valid queries (rows)
-    # For causal, first row has 1 valid, second 2...
     avg_entropy = row_entropy.mean(dim=-1)  # [B, H]
 
-    # Sink: Probability of token 0
+    # Sink: probability of real token 0 (never the appended sink column)
     sink_probs = probs[..., 0]  # [B, H, S]
     avg_sink = sink_probs.mean(dim=-1)  # [B, H]
 
@@ -139,10 +159,18 @@ def compute_qk_stats_pytorch(q: torch.Tensor, k: torch.Tensor, causal: bool = Tr
     }
 
 
-def compute_qk_stats(q: torch.Tensor, k: torch.Tensor, causal: bool = True, use_triton: bool = True) -> dict:
+def compute_qk_stats(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    causal: bool = True,
+    use_triton: bool = True,
+    attn_sink: torch.Tensor | None = None,
+) -> dict:
     """
     Unified entry point. Input layout: [S, B, H, D] (Megatron core_attention convention).
     Permutes to [B, H, S, D] before dispatching to backend.
+
+    ``attn_sink``: optional per-query-head sink logit ``[H]`` (softmax_offset).
     """
     seq_len, batch, num_q_heads, head_dim = q.shape
     _, _, num_k_heads, _ = k.shape
@@ -156,9 +184,9 @@ def compute_qk_stats(q: torch.Tensor, k: torch.Tensor, causal: bool = True, use_
     k = k.permute(1, 2, 0, 3).contiguous()
 
     if use_triton:
-        return compute_qk_stats_triton(q, k, causal)
+        return compute_qk_stats_triton(q, k, causal, attn_sink=attn_sink)
 
-    return compute_qk_stats_pytorch(q, k, causal)
+    return compute_qk_stats_pytorch(q, k, causal, attn_sink=attn_sink)
 
 
 def _cu_seqlens_to_token_arrays(cu_seqlens: torch.Tensor, total_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -199,7 +227,11 @@ def _cu_seqlens_to_token_arrays(cu_seqlens: torch.Tensor, total_tokens: int) -> 
 
 
 def compute_qk_stats_triton_packed(
-    q: torch.Tensor, k: torch.Tensor, cu_seqlens: torch.Tensor, causal: bool = True
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    causal: bool = True,
+    attn_sink: torch.Tensor | None = None,
 ) -> dict:
     """Packed (THD) QK statistics via the split-M Triton kernel.
 
@@ -207,6 +239,9 @@ def compute_qk_stats_triton_packed(
     Reduces the per-M-block partial buffers into per-head stats using row-first
     mean semantics (mean over valid rows of each row's mean logit), matching
     the dense ``qk_stats_partial_kernel`` reduction.
+
+    ``attn_sink``: optional per-query-head sink logit ``[H]`` folded into the
+    softmax denominator on top of the per-sequence sink column.
     """
     num_heads, total_tokens, head_dim = q.shape
     scale = 1.0 / (head_dim**0.5)
@@ -234,9 +269,14 @@ def compute_qk_stats_triton_packed(
 
     grid = (num_heads, num_m_blocks)
 
+    # None is not a valid kernel pointer: pass a dummy zero buffer, gate on HAS_SINK.
+    sink_present = attn_sink is not None
+    sink_buf = attn_sink if sink_present else torch.zeros(num_heads, device=q.device, dtype=torch.float32)
+
     qk_stats_packed_kernel[grid](
         q,
         k,
+        sink_buf,
         seq_start,
         seq_end,
         p_max,
@@ -260,6 +300,7 @@ def compute_qk_stats_triton_packed(
         p_max.stride(1),
         scale=scale,
         apply_causal_mask=causal,
+        HAS_SINK=sink_present,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -293,7 +334,11 @@ def compute_qk_stats_triton_packed(
 
 
 def compute_qk_stats_pytorch_packed(
-    q: torch.Tensor, k: torch.Tensor, cu_seqlens: torch.Tensor, causal: bool = True
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    causal: bool = True,
+    attn_sink: torch.Tensor | None = None,
 ) -> dict:
     """Reference packed QK statistics. Input: [H, T, D].
 
@@ -302,6 +347,9 @@ def compute_qk_stats_pytorch_packed(
     average over valid rows of each row's mean logit — NOT a count-weighted
     position mean). This is the reference/fallback path; ``cu_seqlens.tolist()``
     incurs a D2H sync and is acceptable here (not the Triton hot path).
+
+    ``attn_sink``: optional per-query-head sink logit ``[H]`` folded in as one
+    extra key-less softmax column per sequence, matching the kernel.
     """
     num_heads, total_tokens, head_dim = q.shape
     scale = 1.0 / (head_dim**0.5)
@@ -341,11 +389,21 @@ def compute_qk_stats_pytorch_packed(
         row_mean = row_sum / row_count.clamp(min=1)  # [H, L]
         sum_row_mean += row_mean.sum(dim=-1)
 
-        # entropy per row
-        probs = torch.softmax(logits, dim=-1)
-        log_probs = torch.log_softmax(logits, dim=-1)
+        # entropy per row. Fold the sink logit in as an extra key-less column:
+        # it enters the softmax denominator and entropy, but not max/mean or the
+        # seq-start sink numerator (those describe real keys).
+        if attn_sink is not None:
+            sink_col = attn_sink.reshape(num_heads, 1, 1).expand(num_heads, length, 1).to(logits.dtype)
+            ext_logits = torch.cat([logits, sink_col], dim=-1)
+            ext_valid = torch.cat([valid_mask, torch.ones_like(sink_col, dtype=torch.bool)], dim=-1)
+        else:
+            ext_logits = logits
+            ext_valid = valid_mask
+
+        probs = torch.softmax(ext_logits, dim=-1)
+        log_probs = torch.log_softmax(ext_logits, dim=-1)
         ent_map = -(probs * log_probs)
-        ent_map = torch.where(valid_mask, ent_map, torch.zeros_like(ent_map))
+        ent_map = torch.where(ext_valid, ent_map, torch.zeros_like(ent_map))
         sum_entropy += ent_map.sum(dim=-1).sum(dim=-1)
 
         # sink = prob of each row's own sequence-start (local column 0)
@@ -377,6 +435,7 @@ def compute_qk_stats_packed(
     cu_seqlens: torch.Tensor,
     causal: bool = True,
     use_triton: bool = True,
+    attn_sink: torch.Tensor | None = None,
 ) -> dict:
     """Unified packed (THD) entry point. Input layout: [T, H, D].
 
@@ -384,6 +443,8 @@ def compute_qk_stats_packed(
     leaks across packed sequences and each sequence's sink is its own first
     token. GQA is expanded on the host (matching ``compute_qk_stats``), then
     the tensors are permuted to [H, T, D] before dispatch.
+
+    ``attn_sink``: optional per-query-head sink logit ``[H]`` (softmax_offset).
     """
     total_tokens, num_q_heads, head_dim = q.shape
     _, num_k_heads, _ = k.shape
@@ -397,6 +458,6 @@ def compute_qk_stats_packed(
     k = k.permute(1, 0, 2).contiguous()
 
     if use_triton:
-        return compute_qk_stats_triton_packed(q, k, cu_seqlens, causal)
+        return compute_qk_stats_triton_packed(q, k, cu_seqlens, causal, attn_sink=attn_sink)
 
-    return compute_qk_stats_pytorch_packed(q, k, cu_seqlens, causal)
+    return compute_qk_stats_pytorch_packed(q, k, cu_seqlens, causal, attn_sink=attn_sink)

@@ -150,10 +150,21 @@ class QKStatsMonitor(TorchProbe):
 
                 is_thd = query.dim() == 3
 
+                # Learned per-head sink logit (learnable/off-by-one softmax);
+                # None for vanilla. `module` is core_attention. Keep on-device.
+                attn_sink = getattr(module, "softmax_offset", None)
+                if attn_sink is not None:
+                    attn_sink = attn_sink.detach()
+
                 with torch.no_grad():
                     if is_thd and cu_seqlens is not None:
                         stats = compute_qk_stats_packed(
-                            query, key, cu_seqlens.detach(), causal=self.causal, use_triton=self.use_triton
+                            query,
+                            key,
+                            cu_seqlens.detach(),
+                            causal=self.causal,
+                            use_triton=self.use_triton,
+                            attn_sink=attn_sink,
                         )
                     else:
                         if is_thd:
@@ -162,7 +173,9 @@ class QKStatsMonitor(TorchProbe):
                         seq_len = query.shape[0]
                         if seq_len > _MAX_SEQ_LEN_FOR_QK and not self.use_triton:
                             return
-                        stats = compute_qk_stats(query, key, causal=self.causal, use_triton=self.use_triton)
+                        stats = compute_qk_stats(
+                            query, key, causal=self.causal, use_triton=self.use_triton, attn_sink=attn_sink
+                        )
 
                 # NOTE: TP cross-rank aggregation is intentionally NOT done here.
                 # gather_and_aggregate() at flush time pools across all ranks

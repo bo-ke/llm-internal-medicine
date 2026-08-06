@@ -30,6 +30,8 @@ _kernels = importlib.import_module("internal_medicine.backends.megatron.triton_k
 compute_qk_stats_triton_packed = _kernels.compute_qk_stats_triton_packed
 compute_qk_stats_pytorch_packed = _kernels.compute_qk_stats_pytorch_packed
 compute_qk_stats_packed = _kernels.compute_qk_stats_packed
+compute_qk_stats_triton = _kernels.compute_qk_stats_triton
+compute_qk_stats_pytorch = _kernels.compute_qk_stats_pytorch
 _cu_seqlens_to_token_arrays = _kernels._cu_seqlens_to_token_arrays
 
 
@@ -217,6 +219,88 @@ class CuSeqlensTokenArraysTest(unittest.TestCase):
         self.assertEqual(s.shape[0], 64)
         self.assertTrue((s == 0).all(), f"unexpected seq_start: {s[:8].tolist()}")
         self.assertTrue((e == 64).all(), f"unexpected seq_end: {e[:8].tolist()}")
+
+
+class DenseSinkFoldTest(unittest.TestCase):
+    """Fold the per-head sink logit into the dense QK stats vs a materialized ref."""
+
+    ATOL = 2e-2
+    RTOL = 2e-2
+
+    def _bhsd(self, seq_len=96, num_heads=4, head_dim=64, seed=3):
+        torch.manual_seed(seed)
+        q = torch.randn(1, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(1, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
+        return q, k
+
+    def _reference(self, q, k, sink):
+        _, num_heads, seq_len, head_dim = q.shape
+        logits = torch.matmul(q.float(), k.float().transpose(-2, -1)) / head_dim**0.5
+        logits = logits.masked_fill(
+            torch.triu(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), 1), float("-inf")
+        )
+        sink_col = sink.reshape(1, num_heads, 1, 1).expand(1, num_heads, seq_len, 1).float()
+        ext = torch.cat([logits, sink_col], dim=-1)
+        probs = torch.softmax(ext, dim=-1)
+        ent = -(probs * torch.log_softmax(ext, dim=-1))
+        ent = torch.where(torch.isfinite(ext), ent, torch.zeros_like(ent))
+        return ent.sum(-1).mean(-1).flatten(), probs[..., 0].mean(-1).flatten()
+
+    def test_fold_matches_materialized_reference(self):
+        q, k = self._bhsd()
+        sink = torch.tensor([0.5, -1.0, 2.0, 0.0], device="cuda")
+        out = compute_qk_stats_triton(q.contiguous(), k.contiguous(), causal=True, attn_sink=sink)
+        ref_ent, ref_sink = self._reference(q, k, sink)
+        for h in range(ref_ent.numel()):
+            self.assertAlmostEqual(
+                out["entropy_per_head"].float().flatten()[h].item(),
+                ref_ent[h].item(),
+                delta=self.ATOL + self.RTOL * abs(ref_ent[h].item()),
+            )
+            self.assertAlmostEqual(
+                out["sink_per_head"].float().flatten()[h].item(),
+                ref_sink[h].item(),
+                delta=self.ATOL + self.RTOL * abs(ref_sink[h].item()),
+            )
+
+    def test_none_sink_matches_baseline(self):
+        q, k = self._bhsd()
+        out = compute_qk_stats_triton(q.contiguous(), k.contiguous(), causal=True, attn_sink=None)
+        ref = compute_qk_stats_pytorch(q.contiguous(), k.contiguous(), causal=True, attn_sink=None)
+        self.assertAlmostEqual(out["entropy_global"].item(), ref["entropy_global"].item(), delta=self.ATOL)
+
+    def test_large_sink_collapses_entropy(self):
+        q, k = self._bhsd()
+        big = torch.full((4,), 50.0, device="cuda")
+        out = compute_qk_stats_triton(q.contiguous(), k.contiguous(), causal=True, attn_sink=big)
+        self.assertLess(out["entropy_global"].item(), 1e-2)
+        self.assertLess(out["sink_global"].item(), 1e-2)
+
+
+class PackedSinkFoldTest(unittest.TestCase):
+    """Fold the sink logit into the packed (THD) QK stats vs the pytorch reference."""
+
+    ATOL = 2e-2
+    RTOL = 2e-2
+
+    def _qk(self, seed=5):
+        q, k, cu = _make_packed_qk([48, 80, 64], num_heads=4, head_dim=64, seed=seed)
+        return (*_to_htd(q, k), cu)
+
+    def test_fold_matches_reference(self):
+        qh, kh, cu = self._qk()
+        for sink in (torch.tensor([0.5, -1.0, 2.0, 0.0], device="cuda"), None):
+            tri = compute_qk_stats_triton_packed(qh, kh, cu, causal=True, attn_sink=sink)
+            ref = compute_qk_stats_pytorch_packed(qh, kh, cu, causal=True, attn_sink=sink)
+            for key in ("entropy_global", "sink_global"):
+                t, r = tri[key].float().item(), ref[key].float().item()
+                self.assertAlmostEqual(t, r, delta=self.ATOL + self.RTOL * abs(r), msg=f"{key}: {t} vs {r}")
+
+    def test_large_sink_collapses_entropy(self):
+        qh, kh, cu = self._qk()
+        tri = compute_qk_stats_triton_packed(qh, kh, cu, causal=True, attn_sink=torch.full((4,), 50.0, device="cuda"))
+        self.assertLess(tri["entropy_global"].item(), 1e-2)
+        self.assertLess(tri["sink_global"].item(), 1e-2)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ def qk_stats_kernel(
     # Pointers
     Q_ptr,
     K_ptr,
+    attn_sink_ptr,
     max_logits_ptr,
     mean_logits_ptr,
     entropy_ptr,
@@ -61,6 +62,7 @@ def qk_stats_kernel(
     # Configs
     scale: tl.constexpr,
     apply_causal_mask: tl.constexpr,
+    HAS_SINK: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -189,6 +191,21 @@ def qk_stats_kernel(
             d_i = d_new
             h_i = h_new
             s_i = s_new
+
+        # Fold the per-head sink logit as an extra key-less column: it enters
+        # the denominator (and entropy) but not max/mean or the sink numerator.
+        # h uses the OLD d_i before d_i is rescaled (see partial kernel).
+        if HAS_SINK:
+            sink_logit = tl.load(attn_sink_ptr + head_idx).to(tl.float32)
+            m_new = tl.maximum(m_i, sink_logit)
+            alpha_prev = tl.exp(m_i - m_new)
+            h_i = (h_i + (m_i - m_new) * d_i) * alpha_prev
+            d_i = d_i * alpha_prev
+            s_i = s_i * alpha_prev
+            sink_w = tl.exp(sink_logit - m_new)
+            d_i = d_i + sink_w
+            h_i = h_i + sink_w * (sink_logit - m_new)
+            m_i = m_new
 
         # Finalize block rows
         log_d = tl.log(d_i)
@@ -741,6 +758,7 @@ def qk_stats_packed_kernel(
     # Pointers
     Q_ptr,
     K_ptr,
+    attn_sink_ptr,
     token_seq_start_ptr,  # [total_tokens] int32: start token index of each token's sequence
     token_seq_end_ptr,  # [total_tokens] int32: end (exclusive) token index of each token's sequence
     partial_max_ptr,
@@ -768,6 +786,7 @@ def qk_stats_packed_kernel(
     # Configs
     scale: tl.constexpr,
     apply_causal_mask: tl.constexpr,
+    HAS_SINK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -889,6 +908,21 @@ def qk_stats_packed_kernel(
         d_i = d_new
         h_i = h_new
         s_i = s_new
+
+    # Fold the per-head sink logit as an extra key-less column on top of the
+    # per-sequence sink column: it enters the denominator (and entropy) but not
+    # max/mean or the sink numerator. h uses the OLD d_i before d_i is rescaled.
+    if HAS_SINK:
+        sink_logit = tl.load(attn_sink_ptr + head_idx).to(tl.float32)
+        m_new = tl.maximum(m_i, sink_logit)
+        alpha_prev = tl.exp(m_i - m_new)
+        h_i = (h_i + (m_i - m_new) * d_i) * alpha_prev
+        d_i = d_i * alpha_prev
+        s_i = s_i * alpha_prev
+        sink_w = tl.exp(sink_logit - m_new)
+        d_i = d_i + sink_w
+        h_i = h_i + sink_w * (sink_logit - m_new)
+        m_i = m_new
 
     # Finalize per-row stats for this M-block
     safe_d = tl.where(d_i > 0, d_i, 1.0)

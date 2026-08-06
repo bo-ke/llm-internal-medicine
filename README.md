@@ -207,6 +207,12 @@ setup_internal_medicine()
 | 9 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
 | 10 | `attn_sink_logit` | `qk_stats/.../attn_sink_logit` | `mean(sink_logit)` | 每层+全局 | learned sink logit 量级漂移；稀疏层取 `attn_sink`，full 层取 `softmax_offset` |
 
+> **learnable / off-by-one softmax 的 sink 折叠**：当 `core_attention.softmax_offset`
+> 存在时（`softmax_type` 为 `learnable` / `off-by-one`），`entropy_avg` / `sink` 会把这个
+> per-head sink logit 作为一列额外的无 key 列折进 softmax 分母，使统计与模型真实分布一致
+> （`sink` 分子与 `max` / `mean` 仍只统计真实 key）。vanilla softmax（无 offset）行为不变。
+> megatron 与 paddlefleet 两个后端语义一致。
+
 ### 混合注意力栈的层类型标签 (attn_type)
 
 指标键会带上层类型前缀，避免不同注意力类型的统计混在同一张图里。

@@ -665,8 +665,8 @@ class PaddleQKStatsMonitor(PaddleProbe):
         monitor = self
         attn_type = item.attn_type
 
-        def wrapped(query, kv_full, attn_sink, topk_idxs, softmax_scale, topk_length=None):
-            out = original(query, kv_full, attn_sink, topk_idxs, softmax_scale, topk_length=topk_length)
+        def wrapped(query, kv_full, attn_sink, topk_idxs, softmax_scale, *args, **kwargs):
+            out = original(query, kv_full, attn_sink, topk_idxs, softmax_scale, *args, **kwargs)
             if core.training and monitor._should_monitor():
                 monitor._record_sparse_stats(layer_idx, attn_type, query, kv_full, attn_sink, topk_idxs, softmax_scale)
             return out

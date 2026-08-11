@@ -3,7 +3,7 @@
 监控 mHC (Manifold-Constrained Hyper-Connections) 层的健康状况。mHC 用如下传播替换普通残差：
 
 ```
-x_{l+1} = H_res @ x_l + H_post^T · F(H_pre @ x_l)
+x_{l+1} = H_res^T @ x_l + H_post^T · F(H_pre @ x_l)
 ```
 
 每个 token、每个 hyper-connection 模块学习三个映射（`n = num_residual_streams`）：
@@ -63,9 +63,9 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 
 ## 监控指标
 
-每个 hc 模块产出 14 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 8 个），指标名以
-`attn_` / `mlp_` 前缀区分，除 `branch_residual_share_max`、`h_res_softmax_max`、
-`composite_amax_gain_{fwd,bwd}_max` 取极大值与 `h_res_softmax_min` 取极小值外全部按 token/batch 求均值
+每个 hc 模块产出 16 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 8 个），指标名以
+`attn_` / `mlp_` 前缀区分。`branch_residual_share_max`、`h_res_logits_max`、`h_res_logits_grad_max`、
+`composite_amax_gain_{fwd,bwd}_max` 取极大值，`h_res_logits_min` 与 `h_res_logits_grad_min` 取极小值，其余按 token/batch 求均值
 （并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，
 `{c}` ∈ `{attn, mlp}`；对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
 
@@ -76,7 +76,12 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 | `{c}_h_pre_mean`  | `mean(h_pre)`  | 聚合门均值 |
 | `{c}_h_pre_std`   | `std(h_pre)`   | 聚合门离散度 |
 | `{c}_h_post_mean` | `mean(h_post)` | 扩展门均值 |
-| `{c}_h_post_std`  | `std(h_post)`  | 扩展门离散度 |
+| `{c}_h_post_std`  | `std_{t,i}(h_post[t,i])` | token 与 stream 混合后的总离散度；单独看无法区分流间分工和 token 间变化 |
+
+`h_post_std` 的信息量有限，但不是零：它能发现所有 gate entry 是否整体收缩为近似常数。它必须和
+`h_post_token_std`、`h_post_stream_concentration` 联合解释。总离散度高但 token std 低，更像稳定的 stream 间分工；
+两者都高，才说明每个 token 的总门量也在明显变化。反过来，`h_post_token_std -> 0` 仍允许不同 token 在 stream 间
+重新分配相同总门量，因此不能据此断言门控已完全失去输入区分能力。
 
 ### 结构指标（paddlefleet 独有）
 
@@ -87,9 +92,9 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 | 指标 | 公式 | 诊断意义 |
 |------|------|----------|
 | `{c}_h_post_stream_concentration` | `mean_t( max_i h_post[t,i] / mean_i h_post[t,i] )` | 流间集中度，区间 `[1, n]`。1 = 各流等权；趋 `n` = 质量压到单流，该层退化成普通单流残差，`num_residual_streams` 预算未被使用 |
-| `{c}_h_post_token_std` | `std_t( mean_i h_post[t,i] )` | 门对输入的敏感度（`h = r · proj · α + bias`）。→0 = 门不再区分 token，等价于常数标量 |
+| `{c}_h_post_token_std` | `std_t( mean_i h_post[t,i] )` | token 间“总门量”的离散度。→0 只说明各 token 的 stream 均值接近，不代表每条 stream 的门都与 token 无关 |
 | `{c}_branch_residual_share` | `mean_t( b / (b + r) )`，`b = ‖H_postᵀ F(·)‖_F`、`r = ‖H_resᵀ x_l‖_F` | 本层写入量在「写入 + 残差重混」中的占比，区间 `[0, 1]`。0.5 = 两项等量；趋 0 = 该层退化为纯残差搬运。|
-| `{c}_branch_residual_share_max` | `max_t( b / (b + r) )` | 最坏 token 的写入占比；贴 1 表示存在残差近零的 token。唯一按极值跨 microbatch/层/rank 归约的指标 |
+| `{c}_branch_residual_share_max` | `max_t( b / (b + r) )` | 长尾告警：捕获均值掩盖的 branch-dominated token。对 token 数量和离群点敏感，且两项绝对值都很小时比值仍可贴 1，不能脱离均值和幅度单独诊断 |
 
 两个范数都是精确值，但不物化 `[tokens, n, C]` 中间量：分支项是外积（`‖h_post_t ⊗ xb_t‖_F = ‖h_post_t‖₂·‖xb_t‖₂`），
 残差项用 `[tokens, n, n]` 的 Gram/mix 收缩得到，`n = 4` 时开销约为本层投影的 `C/n²` 分之一。
@@ -119,38 +124,77 @@ amax_gain_bwd = mean_t( max_j | Σ_i  h_res_ji | )      # h_res 的行和（back
 注意论文 Eq. (9) 最后一步是**行**归一，所以它 Fig 7 里会动的是 forward 那条，而我们会动的是 `_bwd`——
 **两边曲线不可直接对比。**
 
-### logits 饱和哨兵（迭代前的行内跨度）
+### 迭代前 logits 范围
 
-`softmax` 在行内**平移不变**，所以决定 `h_res` 有多尖的唯一量是行内跨度 `max_j z_j − min_j z_j`。跨度直接决定
-softmax 的最小输出：`min ≈ exp(−跨度)`，于是阈值由 dtype 给出，不需要拍：
-
-- `exp(-87) ≈ 1.2e-38` —— fp32 最小正规数
-- `exp(-103) ≈ 1.4e-45` —— fp32 最小 denormal，再往下就是 0
-
-跨度超过 ~87，模型自己的 `softmax` 就开始下溢：行内相对比例被摧毁，紧随其后的 Sinkhorn 把残存比例按最多
-`1/eps` 放大。
+直接统计 `_compute_h` 产出、进入 Sinkhorn 前的 raw residual-mixing logits `z`。这两条保留符号，不执行
+softmax，因此不会受概率饱和到 0/1 的截断影响：
 
 | 指标 | 公式 | 诊断意义 |
 |------|------|----------|
-| `{c}_h_res_softmax_min` | `min_t min_{i,j} softmax(z)_{t,i,j}` | 最小混合权重。值域 `(0, 1/n]`，`1/n` = 行内均匀，趋 0 = 该行退化成 one-hot。按 **min** 归约 |
-| `{c}_h_res_softmax_max` | `max_t max_{i,j} softmax(z)_{t,i,j}` | 单个最大混合权重。值域 `[1/n, 1]`，跨度到约 18 之后在 fp32 里精确等于 1.0 并保持不变，所以只能当"是否已经饱和"的开关看，不反映饱和深度。按 **max** 归约 |
+| `{c}_h_res_logits_min` | `min z` | step 内该层所有 microbatch/token/stream 的最小 raw logit。按 **min** 归约 |
+| `{c}_h_res_logits_max` | `max z` | 同上取最大值。按 **max** 归约 |
+
+`max-min` 可作为跨 token 的保守全局跨度，用于观察 logits 尺度持续扩张或异常尖峰；它不是逐行跨度的最大值，
+因此不能直接套用单行 softmax 的精确饱和阈值。与下面的 logits gradient min/max 联合看，可以区分 logits 尺度漂移与
+反向信号减弱。
+
+### 迭代前 logits 梯度
+
+对 `_compute_h` 产出、传入 Sinkhorn 的 raw `h_res` logits `z` 注册 tensor gradient hook，监控的是
+`dL/dz`，不是 Sinkhorn 最终矩阵或循环中间 `M` 的梯度：
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_h_res_logits_grad_min` | `min dL/dz` | step 内该层所有 microbatch/token/stream 的最小 activation gradient。按 **min** 归约 |
+| `{c}_h_res_logits_grad_max` | `max dL/dz` | 同上取最大值。按 **max** 归约 |
+
+hook 热路径只在 GPU 上计算 fp32 min/max 并写 0 维 accumulator。AMP 下 hook 先收到 scaled gradient，随后在
+`on_optimizer_begin`（`scaler.step/update` 之前）用本 step loss scale 统一反除；不除 gradient accumulation，保留每个
+microbatch 在真实反向路径上的 activation-gradient 量级。recompute 的首次 forward 运行于 `no_grad`，由现有
+`_should_monitor()` 跳过；grad-enabled backward replay 再注册 hook，因此不会重复采集 checkpoint 的首次执行。
 
 ### 复合映射（composite_amax_gain_{fwd,bwd}_max）
 
-`apply_h_res` 的实际运算是 `mixed = h_resᵀ @ residual`，所以
-**真正作用在流向量上的算子是 `h_resᵀ`**。从首层到第 k 层的复合算子是
+#### 论文定义
+
+论文第 14 页 Figure 7(b) 按 residual branch 编号。记投影后的第 `l` 个 residual mixing 算子为
+`R_l = P_{M_res}(H_l^res)`，总 branch 数为 `L`。论文的 forward composite 是从入口到当前位置的 prefix：
 
 ```
-A_k = h_res_kᵀ @ ⋯ @ h_res_0ᵀ
+F_l = prod_{i=1}^{l} R_{l+1-i}
+    = R_l @ R_{l-1} @ ... @ R_1
 ```
 
-逐层记录它的最大绝对行和（`_fwd`，前向信号增益）与最大绝对列和（`_bwd`，反向梯度增益）。这条曲线对应论文
-Figure 7(b)：单层指标看不出的拱形（中间层高、两端低）只有复合能显示。
+论文的 backward composite 则是从当前位置到模型尾部的 suffix：
 
-| 指标 | 公式 | 诊断意义 |
+```
+B_l = prod_{i=1}^{L-l} R_{L-i}
+    = R_{L-1} @ R_{L-2} @ ... @ R_l
+```
+
+前向信号经过 `F_l`；从模型输出反传到位置 `l` 的梯度经过 `B_l^T`。因此论文中的 composite forward amplification
+应读 `||F_l||∞`，composite backward amplification 应读 `||B_l^T||∞ = ||B_l||1`。这里的 `l` 是每个顺序执行的
+residual branch；映射到 Transformer 时，attention 和 MLP 是交错的相邻 branch，不能拆成两条互不相干的链。
+
+#### 当前 PaddleFleet 实现
+
+`apply_h_res` 的实际运算是 `mixed = h_resᵀ @ residual`，所以实现先对 token 求平均并转置，得到真正作用在
+流向量上的算子 `T_q = mean_token(h_res_q)ᵀ`。所有非 MTP branch 按物理执行顺序排列：
+
+```
+T_{0,attn}, T_{0,mlp}, T_{1,attn}, T_{1,mlp}, ...
+```
+
+`{c}` 只标识当前观测点是 attention 还是 MLP branch，不再表示两条独立累积链。正序遍历构造入口到当前 branch 的
+prefix `F_q = T_q @ ... @ T_0`；逆序遍历构造当前 branch 到尾部的 suffix
+`B_q = T_tail @ ... @ T_q`。
+
+| 指标 | 公式 | 精确语义 |
 |------|------|----------|
-| `{c}_composite_amax_gain_fwd_max` | `max_i \|Σ_j A_{k,i,j}\|` | 从首层到本层累计的前向最坏放大。逐层输出形成剖面曲线；global 按 **max** 归约给出峰值 |
-| `{c}_composite_amax_gain_bwd_max` | `max_j \|Σ_i A_{k,i,j}\|` | 同上取列和 |
+| `{c}_composite_amax_gain_fwd_max` | `||F_q||∞ = max_i Σ_j |F_{q,i,j}|` | 入口到当前 `{c}` branch 的交错 prefix 前向最坏放大；global 按 **max** 归约 |
+| `{c}_composite_amax_gain_bwd_max` | `||B_qᵀ||∞ = ||B_q||₁ = max_j Σ_i |B_{q,i,j}|` | 模型尾部反传到当前 `{c}` branch 的交错 suffix 反向最坏放大；global 按 **max** 归约 |
+
+该实现与论文 Figure 7(b) 的 prefix-forward / suffix-backward 定义一致。
 
 四个实现要点：
 
@@ -159,13 +203,13 @@ Figure 7(b)：单层指标看不出的拱形（中间层高、两端低）只有
    `h_resᵀ` 口径计算（只是没有显式转置，直接换了求和轴），所以两组指标的 `_fwd`/`_bwd` 语义一致、可以对着读。
 2. **先对 token 求平均再累乘**（论文 Fig 7/8 同口径），所以每层每组件只存一个 `n×n` fp32 快照，而不是把 per-token
    `h_res` 在整个 step 内驻留。这是它当初被下线的第一条理由，现在不成立。
-3. **累乘发生在 flush 时、按 `layer_idx` 排序**，不在 hook 里增量累乘。所以结果与 hook 触发顺序无关——而触发顺序
-   在 recompute 下是反向重放的逆序，那正是它当初被下线的第二条理由。`_record_composite` 有对应的回归测试
-   （故意逆序触发 hook，断言结果仍等于正序累乘）。
+3. **累乘发生在 microbatch 结算时**，快照按 `(layer_idx, attn-before-mlp)` 排序，不在 hook 里增量累乘。因此结果与
+   hook 触发顺序无关；recompute 即使按反向层序重放，也会恢复成物理 branch 顺序。回归测试会故意逆序触发 hook，
+   并用非交换矩阵分别核对正序 prefix 和逆序 suffix。
 4. **MTP 层被排除。** MTP 层不在主干传播路径上，乘进链条没有物理意义。
 
-作用域限制：复合只覆盖**本 rank 持有的层**。当前配置（`sharding: stage1`，无 PP）下每张卡都持有全部 43 层，所以
-就是全网语义。真开 PP 后它会退化成 stage 内语义，而我们既检测不到也修不了——`get_pipeline_model_parallel_rank`
+作用域限制：复合只覆盖**本 rank 持有的层**。在 `sharding: stage1` 且无 PP 时，每张卡持有全部 Transformer 层，
+所以覆盖全网层范围。真开 PP 后它会退化成 stage 内语义，而我们既检测不到也修不了——`get_pipeline_model_parallel_rank`
 和 `get_pipeline_model_parallel_world_size` 在 PaddleFleet 里目前是 stub（无条件返回 0 / 1，
 `parallel_state.py:229`、`:246`）。要支持 PP 需要先等这两个函数实现，再补一次 flush 时的 all-gather；届时
 **collective 必须放在所有 per-layer `try/except` 之外**，否则单个 rank 吞异常会让整个 job 挂死而不是报错。
@@ -174,8 +218,9 @@ Figure 7(b)：单层指标看不出的拱形（中间层高、两端低）只有
 
 - `{c}_amax_gain_bwd`：曾因读数与 `amax_gain_fwd` 一致而下线。这个结果本身是预期的（`_fwd` 读的列和被 Sinkhorn
   最后一步钉死为 1），两条现在都保留：`_fwd` 当不变量守卫，`_bwd` 才是承载收敛残差的那条。
-- `{c}_composite_amax_gain_{fwd,bwd}_max`：曾因两条理由下线，现在都不成立——per-token `h_res` 全 step 驻留的开销
-  （改成先对 token 求平均后只剩一个 `n×n` 快照），以及依赖执行顺序（改成按 `layer_idx` 排序、flush 时累乘后无关）。
+- `{c}_composite_amax_gain_{fwd,bwd}_max`：恢复时先解决了 per-token `h_res` 全 step 驻留和 recompute 逆序触发；本次进一步
+  按论文改为 attention/MLP 交错的 prefix-forward / suffix-backward，并在每个 microbatch 结束时结算到 GPU accumulator。
+  因而一个 optimizer step 内的全部 gradient-accumulation microbatch 都参与既定的 max 归约。
 
 
 
@@ -183,11 +228,13 @@ Figure 7(b)：单层指标看不出的拱形（中间层高、两端低）只有
 
 ## 与 microbatch / 激活重算的交互
 
-- 每个梯度累积 microbatch 都会按序重新调用所有 hc 模块，每次调用独立记录一条样本，flush 时对 microbatch 求均值。
+- 每个梯度累积 microbatch 都会重新调用所有 hc 模块。中间 microbatch 在 `on_substep_end` 结算 composite，最后一个在
+  `on_step_end` 的 flush 前结算；每次结算后立即清空快照。各 microbatch 的结果写入同一 GPU max accumulator，因此
+  optimizer-step 日志表示全部 microbatch 中每个 branch 的最坏 composite gain。
 - 整个捕获受 `_should_monitor()` 门控；非监控步只是 `orig(x)` + 一次布尔判断。
 - `_should_monitor()` 要求 grad enabled。这个判据的名字暗示"跳过重算"，**实际语义相反**：recompute 的真前向跑在
   `no_grad` 下，反向重放才开 grad，所以采集实际发生在反向重放。数值不受影响（重算确定性），但依赖执行顺序的指标
-  会出错——这曾经让复合映射下线，现在复合改成按 `layer_idx` 排序、在 flush 时累乘，不再受影响。
-- 这个判据留着是因为它顺带保证了"每个模块每 step 只取一条样本"：mHC 的 hyper-connection 在一次前向里会被进入
+  会出错——这曾经让复合映射下线；现在结算时按 `(layer_idx, attn-before-mlp)` 恢复物理顺序，不再受影响。
+- 这个判据还会过滤同一 microbatch 中不承载梯度的重复路径：mHC 的 hyper-connection 在一次前向里会被进入
   两次（`high_precision_mhc` 打开时 AMP 关闭的 fp32 路径 + bf16 路径），两条都记会稀释所有均值。详见 README
   「已知限制：采集口径依赖 grad 判据」。

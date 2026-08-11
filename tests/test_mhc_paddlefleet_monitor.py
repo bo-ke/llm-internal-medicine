@@ -1,5 +1,4 @@
 import importlib
-import math
 import sys
 import unittest
 from pathlib import Path
@@ -172,45 +171,20 @@ class MHCMetricsTest(unittest.TestCase):
         )
         self.assertAlmostEqual(float(stats["branch_residual_share"]), 0.0, places=6)
 
-    def test_softmax_extrema_are_one_over_n_for_uniform_logits(self):
-        stats = mhc_metrics.h_res_softmax_extrema(paddle.zeros([5, 16]), 4)
-        self.assertAlmostEqual(float(stats["h_res_softmax_min"]), 0.25, places=6)
-        self.assertAlmostEqual(float(stats["h_res_softmax_max"]), 0.25, places=6)
+    def test_logits_extrema_preserve_signed_raw_range(self):
+        logits = paddle.to_tensor([[-200.0, -18.0, 0.0, 7.5]], dtype="float32")
+        stats = mhc_metrics.h_res_logits_extrema(logits)
+        self.assertAlmostEqual(float(stats["h_res_logits_min"]), -200.0, places=6)
+        self.assertAlmostEqual(float(stats["h_res_logits_max"]), 7.5, places=6)
 
-    def test_softmax_min_matches_exp_minus_range_over_S(self):
-        # p_min = exp(-R) / S with S = 1/p_max, so -log(p_min) = R + log(S).
-        # Row 2 has the widest spread (0 - (-4) = 4) and holds the smallest weight.
-        logits = paddle.to_tensor(
-            [[-2.0, 0.0, -3.0, -2.0], [-3.0, 0.0, -2.0, -1.0], [-3.0, -2.0, -4.0, 0.0], [-2.0, -2.0, -3.0, 0.0]],
-            dtype="float32",
-        ).reshape([1, 16])
-        p = paddle.nn.functional.softmax(logits.reshape([1, 4, 4]), axis=-1)
-        s = 1.0 / float(p[0, 2].max())
-        stats = mhc_metrics.h_res_softmax_extrema(logits, 4)
-        self.assertAlmostEqual(float(stats["h_res_softmax_min"]), math.exp(-4.0) / s, places=6)
-
-    def test_softmax_max_saturates_where_min_still_resolves(self):
-        # Row 0 is one winner against three losers at -R; spreads of 18 and 200
-        # both pin `max` at exactly 1.0, so it cannot separate them, while `min`
-        # and the logit range can.
-        near = paddle.zeros([1, 16])
-        far = paddle.zeros([1, 16])
-        near[0, 1:4] = -18.0
-        far[0, 1:4] = -200.0
-        s_near = mhc_metrics.h_res_softmax_extrema(near, 4)
-        s_far = mhc_metrics.h_res_softmax_extrema(far, 4)
-        self.assertEqual(float(s_near["h_res_softmax_max"]), 1.0)
-        self.assertEqual(float(s_far["h_res_softmax_max"]), 1.0)
-        self.assertGreater(float(s_near["h_res_softmax_min"]), float(s_far["h_res_softmax_min"]))
-
-    def test_softmax_min_underflows_to_zero_past_the_alarm(self):
-        # A spread past ~103 drives softmax's smallest entry below fp32's smallest
-        # denormal, so the series bottoms out at exactly 0. That is past the alarm
-        # (1.18e-38, i.e. a spread of ~87) and the model cannot tell 0 from 1e-44
-        # either — `_sinkhorn_normalize` adds the same 1e-6 to both.
-        far = paddle.zeros([1, 16])
-        far[0, 1:4] = -200.0
-        self.assertEqual(float(mhc_metrics.h_res_softmax_extrema(far, 4)["h_res_softmax_min"]), 0.0)
+    def test_logits_extrema_are_detached_fp32_scalars(self):
+        logits = paddle.to_tensor([[-3.0, 2.0]], dtype="float16")
+        logits.stop_gradient = False
+        stats = mhc_metrics.h_res_logits_extrema(logits)
+        for value in stats.values():
+            self.assertEqual(value.shape, [])
+            self.assertEqual(value.dtype, paddle.float32)
+            self.assertTrue(value.stop_gradient)
 
 
 class MHCMonitorTest(unittest.TestCase):
@@ -303,13 +277,82 @@ class MHCMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["mhc_health/global_attn_composite_amax_gain_fwd_max"], 1.5, places=5)
         self.assertAlmostEqual(latest["mhc_health/global_attn_composite_amax_gain_bwd_max"], 1.0, places=5)
 
-    def test_softmax_extrema_are_recorded_and_reduce_by_extremum_across_layers(self):
-        # layer_0 healthy (uniform logits), layer_1 saturated. The global series
-        # must reduce by MIN / MAX so the sick layer is not averaged away.
+    def test_logits_gradient_extrema_are_unscaled_without_changing_backward(self):
+        n, s, b = 2, 1, 1
+        source = paddle.zeros([s, b, n * n], dtype="float32")
+        source.stop_gradient = False
+        logits = source * 1.0
+        hc = FakeHC(
+            n=n,
+            h_pre=paddle.full([s, b, n], 0.5),
+            h_post=paddle.ones([s, b, n]),
+            h_res=paddle.eye(n).reshape([s, b, n, n]),
+            h_res_logits=logits,
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=self._identity_layer(n, s, b).mlp_hyper_connection)])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        self._prepare_and_attach(monitor, model)
+
+        _, _, captured = hc._compute_h(None, None)
+        weight = paddle.to_tensor([[[2.0, -7.0, 4.0, 1.5]]], dtype="float32")
+        loss_scale = 16.0
+        (captured * weight * loss_scale).sum().backward()
+
+        # The hook observes but never modifies the autograd gradient.
+        self.assertTrue(paddle.allclose(source.grad, weight * loss_scale))
+        monitor.finalize_scaled_grad_metrics(SimpleNamespace(_scale=paddle.to_tensor(loss_scale)))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for key in (
+            "mhc_health/layer_0/attn_h_res_logits_grad_min",
+            "mhc_health/global_attn_h_res_logits_grad_min",
+        ):
+            self.assertAlmostEqual(latest[key], -7.0, places=5)
+        for key in (
+            "mhc_health/layer_0/attn_h_res_logits_grad_max",
+            "mhc_health/global_attn_h_res_logits_grad_max",
+        ):
+            self.assertAlmostEqual(latest[key], 4.0, places=5)
+
+    def test_logits_gradient_hook_skips_no_grad_recompute_forward(self):
+        n, s, b = 2, 1, 1
+        source = paddle.zeros([s, b, n * n], dtype="float32")
+        source.stop_gradient = False
+        hc = FakeHC(
+            n=n,
+            h_pre=paddle.full([s, b, n], 0.5),
+            h_post=paddle.ones([s, b, n]),
+            h_res=paddle.eye(n).reshape([s, b, n, n]),
+            h_res_logits=source * 1.0,
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=self._identity_layer(n, s, b).mlp_hyper_connection)])
+        monitor = PaddleMHCHealthMonitor()
+        self._prepare_and_attach(monitor, model)
+
+        with paddle.no_grad():
+            hc._compute_h(None, None)
+        min_key = "mhc_health/layer_0/attn_h_res_logits_grad_min"
+        max_key = "mhc_health/layer_0/attn_h_res_logits_grad_max"
+        self.assertEqual(monitor._gpu_cnt[min_key], 0)
+        self.assertEqual(monitor._gpu_cnt[max_key], 0)
+
+        _, _, replay_logits = hc._compute_h(None, None)
+        replay_logits.sum().backward()
+        self.assertEqual(monitor._gpu_cnt[min_key], 1)
+        self.assertEqual(monitor._gpu_cnt[max_key], 1)
+        monitor.step()
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertAlmostEqual(latest[min_key], 1.0, places=5)
+        self.assertAlmostEqual(latest[max_key], 1.0, places=5)
+
+    def test_logits_extrema_are_recorded_and_reduce_by_extremum_across_layers(self):
+        # layer_0 has zero logits; layer_1 spans [-104, 7.5]. The global series
+        # must reduce by MIN / MAX so an extreme layer is not averaged away.
         n, s, b = 4, 2, 3
-        saturated = (
+        extreme = (
             paddle.to_tensor(
-                [[-25.7, 0.0, -100.0, -61.0], [-33.4, 0.0, -89.0, -48.0]]
+                [[-25.7, 7.5, -100.0, -61.0], [-33.4, 0.0, -89.0, -48.0]]
                 + [[-34.0, -24.9, -104.0, 0.0], [-79.4, -72.6, -104.0, 0.0]],
                 dtype="float32",
             )
@@ -323,7 +366,7 @@ class MHCMonitorTest(unittest.TestCase):
                 h_pre=paddle.full([s, b, n], 0.5),
                 h_post=paddle.ones([s, b, n]),
                 h_res=paddle.eye(n).reshape([1, 1, n, n]).expand([s, b, n, n]),
-                h_res_logits=paddle.assign(saturated),
+                h_res_logits=paddle.assign(extreme),
             )
 
         model = _mhc_model([self._identity_layer(n, s, b), FakeLayer(attn=sick_hc(), mlp=sick_hc())])
@@ -335,14 +378,12 @@ class MHCMonitorTest(unittest.TestCase):
 
         latest = training_logs.get_latest(prefix="mhc_health")
         for comp in ("attn", "mlp"):
-            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_softmax_min"], 0.25, places=5)
-            self.assertLess(latest[f"mhc_health/layer_1/{comp}_h_res_softmax_min"], 1e-30)
-            self.assertLess(latest[f"mhc_health/global_{comp}_h_res_softmax_min"], 1e-30)
-            # max: uniform layer also reads 1/n, saturated layer pins at 1.0, and
-            # the global series reduces by MAX.
-            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_softmax_max"], 0.25, places=5)
-            self.assertAlmostEqual(latest[f"mhc_health/layer_1/{comp}_h_res_softmax_max"], 1.0, places=5)
-            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_h_res_softmax_max"], 1.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_logits_min"], 0.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_1/{comp}_h_res_logits_min"], -104.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_h_res_logits_min"], -104.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_logits_max"], 0.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_1/{comp}_h_res_logits_max"], 7.5, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_h_res_logits_max"], 7.5, places=5)
 
     def test_composite_is_built_in_layer_order_not_call_order(self):
         # Regression test for what retired the previous composite metric: it was
@@ -370,20 +411,29 @@ class MHCMonitorTest(unittest.TestCase):
         def col_gain(m):
             return float(m.sum(axis=-2).abs().max())
 
-        def chain(seq, gain):
-            # apply_h_res mixes with h_res^T, so the composite operator is built
-            # from the transposes.
-            out, acc = [], None
-            for m in seq:
-                op = m.transpose([1, 0])
-                acc = op if acc is None else paddle.matmul(op, acc)
-                out.append(gain(acc))
-            return out
+        components = ("attn", "mlp")
+        branches = [
+            (layer_idx, component, mat.transpose([1, 0]))
+            for layer_idx, mat in enumerate(mats)
+            for component in components
+        ]
 
-        expected = chain(mats, row_gain)
-        expected_bwd = chain(mats, col_gain)
-        # Guard against a vacuous test: the reversed product must actually differ.
-        self.assertNotAlmostEqual(expected[-1], chain(list(reversed(mats)), row_gain)[-1], places=4)
+        expected_fwd = {}
+        prefix = None
+        for layer_idx, component, op in branches:
+            prefix = op if prefix is None else paddle.matmul(op, prefix)
+            expected_fwd[(layer_idx, component)] = row_gain(prefix)
+
+        expected_bwd = {}
+        suffix = None
+        for layer_idx, component, op in reversed(branches):
+            suffix = op if suffix is None else paddle.matmul(suffix, op)
+            expected_bwd[(layer_idx, component)] = col_gain(suffix)
+        # Guard against a vacuous test: reversing the physical branch order differs.
+        wrong_prefix = None
+        for _, _, op in reversed(branches):
+            wrong_prefix = op if wrong_prefix is None else paddle.matmul(op, wrong_prefix)
+        self.assertNotAlmostEqual(expected_fwd[(2, "mlp")], row_gain(wrong_prefix), places=4)
 
         def layer_for(mat):
             def make_hc():
@@ -403,20 +453,28 @@ class MHCMonitorTest(unittest.TestCase):
         monitor.step()
 
         latest = training_logs.get_latest(prefix="mhc_health")
-        for comp in ("attn", "mlp"):
-            for idx, (want_fwd, want_bwd) in enumerate(zip(expected, expected_bwd)):
+        for comp in components:
+            for idx in range(len(mats)):
+                key = (idx, comp)
                 self.assertAlmostEqual(
-                    latest[f"mhc_health/layer_{idx}/{comp}_composite_amax_gain_fwd_max"], want_fwd, places=4
+                    latest[f"mhc_health/layer_{idx}/{comp}_composite_amax_gain_fwd_max"],
+                    expected_fwd[key],
+                    places=4,
                 )
                 self.assertAlmostEqual(
-                    latest[f"mhc_health/layer_{idx}/{comp}_composite_amax_gain_bwd_max"], want_bwd, places=4
+                    latest[f"mhc_health/layer_{idx}/{comp}_composite_amax_gain_bwd_max"],
+                    expected_bwd[key],
+                    places=4,
                 )
-            # Global reduces by max over layers.
             self.assertAlmostEqual(
-                latest[f"mhc_health/global_{comp}_composite_amax_gain_fwd_max"], max(expected), places=4
+                latest[f"mhc_health/global_{comp}_composite_amax_gain_fwd_max"],
+                max(value for (idx, component), value in expected_fwd.items() if component == comp),
+                places=4,
             )
             self.assertAlmostEqual(
-                latest[f"mhc_health/global_{comp}_composite_amax_gain_bwd_max"], max(expected_bwd), places=4
+                latest[f"mhc_health/global_{comp}_composite_amax_gain_bwd_max"],
+                max(value for (idx, component), value in expected_bwd.items() if component == comp),
+                places=4,
             )
 
     def test_composite_is_one_for_identity_chain(self):
@@ -463,6 +521,39 @@ class MHCMonitorTest(unittest.TestCase):
         monitor.step()
         # Stale matrices must not survive into the next step's product.
         self.assertFalse(monitor._h_res_snapshot)
+
+    def test_composite_aggregates_each_microbatch_before_snapshot_overwrite(self):
+        n, s, b = 2, 1, 1
+        model = _mhc_model([self._identity_layer(n, s, b)])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+
+        amplified = paddle.diag(paddle.to_tensor([3.0, 1.0])).reshape([1, 1, n, n])
+        for _, _, mod in targets:
+            mod._h_res = amplified
+        self._drive(targets, x_dim=n * 8)
+        monitor.finalize_composite_microbatch()
+        self.assertFalse(monitor._h_res_snapshot)
+
+        identity = paddle.eye(n).reshape([1, 1, n, n])
+        for _, _, mod in targets:
+            mod._h_res = identity
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertAlmostEqual(
+            latest["mhc_health/layer_0/attn_composite_amax_gain_fwd_max"], 3.0, places=5
+        )
+        self.assertAlmostEqual(
+            latest["mhc_health/layer_0/mlp_composite_amax_gain_fwd_max"], 9.0, places=5
+        )
+        self.assertAlmostEqual(
+            latest["mhc_health/layer_0/attn_composite_amax_gain_bwd_max"], 9.0, places=5
+        )
+        self.assertAlmostEqual(
+            latest["mhc_health/layer_0/mlp_composite_amax_gain_bwd_max"], 3.0, places=5
+        )
 
     def test_branch_residual_share_is_recorded_from_bda(self):
         n, s, b, c = 4, 2, 3, 6

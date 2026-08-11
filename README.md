@@ -358,10 +358,11 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 
 监控 mHC (Manifold-Constrained Hyper-Connections) 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`，
 以及 `x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)` 两项的相对大小。
-只在模型开启 mHC 层时生效——mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
-彻底 no-op（不 wrap、不产生指标）。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 14 个指标，
-指标名以 `attn_` / `mlp_` 前缀区分；除 `branch_residual_share_max`、`h_res_softmax_max`、
-`composite_amax_gain_{fwd,bwd}_max` 取极大值与 `h_res_softmax_min` 取极小值外，其余按 token/batch 求均值。
+只在模型开启 mHC 层时生效，mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
+彻底 no-op。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 16 个指标，
+指标名以 `attn_` / `mlp_` 前缀区分；`branch_residual_share_max`、`h_res_logits_max`、
+`h_res_logits_grad_max`、`composite_amax_gain_{fwd,bwd}_max` 取极大值，`h_res_logits_min` 与
+`h_res_logits_grad_min` 取极小值，其余按 token/batch 求均值。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
@@ -370,57 +371,22 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 | 3 | `{c}_h_post_mean` | `mhc_health/layer_{i}/{c}_h_post_mean` | `mean(h_post)` | 每层+全局 | 扩展门均值 |
 | 4 | `{c}_h_post_std` | `mhc_health/layer_{i}/{c}_h_post_std` | `std(h_post)` | 每层+全局 | 扩展门离散度（token 与 stream 混合） |
 | 5 | `{c}_h_post_stream_concentration` | `mhc_health/layer_{i}/{c}_h_post_stream_concentration` | `mean_t(max_i h_post / mean_i h_post)` | 每层+全局 | stream 集中度，值域 `[1, n]`：1 = 均匀，n = 全压在一条流上 |
-| 6 | `{c}_h_post_token_std` | `mhc_health/layer_{i}/{c}_h_post_token_std` | `std_t(mean_i h_post)` | 每层+全局 | 门控对输入的区分度，→0 = 退化成常数 |
+| 6 | `{c}_h_post_token_std` | `mhc_health/layer_{i}/{c}_h_post_token_std` | `std_t(mean_i h_post)` | 每层+全局 | token 间总门量离散度；→0 不等于每条 stream 的门都为常数 |
 | 7 | `{c}_branch_residual_share` | `mhc_health/layer_{i}/{c}_branch_residual_share` | `mean_t(b / (b + r))`，`b = ‖H_postᵀ F(·)‖_F`、`r = ‖H_resᵀ x_l‖_F` | 每层+全局 | **本层是否还在写入残差流**，值域 `[0, 1]`：0.5 = 两项等量 |
 | 8 | `{c}_branch_residual_share_max` | `mhc_health/layer_{i}/{c}_branch_residual_share_max` | 同上取最坏 token | 每层+全局 | 单 token 被分支主导的程度（贴 1 = 存在近零残差 token） |
 | 9 | `{c}_amax_gain_fwd` | `mhc_health/layer_{i}/{c}_amax_gain_fwd` | `mean_t(max_i \|Σ_j h_res_ji\|)`（`h_res` 的列和 = `h_resᵀ` 的行和） | 每层+全局 | 单层前向最坏放大。列和被 Sinkhorn 最后一步钉死为 1，故这条是不变量守卫（见下） |
 | 10 | `{c}_amax_gain_bwd` | `mhc_health/layer_{i}/{c}_amax_gain_bwd` | `mean_t(max_j \|Σ_i h_res_ji\|)`（`h_res` 的行和） | 每层+全局 | 单层反向最坏放大。承载 Sinkhorn 截断迭代的收敛残差 |
-| 11 | `{c}_h_res_softmax_min` | `mhc_health/layer_{i}/{c}_h_res_softmax_min` | `min_t min_{i,j} softmax(z)`，`z` = Sinkhorn 之前的 `h_res` logits | 每层+全局 | **饱和哨兵**，值域 `(0, 1/n]`：`1/n` = 行内均匀，趋 0 = 该行退化成 one-hot。阈值 `1.18e-38`（fp32 最小正规数），越线即模型自己的 `softmax` 已下溢。按 **min** 归约 |
-| 12 | `{c}_h_res_softmax_max` | `mhc_health/layer_{i}/{c}_h_res_softmax_max` | `max_t max_{i,j} softmax(z)` | 每层+全局 | 单个最大混合权重，值域 `[1/n, 1]`。行内跨度约 18 之后在 fp32 里精确等于 1.0 且不再变化，故只能当"是否已饱和"的开关，不反映饱和深度。按 **max** 归约 |
-| 13 | `{c}_composite_amax_gain_fwd_max` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd_max` | `max_i \|Σ_j A_{k,i,j}\|`，`A_k = h_res_kᵀ @ A_{k-1}` 按层序累乘（`h_res_kᵀ` 才是 `apply_h_res` 实际作用的算子） | 每层+全局 | 从首层到本层累计的前向最坏放大。按 **max** 归约 |
-| 14 | `{c}_composite_amax_gain_bwd_max` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd_max` | `max_j \|Σ_i A_{k,i,j}\|` | 每层+全局 | 同上取列和。按 **max** 归约 |
+| 11 | `{c}_h_res_logits_min` | `mhc_health/layer_{i}/{c}_h_res_logits_min` | `min z`，`z` = Sinkhorn 输入 logits | 每层+全局 | 迭代前 residual-mixing logits 的最小值。按 step 内 layer/microbatch **min** 归约 |
+| 12 | `{c}_h_res_logits_max` | `mhc_health/layer_{i}/{c}_h_res_logits_max` | `max z` | 每层+全局 | 同上取最大值。与 min 联合观察 raw logits 的 signed 范围。按 **max** 归约 |
+| 13 | `{c}_h_res_logits_grad_min` | `mhc_health/layer_{i}/{c}_h_res_logits_grad_min` | `min dL/dz`，`z` = Sinkhorn 输入 logits | 每层+全局 | 迭代前 logits 的未缩放 activation gradient 最小值。按 step 内 layer/microbatch **min** 归约 |
+| 14 | `{c}_h_res_logits_grad_max` | `mhc_health/layer_{i}/{c}_h_res_logits_grad_max` | `max dL/dz` | 每层+全局 | 同上取最大值。AMP loss scale 被反除，不除 gradient accumulation。按 **max** 归约 |
+| 15 | `{c}_composite_amax_gain_fwd_max` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd_max` | 入口到当前 branch 的 attention/MLP 交错 prefix 最大绝对行和 | 每层+全局 | 按 **max** 跨 microbatch/层归约 |
+| 16 | `{c}_composite_amax_gain_bwd_max` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd_max` | 当前 branch 到模型尾部的 attention/MLP 交错 suffix 最大绝对列和 | 每层+全局 | 按 **max** 跨 microbatch/层归约 |
 
 `{c}` ∈ `{attn, mlp}`。
 
-**哪个轴带信息**：`apply_h_res` 与 fused cuTile kernel 都按 `out_i = Σ_j h_res_ji · x_j` 混流，即真正作用在流
-向量上的算子是 `h_resᵀ`，所以前向增益是 `h_res` 的列和、反向增益是行和（单层与复合同口径）。我们的
-`_sinkhorn_normalize` 最后一步是**列**归一，所以 `_fwd` 被钉死为 1 充当不变量守卫，`_bwd` 才承载截断迭代的残差；
-论文 Eq. (9) 最后一步是行归一，它 Fig 7 里会动的是 forward 那条，**两边曲线不可直接对比**。
-
-指标 1~6 与 9~10 来自包裹 `compute_mappings`（`h_pre` 不在 `forward` 返回值里，只能从这里拿到真实映射）；
-指标 11~12 需要 Sinkhorn **之前**的 `h_res` logits，故额外包裹 `_compute_h`（顺带绕开 `use_fused_mhc` 分叉）；
-指标 13~14 在 **flush 时**按 `layer_idx` 排序累乘（hook 内只存 token 平均并**转置**后的 `n×n` 快照，
-转置是因为 `apply_h_res` 实际作用的算子是 `h_resᵀ`），因此与 hook 触发顺序无关——而该顺序在 recompute 下是
-反向重放的逆序，正是它当初被下线的原因。MTP 层不在主干链上，累乘时跳过。作用域是本 rank 持有的层，
-当前配置（`sharding: stage1`，无 PP）下即全部 43 层；开 PP 后会退化为 stage 内语义，详见 docs。
-指标 7~8 需要 sublayer 输出，只有两项合并处才同时可见，故额外包裹 `fused_h_res_h_post_bda`，且指标从**入参**
-推导，因此 fused 快路径与带 dropout 的顺序路径口径一致。两个范数都是精确值但不 materialize 任何
-`[tokens, n, C]` 中间张量：branch 项是外积，`‖h_post_t ⊗ x_t‖_F = ‖h_post_t‖₂·‖x_t‖₂`；residual 项用
-`‖mixed_t‖²_F = Σ_{j,k} S[t,j,k]·G[t,j,k]`（`S` 为 `h_res` 的自相关、`G` 为 n 条流的 Gram），两者都是
-`[tokens, n, n]`。branch 项在 dropout **之前**测量（本仓库预训练配置 `hidden_dropout_prob = 0`）。
-
-### 健康判读
-
-- `h_post_mean` 趋 0 → 该层 sublayer 输出被门控压掉。注意 `h_post = 2σ(·)` 恒为正，**不存在正负相消**，
-  所以均值小就等于幅度小；但需配合 7 才能确认「贡献」是否真的消失（`F(·)` 的幅度可能同步增大补偿）。
-- `branch_residual_share` 无绝对阈值，看**深度剖面**与趋势。值域 `[0, 1]`：0.5 = 分支与残差等量，趋 0 = 该层退化为
-  纯残差搬运。判读看 `_max` 与均值的差距、以及`_max` 是否长期贴 1。
-- 二者组合定位失效模式：
-  - `h_post_mean`→0、`stream_concentration`≈1、`share` 同步塌 → **整体关闭**。此时 sigmoid 已进饱和区
-    （`h_post = 0.004` 对应 logit ≈ −6.2，`σ′ ≈ 0.002`），靠自身难以恢复，应查门控参数的 lr / weight decay
-    与 `mhc_init_gating_factor`。
-  - `stream_concentration`≈n → **退化为单流**，该层放弃了多流结构，`num_residual_streams` 的开销在这些层上没有
-    收益；可考虑逐层配置 n。注意这未必是病：HC 允许不同层使用不同的流组合，需结合「是否总是同一条流」判断。
-- `h_post_token_std`→0 → 门控丢失对 token 的区分度，从动态门退化成常数标量。
-- `amax_gain_bwd` 偏离 1.0 → Sinkhorn 未收敛或初始化异常。它承载截断迭代的残差，量级很小，
-  **只当哨兵用，不要拿它做诊断**。`amax_gain_fwd` 读 `h_res` 的列和，而列和被 Sinkhorn 最后一步钉死为 1，
-  所以它是不变量守卫：一旦它偏离 1，说明归一化本身出了问题（数值异常或实现改动），比 `_bwd` 更严重。
-- `composite_amax_gain_{fwd,bwd}_max` → 从首层累计到本层的最坏放大，逐层输出构成剖面曲线（论文 Fig 7b 的拱形
-  只有复合能显示，单层看不出）。与单层同口径：`_fwd` 被钉死，会动的是 `_bwd`。
-- `h_res_softmax_min` 下降 → 该层 `h_res` 的 logits 正在饱和，**梯度冻结**。饱和行的 softmax Jacobian
-  `diag(p) − ppᵀ ≈ 0`，`mapping_proj.weight` / `alpha_res` 收不到梯度，该层 `h_res` 冻在当前形态且不可自愈。
-  阈值 `1.18e-38`（fp32 最小正规数），越线即模型自己的 `softmax` 已下溢、行内比例不可逆丢失。健康值 `1/n`。
-  这条曲线是唯一的观测窗口——成品 `h_res` 的行和列和被 Sinkhorn 归一化钉在 1，其余指标全读健康。
+指标公式、采集路径、健康判读及论文 composite 定义统一维护在
+[`docs/mhc_health.md`](docs/mhc_health.md)，README 不再重复展开。
 
 ---
 

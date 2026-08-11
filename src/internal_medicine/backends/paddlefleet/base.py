@@ -35,9 +35,6 @@ class PaddleProbe(Probe):
         # global_key → (聚合方式, [对应的 layer keys])，flush 时从 layer 推导 global
         self._layer_metric_groups: dict[str, tuple[str, list[str]]] = {}
         self._layer_metric_keys: set[str] = set()  # 所有 per-layer key，用于 flush 时判断是否输出
-        # GLOBAL_ONLY_METRICS 对应的 per-layer key：仍然累加（global 要从它们推导），
-        # 但不写进日志。给"守门型"指标用——恒定值不值得占 N 层 × M 组件条曲线。
-        self._global_only_layer_keys: set[str] = set()
         self._disabled_keys: set[str] = set()  # log_global=False 时被禁用的 global keys
         self._mtp_layer_ids: set[int] = set()
         self._buffers_allocated = False
@@ -191,8 +188,6 @@ class PaddleProbe(Probe):
             if layer_key not in all_declared:
                 self.declare_mean(layer_key)
         self._layer_metric_keys.add(layer_key)
-        if metric_name in self.GLOBAL_ONLY:
-            self._global_only_layer_keys.add(layer_key)
         if not self.log_global:
             return
         # 注册 global 分组: flush 时从这些 layer keys 聚合出 global 值
@@ -221,7 +216,7 @@ class PaddleProbe(Probe):
         """per-layer key 是否写进日志（global 派生不受此影响）。"""
         if key not in self._layer_metric_keys:
             return True  # 显式 declare 的非逐层 key
-        return self.log_per_layer and key not in self._global_only_layer_keys
+        return self.log_per_layer
 
     def _flush_gpu_buffer(self) -> dict[str, float]:
         """单次批量 D2H：收集所有累加器 → 推导 global → stack→cpu→tolist → 重置。"""

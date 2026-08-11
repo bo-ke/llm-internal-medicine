@@ -31,72 +31,22 @@ def amax_gain(mat: paddle.Tensor, axis: int) -> paddle.Tensor:
     return sums.abs().max(axis=-1).mean()  # 0-dim
 
 
-def h_res_softmax_extrema(h_res_logits: paddle.Tensor, n: int) -> dict[str, paddle.Tensor]:
-    """Extreme mixing weights of the row-wise softmax, before Sinkhorn.
-
-    Saturation sentinel. ``min`` is the informative half: bounded by ``(0, 1/n]``
-    with ``1/n`` = uniform row, falling as the row peaks, and it crosses fp32's
-    smallest normal (``1.18e-38``) exactly when the model's own ``softmax``
-    underflows and the within-row proportions are lost. ``max`` is capped at 1 by
-    the row sum and pins at exactly 1.0 in fp32 from a within-row logit spread of
-    ~18 onwards, so it only answers "saturated yes/no", not how far.
-
-    What it diagnoses is **gradient freezing**, not NaN: a saturated row's softmax
-    Jacobian ``diag(p) - p pᵀ`` is ~0, so ``mapping_proj`` / ``alpha_res`` stop
-    receiving gradient and that layer's ``h_res`` freezes, while the finished
-    ``h_res`` still reports row/column sums of ~1 and every other metric
-    here reads healthy. (NaN was ruled out separately: both the native and cuTile
-    Sinkhorn paths stay finite in fp32 even on ``-inf`` logits, because the
-    ``eps`` in the normalization denominators caps amplification at ``1/eps``.)
-
-    The softmax deliberately omits the model's ``+ eps`` (``_sinkhorn_normalize``
-    in ``hyper_connection.py``), which would floor every entry at 1e-6 and clamp
-    ``min`` there. The trade is that ``min`` reads exactly 0 past a spread of
-    ~103 — past the alarm, and the model cannot tell 0 from 1e-44 either.
-
-    Args:
-        h_res_logits: ``[..., n*n]`` raw mixing logits, i.e. ``_compute_h``'s
-            third return value — before the reshape and Sinkhorn projection.
-        n: ``num_residual_streams``.
-
-    Returns:
-        ``h_res_softmax_min`` / ``h_res_softmax_max`` over every row of every
-        token, as 0-dim tensors; one softmax serves both. No host sync.
-    """
-    logits = h_res_logits.detach().astype("float32").reshape([-1, n, n])
-    weights = paddle.nn.functional.softmax(logits, axis=-1)
+def h_res_logits_extrema(h_res_logits: paddle.Tensor) -> dict[str, paddle.Tensor]:
+    """Min/max of the raw residual-mixing logits before Sinkhorn."""
+    logits = h_res_logits.detach().astype("float32")
     return {
-        "h_res_softmax_min": weights.min(),
-        "h_res_softmax_max": weights.max(),
+        "h_res_logits_min": logits.min(),
+        "h_res_logits_max": logits.max(),
     }
 
 
 def gate_stats(h: paddle.Tensor) -> tuple[paddle.Tensor, paddle.Tensor]:
-    """Mean and (unbiased) std of a gate tensor ``h`` over all elements.
-
-    Returns two 0-dim tensors ``(mean, std)``; no host sync.
-    """
+    """Mean and (unbiased) std of a gate tensor ``h`` over all elements."""
     return h.mean(), h.std()
 
 
 def h_post_structure_stats(h_post: paddle.Tensor) -> dict[str, paddle.Tensor]:
-    """Structure of the expansion gate across streams and across tokens.
-
-    ``h_post_mean`` / ``h_post_std`` pool the token and stream axes together, so
-    a shrinking mean cannot tell "all n streams went quiet" from "n-1 died and
-    one carries everything". These two split the axes:
-
-    ``h_post_stream_concentration`` — ``mean_t(max_i h_post / mean_i h_post)``,
-    taken per token *before* averaging so it stays bounded by ``[1, n]``
-    regardless of token-level scale: 1 = streams equally weighted, ``n`` = all
-    mass on one stream (the ``num_residual_streams`` budget is unused).
-
-    ``h_post_token_std`` — std over tokens of the per-token stream mean. The gate
-    is a function of the input (``h = r · proj · α + bias``), so →0 means it
-    stopped discriminating tokens and is effectively a constant scalar.
-
-    Returns 0-dim GPU tensors; no host sync.
-    """
+    """Structure of the expansion gate across streams and across tokens."""
     flat = h_post.detach().astype("float32")
     flat = flat.reshape([-1, flat.shape[-1]])  # [tokens, n]
 
@@ -118,30 +68,7 @@ def branch_residual_share(
     layer_output: paddle.Tensor,
     bias: paddle.Tensor | None = None,
 ) -> dict[str, paddle.Tensor]:
-    """How much of the mHC update this layer wrote itself, per token.
-
-    mHC propagates ``x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)``: the first term
-    only re-mixes what earlier layers wrote, the second is this layer's own
-    contribution. The share
-
-        ``branch_residual_share = b / (b + r)``,
-        ``b = ‖H_postᵀ F(·)‖_F``, ``r = ‖H_resᵀ x_l‖_F``
-
-    reads "is this layer still writing anything" — which ``h_post_mean`` cannot,
-    since a shrinking gate may be offset by a growing ``F(·)``.
-
-    The bounded form is deliberate: ``r`` really does hit 0 (an all-zero token in
-    ``layer_0`` or an MTP layer's shifted slot), and the raw ratio ``b / r`` then
-    pinned at the epsilon floor ``b / 1e-6 ≈ 1e6`` and hijacked the token mean
-    and the derived ``global_*`` series. Here such a token reads 1.0 and every
-    token contributes at most 1.0.
-
-    Both norms are exact but materialise no ``[tokens, n, C]`` intermediate: the
-    branch term is an outer product (``‖h_post_t ⊗ xb_t‖_F = ‖h_post_t‖₂·‖xb_t‖₂``)
-    and the residual term contracts two ``[tokens, n, n]`` matrices —
-    ``‖mixed_t‖²_F = Σ_{j,k} S[t,j,k]·G[t,j,k]`` with ``S`` the ``h_res``
-    autocorrelation and ``G`` the Gram matrix of the n streams. Cost is
-    ``C/n²`` times cheaper than the layer's own projections.
+    """How much of the mHC update this layer wrote itself, per token?
 
     Args:
         h_res: ``[..., n, n]`` Sinkhorn doubly-stochastic mixing matrix.

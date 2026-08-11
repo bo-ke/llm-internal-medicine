@@ -1,12 +1,6 @@
 """mHC Health Monitor for PaddleFleet.
 
-Paddle port of ``backends/megatron/mhc_monitor.py``. Monitors the three per-token
-mappings of every ``HyperConnectionModule`` in an mHC (Manifold-Constrained
-Hyper-Connections) model, plus the relative magnitude of the two update terms of
-``x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)`` (i.e. how much this layer still
-writes into the residual streams).
-
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 14
+Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 16
 series, name-prefixed by component:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
@@ -14,7 +8,8 @@ series, name-prefixed by component:
     {attn,mlp}_h_post_stream_concentration  {attn,mlp}_h_post_token_std
     {attn,mlp}_branch_residual_share  {attn,mlp}_branch_residual_share_max
     {attn,mlp}_amax_gain_fwd  {attn,mlp}_amax_gain_bwd
-    {attn,mlp}_h_res_softmax_min  {attn,mlp}_h_res_softmax_max
+    {attn,mlp}_h_res_logits_min  {attn,mlp}_h_res_logits_max
+    {attn,mlp}_h_res_logits_grad_min  {attn,mlp}_h_res_logits_grad_max
     {attn,mlp}_composite_amax_gain_fwd_max  {attn,mlp}_composite_amax_gain_bwd_max
 
 Forward hooks are not enough, so three bound methods are wrapped instead (see
@@ -25,39 +20,6 @@ Forward hooks are not enough, so three bound methods are wrapped instead (see
   projection, and wrapping here also sidesteps the ``use_fused_mhc`` fork.
 - ``fused_h_res_h_post_bda`` — the only point where both update terms are
   visible.
-
-Everything is detached and computed under ``no_grad`` (see the VRAM-safety notes
-on the hook).
-
-Which axis carries signal: both the single-layer and the composite gains are
-computed on the operator that really acts on the stream vector, ``h_res^T``
-(``apply_h_res`` and the fused cuTile kernel both contract over ``h_res``'s first
-index). ``_fwd`` is therefore a column sum of ``h_res`` and ``_bwd`` a row sum.
-Our ``_sinkhorn_normalize`` ends on a **column** normalization, so ``_fwd`` is
-pinned to 1 by construction and ``_bwd`` carries the truncated-iteration
-residual. The paper's Eq. (9) ends on a row normalization, so its Fig. 7 plots
-the mirror image — the curve that moves there is its forward gain, ours is
-``_bwd``. Both directions are emitted anyway so the pinned side acts as a guard.
-
-``composite_amax_gain_*`` and ``amax_gain_bwd`` were all retired once and are
-back. The composite objections were the cost of keeping a per-token ``h_res``
-resident for the whole step and order-dependence under recompute: averaging over
-tokens first shrinks the snapshot to one ``n x n`` matrix per layer, and keying
-snapshots by ``layer_idx`` instead of accumulating in call order removes the
-order-dependence (see ``_record_composite`` for the remaining scope caveat).
-``amax_gain_bwd`` was dropped for reading equal to ``amax_gain_fwd``, which is
-expected given the pinned axis above; it is kept now as the explicit invariant
-guard.
-
-Residual-stream amplification itself is still unmonitored; the candidates are the
-Sinkhorn convergence residual (row sums vs 1) and the spectrum of ``h_res``.
-
-The monitor is a hard no-op unless the model actually uses the mHC layer: if the
-mHC classes cannot be imported, or no ``HyperConnectionTransformerLayer`` is
-found, ``setup_mhc_monitor`` attaches nothing and registers no metrics.
-
-Hot-path discipline (no D2H sync, no hook-time collectives, schema fixed at
-registration): see ``.claude/skills/monitor-hook-perf-rules``.
 """
 
 import logging
@@ -72,7 +34,7 @@ from .mhc_metrics import (
     branch_residual_share,
     gate_stats,
     h_post_structure_stats,
-    h_res_softmax_extrema,
+    h_res_logits_extrema,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,8 +62,10 @@ _METRIC_NAMES = (
     "branch_residual_share_max",
     "amax_gain_fwd",
     "amax_gain_bwd",
-    "h_res_softmax_min",
-    "h_res_softmax_max",
+    "h_res_logits_min",
+    "h_res_logits_max",
+    "h_res_logits_grad_min",
+    "h_res_logits_grad_max",
     "composite_amax_gain_fwd_max",
     "composite_amax_gain_bwd_max",
 )
@@ -112,23 +76,20 @@ _METRIC_NAMES = (
 _MAX_METRICS = frozenset(
     {
         "branch_residual_share_max",
-        "h_res_softmax_max",
+        "h_res_logits_max",
+        "h_res_logits_grad_max",
         "composite_amax_gain_fwd_max",
         "composite_amax_gain_bwd_max",
     }
 )
-_MIN_METRICS = frozenset({"h_res_softmax_min"})
-
-# Nothing is global-only: the single-layer amax gains used to be, on the grounds
-# that they are 1 by construction, but the per-layer profile is wanted alongside
-# the composite one.
-_GLOBAL_ONLY_METRICS: frozenset[str] = frozenset()
+_MIN_METRICS = frozenset({"h_res_logits_min", "h_res_logits_grad_min"})
 
 # (component_name, layer attribute) — attn runs before mlp in the layer forward.
 _COMPONENTS = (
     ("attn", "self_attention_hyper_connection"),
     ("mlp", "mlp_hyper_connection"),
 )
+_COMPONENT_ORDER = {component: order for order, (component, _) in enumerate(_COMPONENTS)}
 
 
 def _iter_chunks(model):
@@ -173,7 +134,6 @@ class PaddleMHCHealthMonitor(PaddleProbe):
     ):
         self.MAX_AGGREGATED = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _MAX_METRICS}
         self.MIN_AGGREGATED = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _MIN_METRICS}
-        self.GLOBAL_ONLY = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _GLOBAL_ONLY_METRICS}
         super().__init__(
             log_per_layer=log_per_layer,
             log_global=log_global,
@@ -188,6 +148,9 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         self._h_res_snapshot: dict[tuple[int, str], paddle.Tensor] = {}
         # MTP layers are off the main trunk and must not enter the product.
         self._mtp_layer_ids: set[int] = set()
+        # Gradient hooks see AMP-scaled activation gradients. The callback
+        # finalizes these accumulators with this step's scale before flush.
+        self._grad_metrics_finalized = False
 
     # ------------------------------------------------------------------
     # Discovery
@@ -261,10 +224,6 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                 orig = mod.compute_mappings
                 mod.compute_mappings = self._make_capture(orig, layer_idx, comp)
                 self._wrapped.append((mod, "compute_mappings", orig))
-                # Wrapping `_compute_h` also sidesteps the `use_fused_mhc` fork:
-                # the fused path swaps `_sinkhorn_op` for a cuTile kernel whose
-                # intermediates are unreachable, but `_compute_h` is plain paddle
-                # either way.
                 orig_h = getattr(mod, "_compute_h", None)
                 if orig_h is not None:
                     mod._compute_h = self._make_logits_capture(orig_h, layer_idx, comp)
@@ -312,62 +271,77 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         from the first layer up to layer ``k``. ``_fwd`` is its max-abs row sum
         (worst forward signal gain), ``_bwd`` its max-abs column sum.
 
-        Built from snapshots sorted by ``layer_idx``, so the result does not
-        depend on the order the hooks fired in — under recompute that order is
-        the reverse-layer backward replay, which is what retired the previous
-        composite metric. MTP layers are skipped: they are off the main trunk, so
-        multiplying them into the chain has no physical meaning.
-
         Scope is the layers this rank owns: the whole model under sharding (every
         rank holds all layers), but one stage under real pipeline parallelism,
         which we can neither detect nor correct while
         ``get_pipeline_model_parallel_{rank,world_size}`` are stubs in PaddleFleet
         (they return 0 / 1 unconditionally).
         """
-        for comp, _ in _COMPONENTS:
-            chain = sorted(
-                (
-                    (idx, mat)
-                    for (idx, c), mat in self._h_res_snapshot.items()
-                    if c == comp and idx not in self._mtp_layer_ids
-                ),
-                key=lambda item: item[0],
+        branches = sorted(
+            (
+                (idx, component, mat)
+                for (idx, component), mat in self._h_res_snapshot.items()
+                if idx not in self._mtp_layer_ids
+            ),
+            key=lambda item: (item[0], _COMPONENT_ORDER[item[1]]),
+        )
+
+        prefix = None
+        for layer_idx, component, mat in branches:
+            prefix = mat if prefix is None else paddle.matmul(mat, prefix)
+            self.record_layer_metric(
+                layer_idx,
+                f"{component}_composite_amax_gain_fwd_max",
+                amax_gain(prefix, axis=-1),
             )
-            composite = None
-            for layer_idx, mat in chain:
-                composite = mat if composite is None else paddle.matmul(mat, composite)
-                self.record_layer_metric(
-                    layer_idx, f"{comp}_composite_amax_gain_fwd_max", amax_gain(composite, axis=-1)
-                )
-                self.record_layer_metric(
-                    layer_idx, f"{comp}_composite_amax_gain_bwd_max", amax_gain(composite, axis=-2)
-                )
+
+        suffix = None
+        for layer_idx, component, mat in reversed(branches):
+            suffix = mat if suffix is None else paddle.matmul(suffix, mat)
+            self.record_layer_metric(
+                layer_idx,
+                f"{component}_composite_amax_gain_bwd_max",
+                amax_gain(suffix, axis=-2),
+            )
+
+    def finalize_composite_microbatch(self) -> None:
+        """Record and release one microbatch's detached composite snapshots."""
+        if not self._h_res_snapshot:
+            return
+        try:
+            with paddle.no_grad():
+                self._record_composite()
+        except Exception as e:
+            if self.verbose:
+                logger.error(f"[PaddleMHCMonitor] Error composite: {e}")
+        finally:
+            self._h_res_snapshot.clear()
+
+    def finalize_scaled_grad_metrics(self, scaler=None) -> None:
+        """Remove AMP loss scaling from this step's logits-gradient extrema."""
+        if self._grad_metrics_finalized:
+            return
+        scale = getattr(scaler, "_scale", None) if scaler is not None else None
+        if scale is not None:
+            scale = paddle.assign(scale).detach().astype("float32")
+            for key in self._max_keys | self._min_keys:
+                if "_h_res_logits_grad_" in key and self._gpu_cnt[key] > 0:
+                    self._gpu_acc[key].divide_(scale)
+        self._grad_metrics_finalized = True
 
     def _flush_buffers(self) -> None:
-        if self._h_res_snapshot:
-            try:
-                with paddle.no_grad():
-                    self._record_composite()
-            except Exception as e:
-                if self.verbose:
-                    logger.error(f"[PaddleMHCMonitor] Error composite: {e}")
-            self._h_res_snapshot.clear()
+        # Direct users and non-AMP trainers may not emit on_optimizer_begin.
+        self.finalize_scaled_grad_metrics()
+        self.finalize_composite_microbatch()
         super()._flush_buffers()
+        self._grad_metrics_finalized = False
 
     # ------------------------------------------------------------------
     # Capture wrapper (the hot path)
     # ------------------------------------------------------------------
 
     def _make_capture(self, orig, layer_idx: int, component: str):
-        """Wrap ``compute_mappings`` to record metrics from its real return value.
-
-        VRAM safety: the mappings arrive attached to the training autograd graph,
-        so they are detached and all metric math runs under ``no_grad`` — nothing
-        stored may pin the graph through backward. The wrapper also keeps no state
-        across calls, since a monitored module can be entered more than once per
-        step (recompute replay, and mHC's own fp32 / bf16 paths) and any
-        cross-call accumulator would depend on execution order.
-        """
+        """Wrap ``compute_mappings`` to record metrics from its real return value."""
 
         def wrapped(x):
             out = orig(x)  # the real mappings the model consumes — returned unchanged
@@ -389,24 +363,10 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                     for name, value in h_post_structure_stats(h_post).items():
                         self.record_layer_metric(layer_idx, f"{component}_{name}", value)
 
-                    # Gains of the *operator*, not of `h_res` as written: streams
-                    # mix as `out_i = Σ_j h_res[j, i] · x_j`, so stream i's
-                    # forward gain is a **column** sum of `h_res` and its
-                    # backward gain a row sum. Columns are pinned to 1 by
-                    # construction (the Sinkhorn iteration ends on a column
-                    # normalization), so `_fwd` is a flat invariant guard while
-                    # `_bwd` carries the convergence residual.
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_fwd", amax_gain(h_res, axis=-2))
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_bwd", amax_gain(h_res, axis=-1))
 
-                    # Token-mean snapshot of the *operator* for the composite
-                    # product. `apply_h_res` mixes streams as
-                    # `mixed = h_res^T @ residual`, so the matrix that actually
-                    # acts on the stream vector is the transpose — composing
-                    # `h_res` itself would give neither the forward nor the
-                    # backward chain. Paper Fig 7b averages over tokens too, so
-                    # this holds one n x n matrix per layer/component. Last write
-                    # wins if the module is entered more than once per step.
+                    # Token-mean snapshot of the *operator* for the composite product.
                     n = int(h_res.shape[-1])
                     self._h_res_snapshot[(layer_idx, component)] = (
                         h_res.astype("float32").reshape([-1, n, n]).mean(axis=0).transpose([1, 0])
@@ -419,25 +379,41 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         return wrapped
 
     def _make_logits_capture(self, orig, layer_idx: int, component: str):
-        """Wrap ``_compute_h`` to record the saturation sentinel.
-
-        ``_compute_h`` returns ``(h_pre, h_post, h_res_logits)``; ``h_res_logits``
-        is the raw ``[..., n*n]`` mixing logits, which ``compute_mappings``
-        consumes immediately (``h_res = self._sinkhorn_op(...)``), so a wrapper
-        one level up cannot see it. ``n`` is read from ``h_pre``'s last axis
-        rather than config, in case ``num_residual_streams`` ever varies by layer.
-        Same VRAM discipline as ``_make_capture``.
-        """
+        """Wrap ``_compute_h`` to record the saturation sentinel."""
 
         def wrapped(proj, r):
             out = orig(proj, r)  # the real mappings the model consumes — returned unchanged
             if not self._should_monitor():
                 return out
             try:
-                h_pre, _h_post, h_res_logits = out
-                n = int(h_pre.shape[-1])
+                _h_pre, _h_post, h_res_logits = out
+                if not h_res_logits.stop_gradient:
+
+                    def record_grad_extrema(grad):
+                        try:
+                            grad_fp32 = grad.detach().astype("float32")
+                            self.record_layer_metric(
+                                layer_idx,
+                                f"{component}_h_res_logits_grad_min",
+                                grad_fp32.min(),
+                            )
+                            self.record_layer_metric(
+                                layer_idx,
+                                f"{component}_h_res_logits_grad_max",
+                                grad_fp32.max(),
+                            )
+                            self._grad_metrics_finalized = False
+                        except Exception as e:
+                            if self.verbose:
+                                logger.error(
+                                    f"[PaddleMHCMonitor] Error logits gradient "
+                                    f"layer {layer_idx}/{component}: {e}"
+                                )
+                        return grad
+
+                    h_res_logits.register_hook(record_grad_extrema)
                 with paddle.no_grad():
-                    for name, value in h_res_softmax_extrema(h_res_logits, n).items():
+                    for name, value in h_res_logits_extrema(h_res_logits).items():
                         self.record_layer_metric(layer_idx, f"{component}_{name}", value)
             except Exception as e:
                 if self.verbose:

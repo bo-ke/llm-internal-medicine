@@ -13,6 +13,9 @@
 - **[LAR (Log-Alignment Ratio)](./docs/lar.md)** — output_layer + 每个 MoE router 的 LAR，泛化/过拟合诊断信号（无 SVD、每步 O(1) 通信；但每步要读一遍 `[T, vocab]` logits）
 - **[Activation Dump](./docs/activation_dump.md)** — 按 monitor 间隔把残差流 hidden states（默认全量）连同产生它们的输入 batch（`input_ids` / `labels` / `PackedSeqParams`）落盘 (safetensors)，供离线结构分析 (`spec_entropy_explorer.py`)，不上报任何 training_logs 指标
 
+以及一个挂在**优化器**而不是模型上的模块，**始终开启**（无开关，调用方零改动）：
+- **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，每 step 一个标量，与 grad norm 并排看
+
 ---
 
 ## 快速开始
@@ -507,3 +510,6 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **PLE** | `residual_ratio` | `\|\|Δ\|\|/\|\|h\|\|` | mean | 适中 |
 | **PLE** | `gate_activation_mean` | `mean(\|act(gate)\|)` | mean | 非零 |
 | **PLE** | `gate_sparsity` | `dead_ratio` | mean | 不应持续上升 |
+| **Optim** | `update_rms` | `sqrt(mean((θ_new−θ_old)²))` | 已全局归约 | 本 step 参数更新幅度 (始终开启) |
+| **Optim** | `param_rms` | `sqrt(mean(θ_new²))` | 已全局归约 | 更新后参数尺度 (始终开启) |
+| **Optim** | `update_param_ratio` | `update_rms / param_rms` | 已全局归约 | trust ratio, ~1e-3 健康 (始终开启) |

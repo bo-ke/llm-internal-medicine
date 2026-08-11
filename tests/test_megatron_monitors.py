@@ -27,6 +27,9 @@ setup_activation_dump_monitor = activation_dump_module.setup_activation_dump_mon
 lar_module = importlib.import_module("internal_medicine.backends.megatron.lar_monitor")
 LARMonitor = lar_module.LARMonitor
 setup_lar_monitor = lar_module.setup_lar_monitor
+optim_update_module = importlib.import_module("internal_medicine.backends.megatron.optim_update_monitor")
+OptimUpdateMonitor = optim_update_module.OptimUpdateMonitor
+setup_optim_update_monitor = optim_update_module.setup_optim_update_monitor
 MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megatron.moe_monitor").MoESpecialistMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
@@ -2374,6 +2377,341 @@ class MegatronLARMonitorTest(unittest.TestCase):
             logits=model.output_layer(hidden).reshape(-1, V)[mask],
         )
         self.assertAlmostEqual(got["lar/lm_head/lar"], want, places=4)
+
+
+class _FakeDistOpt:
+    """Stand-in for DistributedOptimizer's main/model param pairing.
+
+    Mirrors the real invariant the monitor depends on: ``shard_fp32_from_float16_groups``
+    holds the fp32 master (already stepped to ``theta_new``) while
+    ``shard_float16_groups`` still holds the bf16 ``theta_old`` until
+    ``_copy_main_params_to_model_params`` runs.
+    """
+
+    is_stub_optimizer = False
+
+    def __init__(self, theta_old: "torch.Tensor", dtype=None):
+        dtype = dtype or torch.bfloat16
+        # The fp32 master is the authoritative value and is NOT on the bf16 grid — it
+        # persists across steps and accumulates sub-bf16 updates. The model param is its
+        # rounded copy. Seeding the master FROM the bf16 param instead would put it
+        # exactly on-grid, removing the rounding error the debias exists to cancel and
+        # making these tests measure a state training never reaches.
+        self.main_param = theta_old.detach().clone().float()
+        self.model_param = self.main_param.to(dtype)
+        self.shard_float16_groups = [[self.model_param]]
+        self.shard_fp32_from_float16_groups = [[self.main_param]]
+        self.copy_calls = 0
+
+    def apply_update(self, delta: "torch.Tensor") -> None:
+        """The inner ``optimizer.step()``: fp32 master moves, model param does not."""
+        self.main_param.add_(delta)
+
+    def _copy_main_params_to_model_params(self):
+        self.copy_calls += 1
+        self.model_param.copy_(self.main_param)
+
+
+class MegatronOptimUpdateMonitorTest(unittest.TestCase):
+    """optim/update_rms + param_rms: measured between optimizer.step() and copy-back."""
+
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def _run_step(self, theta_old, delta, **kwargs):
+        opt = _FakeDistOpt(theta_old)
+        monitor = OptimUpdateMonitor(**kwargs)
+        self.assertTrue(monitor.attach_optimizer(opt), "no copy method was wrapped")
+        opt.apply_update(delta)
+        opt._copy_main_params_to_model_params()
+        try:
+            return opt, monitor.step()
+        finally:
+            monitor.remove_hooks()
+
+    def test_reports_update_and_param_rms(self):
+        torch.manual_seed(0)
+        theta = torch.randn(50_000) * 0.02
+        delta = torch.randn(50_000) * 3e-4
+        opt, got = self._run_step(theta, delta)
+
+        want_update = float(delta.pow(2).mean().sqrt())
+        want_param = float(opt.main_param.pow(2).mean().sqrt())
+        self.assertAlmostEqual(got["optim/update_rms"] / want_update, 1.0, places=2)
+        self.assertAlmostEqual(got["optim/param_rms"] / want_param, 1.0, places=4)
+        self.assertAlmostEqual(
+            got["optim/update_param_ratio"],
+            got["optim/update_rms"] / got["optim/param_rms"],
+            places=9,
+        )
+
+    def test_metrics_land_in_training_logs(self):
+        torch.manual_seed(1)
+        self._run_step(torch.randn(4096) * 0.02, torch.randn(4096) * 1e-4)
+        latest = training_logs.get_latest(prefix="optim")
+        self.assertEqual(
+            set(latest),
+            {"optim/update_rms", "optim/param_rms", "optim/update_param_ratio"},
+        )
+
+    def test_debias_keeps_small_updates_accurate(self):
+        """A bf16 theta_old rounds, which inflates the raw difference once the update is
+        near the bf16 resolution — 11x at lr 3e-6. Debiasing must hold ~1.0x across the
+        whole lr range, otherwise the metric is useless late in a cosine decay."""
+        torch.manual_seed(2)
+        for lr in (3e-4, 3e-5, 3e-6):
+            theta = torch.randn(200_000) * 0.02
+            delta = torch.randn(200_000) * lr
+            want = float(delta.pow(2).mean().sqrt())
+            with self.subTest(lr=lr, debias=True):
+                _, got = self._run_step(theta, delta, debias_low_precision=True)
+                self.assertAlmostEqual(got["optim/update_rms"] / want, 1.0, places=1)
+        # And confirm the raw form really is badly biased at the small end, so the
+        # debias branch is not dead weight.
+        theta = torch.randn(200_000) * 0.02
+        delta = torch.randn(200_000) * 3e-6
+        want = float(delta.pow(2).mean().sqrt())
+        _, raw = self._run_step(theta, delta, debias_low_precision=False)
+        self.assertGreater(raw["optim/update_rms"] / want, 3.0)
+
+    def test_zero_update_reports_zero(self):
+        """No update at all must not produce a floor from bf16 rounding."""
+        torch.manual_seed(3)
+        theta = torch.randn(20_000) * 0.02
+        _, got = self._run_step(theta, torch.zeros(20_000))
+        self.assertLess(got["optim/update_rms"], 1e-6)
+        self.assertGreater(got["optim/param_rms"], 0.0)
+
+    def test_copy_back_still_happens(self):
+        """The wrapper must be transparent: the real copy has to run, exactly once."""
+        torch.manual_seed(4)
+        theta = torch.randn(8192) * 0.02
+        delta = torch.randn(8192) * 1e-4
+        opt, _ = self._run_step(theta, delta)
+        self.assertEqual(opt.copy_calls, 1)
+        self.assertTrue(torch.equal(opt.model_param, opt.main_param.to(opt.model_param.dtype)))
+
+    def test_patch_is_reverted_by_remove_hooks(self):
+        opt = _FakeDistOpt(torch.randn(1024) * 0.02)
+        original = opt._copy_main_params_to_model_params
+        monitor = OptimUpdateMonitor()
+        monitor.attach_optimizer(opt)
+        self.assertIsNot(opt._copy_main_params_to_model_params, original)
+        monitor.remove_hooks()
+        # Reverted by dropping the instance attribute so class lookup resumes; bound
+        # methods are recreated per access, so compare __func__.
+        self.assertNotIn("_copy_main_params_to_model_params", vars(opt))
+        self.assertIs(opt._copy_main_params_to_model_params.__func__, original.__func__)
+
+    def test_patch_is_idempotent(self):
+        opt = _FakeDistOpt(torch.randn(1024) * 0.02)
+        monitor = OptimUpdateMonitor()
+        monitor.attach_optimizer(opt)
+        patched_once = opt._copy_main_params_to_model_params
+        monitor.attach_optimizer(opt)
+        try:
+            self.assertIs(opt._copy_main_params_to_model_params, patched_once)
+            self.assertEqual(len(monitor._patched), 1)
+        finally:
+            monitor.remove_hooks()
+
+    def test_accumulates_across_chained_optimizers(self):
+        """ChainedOptimizer (Muon + Adam) must contribute both sub-optimizers' shards to
+        one pooled RMS, not just the first."""
+        torch.manual_seed(5)
+        theta_a, theta_b = torch.randn(30_000) * 0.02, torch.randn(30_000) * 0.02
+        delta_a, delta_b = torch.randn(30_000) * 3e-4, torch.randn(30_000) * 3e-4
+        opt_a, opt_b = _FakeDistOpt(theta_a), _FakeDistOpt(theta_b)
+        chained = SimpleNamespace(chained_optimizers=[opt_a, opt_b])
+
+        monitor = OptimUpdateMonitor()
+        self.assertTrue(monitor.attach_optimizer(chained))
+        try:
+            opt_a.apply_update(delta_a)
+            opt_b.apply_update(delta_b)
+            opt_a._copy_main_params_to_model_params()
+            opt_b._copy_main_params_to_model_params()
+            got = monitor.step()
+        finally:
+            monitor.remove_hooks()
+
+        want = float(torch.cat([delta_a, delta_b]).pow(2).mean().sqrt())
+        self.assertAlmostEqual(got["optim/update_rms"] / want, 1.0, places=2)
+
+    def test_step_is_empty_without_a_step(self):
+        """step() with nothing pending must emit nothing rather than 0/0."""
+        opt = _FakeDistOpt(torch.randn(512) * 0.02)
+        monitor = OptimUpdateMonitor()
+        monitor.attach_optimizer(opt)
+        try:
+            self.assertEqual(monitor.step(), {})
+            self.assertEqual(training_logs.get_latest(prefix="optim"), {})
+        finally:
+            monitor.remove_hooks()
+
+    def test_pending_is_cleared_between_steps(self):
+        """Two consecutive steps must report each step's own update, not a running sum."""
+        torch.manual_seed(6)
+        opt = _FakeDistOpt(torch.randn(40_000) * 0.02)
+        monitor = OptimUpdateMonitor()
+        monitor.attach_optimizer(opt)
+        try:
+            big = torch.randn(40_000) * 1e-3
+            opt.apply_update(big)
+            opt._copy_main_params_to_model_params()
+            first = monitor.step()["optim/update_rms"]
+
+            small = torch.randn(40_000) * 1e-4
+            opt.apply_update(small)
+            opt._copy_main_params_to_model_params()
+            second = monitor.step()["optim/update_rms"]
+        finally:
+            monitor.remove_hooks()
+
+        self.assertAlmostEqual(first / float(big.pow(2).mean().sqrt()), 1.0, places=1)
+        self.assertAlmostEqual(second / float(small.pow(2).mean().sqrt()), 1.0, places=1)
+        self.assertLess(second, first / 5)
+
+    def test_stub_optimizer_is_skipped(self):
+        opt = _FakeDistOpt(torch.randn(512) * 0.02)
+        opt.is_stub_optimizer = True
+        monitor = OptimUpdateMonitor()
+        monitor.attach_optimizer(opt)
+        try:
+            opt.apply_update(torch.randn(512) * 1e-4)
+            opt._copy_main_params_to_model_params()
+            self.assertEqual(monitor.step(), {})
+        finally:
+            monitor.remove_hooks()
+
+    def test_setup_helper_registers_under_the_metric_prefix(self):
+        """The monitor_dict key must equal METRIC_PREFIX ("optim"), because callers print
+        training_logs by iterating monitor_dict keys as metric prefixes — a mismatched key
+        would silently drop these metrics from the log. The helper also returns ``model``,
+        matching the other setup_* functions' contract."""
+        opt = _FakeDistOpt(torch.randn(1024) * 0.02)
+        monitor_dict = {}
+        sentinel = object()
+        returned = setup_optim_update_monitor(sentinel, optimizer=opt, monitor_dict=monitor_dict)
+        monitor = monitor_dict[optim_update_module.METRIC_PREFIX]
+        try:
+            self.assertIs(returned, sentinel, "must return the model, like the other setups")
+            self.assertEqual(list(monitor_dict), [optim_update_module.METRIC_PREFIX])
+            self.assertTrue(monitor._patched)
+
+            opt.apply_update(torch.randn(1024) * 3e-4)
+            opt._copy_main_params_to_model_params()
+            monitor.step()
+            emitted = training_logs.get_latest(prefix=optim_update_module.METRIC_PREFIX)
+            self.assertEqual(len(emitted), 3)
+            for key in emitted:
+                self.assertTrue(key.startswith(f"{optim_update_module.METRIC_PREFIX}/"))
+        finally:
+            monitor.remove_hooks()
+
+    def test_always_on_without_being_named_in_monitors(self):
+        """The monitor must be installed by setup_monitors regardless of the ``monitors``
+        spec — it is in _ALWAYS_ON_MONITORS, not _MONITOR_MAP — so no training script has
+        to name it or thread the optimizer through a callback."""
+        self.assertIn("optim", megatron_backend._ALWAYS_ON_MONITORS)
+        self.assertNotIn("optim", megatron_backend._MONITOR_MAP)
+        self.assertNotIn("optim", megatron_backend._expand_monitor_names(["all"]))
+
+        monitor_dict = {}
+        model = FakeGPTModel(num_layers=1, hidden_size=8, vocab_size=16)
+        megatron_backend.setup_monitors(model, monitors=["qk_stats"], monitor_dict=monitor_dict)
+        monitor = monitor_dict.get("optim")
+        try:
+            self.assertIsInstance(monitor, OptimUpdateMonitor)
+            self.assertTrue(monitor._patched, "class-level patch should be installed")
+        finally:
+            if monitor is not None:
+                monitor.remove_hooks()
+
+    def test_class_patch_covers_optimizers_built_afterwards(self):
+        """Patching the mcore optimizer CLASS is what removes the need for a trainer-side
+        callback: an instance constructed after setup must still be measured."""
+        monitor = OptimUpdateMonitor()
+        if not monitor.attach_optimizer_classes():
+            self.skipTest("megatron.core optimizer classes unavailable")
+        try:
+            from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+            patched = DistributedOptimizer.__dict__["_copy_main_params_to_model_params"]
+            self.assertTrue(getattr(patched, "_im_update_patched", False))
+        finally:
+            monitor.remove_hooks()
+            from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+            reverted = DistributedOptimizer.__dict__["_copy_main_params_to_model_params"]
+            self.assertFalse(getattr(reverted, "_im_update_patched", False), "class must be restored")
+
+    def test_chunked_sum_matches_single_pass(self):
+        """The shard is walked in fixed-size chunks to bound the temporary; the result
+        must equal a single-pass computation across a chunk boundary."""
+        torch.manual_seed(7)
+        n = optim_update_module._CHUNK + 12345
+        main = torch.randn(n)
+        model = main.to(torch.bfloat16)
+        ss_u, ss_p, ss_q, count = optim_update_module._pair_sums(main, model)
+        self.assertEqual(count, n)
+        # fp32 chunk accumulation vs a single fp32 reduction over ~1M elements: agreement
+        # is fp32 round-off, not exact.
+        self.assertAlmostEqual(float(ss_u) / float((main - model.float()).pow(2).sum()), 1.0, places=3)
+        self.assertAlmostEqual(float(ss_p) / float(main.pow(2).sum()), 1.0, places=4)
+
+    def test_tp_duplicate_params_are_counted_once(self):
+        """A TP-REPLICATED param exists identically on every TP rank, so only rank 0 may
+        count it; a TP-SHARDED param is distinct per rank and always counts. Getting this
+        backwards inflates the RMS by the TP size."""
+        replicated = torch.nn.Parameter(torch.randn(64))
+        sharded = torch.nn.Parameter(torch.randn(64))
+        sharded.tensor_model_parallel = True
+
+        rank0 = SimpleNamespace(rank=lambda: 0)
+        rank1 = SimpleNamespace(rank=lambda: 1)
+        not_dup = optim_update_module._param_is_not_tp_duplicate
+        self.assertTrue(not_dup(sharded, rank1), "TP-sharded is distinct on every rank")
+        self.assertTrue(not_dup(replicated, rank0))
+        self.assertFalse(not_dup(replicated, rank1), "replicated must only count on TP rank 0")
+
+    def test_shared_params_are_excluded(self):
+        """Tied embeddings are marked ``shared`` and appear on two PP stages; counting
+        both would double-count them."""
+        plain = torch.nn.Parameter(torch.randn(8))
+        shared = torch.nn.Parameter(torch.randn(8))
+        shared.shared = True
+        self.assertTrue(optim_update_module._param_is_not_shared(plain))
+        self.assertFalse(optim_update_module._param_is_not_shared(shared))
+
+    def test_expert_and_dense_shards_are_bucketed_separately(self):
+        """Expert params reduce over different groups than dense ones, so they must land
+        in separate buckets (``allreduce=False`` is mcore's expert marker)."""
+        torch.manual_seed(8)
+        opt = _FakeDistOpt(torch.randn(4096) * 0.02)
+        expert_model = (torch.randn(4096) * 0.02).to(torch.bfloat16)
+        expert_main = expert_model.float()
+        expert_model.allreduce = False
+        opt.shard_fp32_from_float16_groups[0].append(expert_main)
+        opt.shard_float16_groups[0].append(expert_model)
+
+        monitor = OptimUpdateMonitor()
+        monitor.attach_optimizer(opt)
+        try:
+            opt.apply_update(torch.randn(4096) * 3e-4)
+            expert_main.add_(torch.randn(4096) * 3e-4)
+            opt._copy_main_params_to_model_params()
+            self.assertEqual(len(monitor._pending_dense), 1)
+            self.assertEqual(len(monitor._pending_expert), 1)
+            got = monitor.step()
+            self.assertIn("optim/update_rms", got)
+            self.assertEqual(monitor._pending_dense, [])
+            self.assertEqual(monitor._pending_expert, [])
+        finally:
+            monitor.remove_hooks()
 
 
 class MegatronMonitorRegistryTest(unittest.TestCase):

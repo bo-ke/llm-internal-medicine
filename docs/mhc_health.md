@@ -38,6 +38,7 @@ internal_medicine_monitors:
 
 `h_pre` 不在 `HyperConnectionModule.forward` 的返回中，普通 forward hook 看不到它。因此本 monitor **包裹
 （wrap）每个 mHC 模块的 `compute_mappings` 绑定方法**，直接捕获其真实返回的 `(h_pre, h_post, h_res)` —— 不重算。
+另外包 `_compute_h`（拿 Sinkhorn 之前的 `h_res` logits）和 `fused_h_res_h_post_bda`（拿子层输出，算分支/残差占比）。
 
 - `compute_mappings` 是普通 Python 方法（仅 `@nvtx_decorator`，非 `@torch.compile`），在 `_forward_normal` 中以
   `self.compute_mappings(...)` 调用，且**不被 checkpoint**，因此在 grad-enabled 的正向中恰好执行一次；实例属性
@@ -62,10 +63,11 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 
 ## 监控指标
 
-每个 hc 模块产出 9 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 8 个），指标名以
-`attn_` / `mlp_` 前缀区分，除 `branch_residual_share_max` 取极值外全部按 token/batch 求均值
-（并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，`{c}` ∈ `{attn, mlp}`；
-对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
+每个 hc 模块产出 14 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 8 个），指标名以
+`attn_` / `mlp_` 前缀区分，除 `branch_residual_share_max`、`h_res_softmax_max`、
+`composite_amax_gain_{fwd,bwd}_max` 取极大值与 `h_res_softmax_min` 取极小值外全部按 token/batch 求均值
+（并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，
+`{c}` ∈ `{attn, mlp}`；对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
 
 ### 门控统计（h_pre / h_post）
 
@@ -95,33 +97,87 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 
 ### amax-gain（Sinkhorn 收敛哨兵）
 
-paper 定义的最坏情况增益：矩阵的**最大绝对行和**界定前向传播的最坏放大。对每个 token 的 `n×n` 矩阵计算，
-再对 token 求均值：
+paper 定义的最坏情况增益：算子的**最大绝对行和**界定前向传播的最坏放大。这里的算子不是 `h_res` 本身——
+`apply_h_res` 与 fused cuTile kernel 都按 `out_i = Σ_j h_res_ji · x_j` 混流，即真正作用在流向量上的是 `h_resᵀ`
+（见 `hyper_connection.py:466-471`、`fused_mhc_kernels.py:367-373`）。所以前向增益是 `h_res` 的**列**和、
+反向增益是**行**和。对每个 token 的 `n×n` 矩阵计算，再对 token 求均值：
 
 ```
-amax_gain_fwd = mean_t( max_i | Σ_j  h_res_ij | )      # 行和（forward）
+amax_gain_fwd = mean_t( max_i | Σ_j  h_res_ji | )      # h_res 的列和 = h_resᵀ 的行和（forward）
+amax_gain_bwd = mean_t( max_j | Σ_i  h_res_ji | )      # h_res 的行和（backward）
 ```
 
 | 指标 | 诊断意义 |
 |------|----------|
-| `{c}_amax_gain_fwd` | Sinkhorn 是否收敛 / 有无 NaN。双随机 → 恒 ≈1.0。**只输出 `global_*`** |
+| `{c}_amax_gain_fwd` | 单层前向最坏放大。列和被 Sinkhorn 最后一步归一钉死，是不变量守卫 |
+| `{c}_amax_gain_bwd` | 单层反向最坏放大。承载 Sinkhorn 截断迭代的收敛残差 |
 
-单层 `h_res` 经 Sinkhorn 投影为双随机矩阵，所以这个值**按构造恒为 1**——实测 0.99999905，动态范围 0.0001%，
-偏离量全部来自 Sinkhorn 的 `eps = 1e-6`。它只能当哨兵，不要拿来做诊断。也正因如此它走 `Probe.GLOBAL_ONLY`：
-逐层值照常累加、`global_*` 从中派生，只是不写进日志——任一层漂移仍会把全局曲线带走，但看板上只有 2 条线
-而不是 13 层 × 2 组件。
+**哪个轴带信息**：我们的 `_sinkhorn_normalize` 最后一步是**列**归一，所以列和按构造恒为 1，行和才承载截断迭代的
+残差（偏离量来自 `eps = 1e-6`，量级很小）。所以 `_bwd` 只能当哨兵、不要做诊断；`_fwd` 一旦偏离 1 反而更严重，
+说明归一化本身出了问题（数值异常或实现改动）。
 
-### 已下线：amax_gain_bwd 与复合映射
+注意论文 Eq. (9) 最后一步是**行**归一，所以它 Fig 7 里会动的是 forward 那条，而我们会动的是 `_bwd`——
+**两边曲线不可直接对比。**
 
-- `{c}_amax_gain_bwd`（最大绝对列和）：Sinkhorn 的最后一步是列归一（`hyper_connection.py` 的迭代循环），
-  列和被钉在 1，实测四条 run、每一层都与 `amax_gain_fwd` **逐位相同**。
-- `{c}_composite_amax_gain_fwd` / `_bwd`（`M_k = h_res_k @ M_{k-1}` 的行/列和）：双随机矩阵之积仍是双随机矩阵，
-  复合增益同样恒为 1（实测 0.99999~0.999975）。更糟的是它依赖执行顺序：开 `recompute_granularity: full` 时
-  采集实际发生在反向重放，累乘变成逆序——实测每层累乘因子数为 `1, 25.6, 23.6, …, 2.9`，而正序应为
-  `1, 3, 5, …, 25.8`（关掉 recompute 的对照组给出了后者）。让它与顺序无关需要把每层 `h_res` 在整个 step 内
-  驻留（43 层约 45MB 常驻显存），为一个常数付这个代价不值得。
+### logits 饱和哨兵（迭代前的行内跨度）
 
-要真正观测残差流放大，应监控 **Sinkhorn 收敛残差**（行和与 1 的偏差）或 `h_res` 的谱性质，两者都尚未实现。
+`softmax` 在行内**平移不变**，所以决定 `h_res` 有多尖的唯一量是行内跨度 `max_j z_j − min_j z_j`。跨度直接决定
+softmax 的最小输出：`min ≈ exp(−跨度)`，于是阈值由 dtype 给出，不需要拍：
+
+- `exp(-87) ≈ 1.2e-38` —— fp32 最小正规数
+- `exp(-103) ≈ 1.4e-45` —— fp32 最小 denormal，再往下就是 0
+
+跨度超过 ~87，模型自己的 `softmax` 就开始下溢：行内相对比例被摧毁，紧随其后的 Sinkhorn 把残存比例按最多
+`1/eps` 放大。
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_h_res_softmax_min` | `min_t min_{i,j} softmax(z)_{t,i,j}` | 最小混合权重。值域 `(0, 1/n]`，`1/n` = 行内均匀，趋 0 = 该行退化成 one-hot。按 **min** 归约 |
+| `{c}_h_res_softmax_max` | `max_t max_{i,j} softmax(z)_{t,i,j}` | 单个最大混合权重。值域 `[1/n, 1]`，跨度到约 18 之后在 fp32 里精确等于 1.0 并保持不变，所以只能当"是否已经饱和"的开关看，不反映饱和深度。按 **max** 归约 |
+
+### 复合映射（composite_amax_gain_{fwd,bwd}_max）
+
+`apply_h_res` 的实际运算是 `mixed = h_resᵀ @ residual`，所以
+**真正作用在流向量上的算子是 `h_resᵀ`**。从首层到第 k 层的复合算子是
+
+```
+A_k = h_res_kᵀ @ ⋯ @ h_res_0ᵀ
+```
+
+逐层记录它的最大绝对行和（`_fwd`，前向信号增益）与最大绝对列和（`_bwd`，反向梯度增益）。这条曲线对应论文
+Figure 7(b)：单层指标看不出的拱形（中间层高、两端低）只有复合能显示。
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_composite_amax_gain_fwd_max` | `max_i \|Σ_j A_{k,i,j}\|` | 从首层到本层累计的前向最坏放大。逐层输出形成剖面曲线；global 按 **max** 归约给出峰值 |
+| `{c}_composite_amax_gain_bwd_max` | `max_j \|Σ_i A_{k,i,j}\|` | 同上取列和 |
+
+四个实现要点：
+
+1. **累乘的是转置。** 直接对 `h_res` 累乘既不是前向链也不是反向链——`h_res_k ⋯ h_res_0` 与真实算子
+   `A_k = (h_res_0 ⋯ h_res_k)ᵀ` 是不同的矩阵。快照里存的就是 `h_resᵀ`。单层的 `amax_gain_{fwd,bwd}` 同样按
+   `h_resᵀ` 口径计算（只是没有显式转置，直接换了求和轴），所以两组指标的 `_fwd`/`_bwd` 语义一致、可以对着读。
+2. **先对 token 求平均再累乘**（论文 Fig 7/8 同口径），所以每层每组件只存一个 `n×n` fp32 快照，而不是把 per-token
+   `h_res` 在整个 step 内驻留。这是它当初被下线的第一条理由，现在不成立。
+3. **累乘发生在 flush 时、按 `layer_idx` 排序**，不在 hook 里增量累乘。所以结果与 hook 触发顺序无关——而触发顺序
+   在 recompute 下是反向重放的逆序，那正是它当初被下线的第二条理由。`_record_composite` 有对应的回归测试
+   （故意逆序触发 hook，断言结果仍等于正序累乘）。
+4. **MTP 层被排除。** MTP 层不在主干传播路径上，乘进链条没有物理意义。
+
+作用域限制：复合只覆盖**本 rank 持有的层**。当前配置（`sharding: stage1`，无 PP）下每张卡都持有全部 43 层，所以
+就是全网语义。真开 PP 后它会退化成 stage 内语义，而我们既检测不到也修不了——`get_pipeline_model_parallel_rank`
+和 `get_pipeline_model_parallel_world_size` 在 PaddleFleet 里目前是 stub（无条件返回 0 / 1，
+`parallel_state.py:229`、`:246`）。要支持 PP 需要先等这两个函数实现，再补一次 flush 时的 all-gather；届时
+**collective 必须放在所有 per-layer `try/except` 之外**，否则单个 rank 吞异常会让整个 job 挂死而不是报错。
+
+### 曾经下线、现已恢复
+
+- `{c}_amax_gain_bwd`：曾因读数与 `amax_gain_fwd` 一致而下线。这个结果本身是预期的（`_fwd` 读的列和被 Sinkhorn
+  最后一步钉死为 1），两条现在都保留：`_fwd` 当不变量守卫，`_bwd` 才是承载收敛残差的那条。
+- `{c}_composite_amax_gain_{fwd,bwd}_max`：曾因两条理由下线，现在都不成立——per-token `h_res` 全 step 驻留的开销
+  （改成先对 token 求平均后只剩一个 `n×n` 快照），以及依赖执行顺序（改成按 `layer_idx` 排序、flush 时累乘后无关）。
+
+
 
 ---
 
@@ -131,7 +187,7 @@ amax_gain_fwd = mean_t( max_i | Σ_j  h_res_ij | )      # 行和（forward）
 - 整个捕获受 `_should_monitor()` 门控；非监控步只是 `orig(x)` + 一次布尔判断。
 - `_should_monitor()` 要求 grad enabled。这个判据的名字暗示"跳过重算"，**实际语义相反**：recompute 的真前向跑在
   `no_grad` 下，反向重放才开 grad，所以采集实际发生在反向重放。数值不受影响（重算确定性），但依赖执行顺序的指标
-  会出错——这是复合映射被下线的原因之一。
+  会出错——这曾经让复合映射下线，现在复合改成按 `layer_idx` 排序、在 flush 时累乘，不再受影响。
 - 这个判据留着是因为它顺带保证了"每个模块每 step 只取一条样本"：mHC 的 hyper-connection 在一次前向里会被进入
-  两次（`high_precision_mhc` 打开时 AMP 关闭的 fp32 路径 + bf16 路径），两条都记会稀释所有均值（实测单层
-  `amax_gain` 偏离量减半、门控 std 偏移 1~3%）。详见 README「已知限制：采集口径依赖 grad 判据」。
+  两次（`high_precision_mhc` 打开时 AMP 关闭的 fp32 路径 + bf16 路径），两条都记会稀释所有均值。详见 README
+  「已知限制：采集口径依赖 grad 判据」。

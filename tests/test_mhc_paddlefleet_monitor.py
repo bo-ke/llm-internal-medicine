@@ -1,4 +1,5 @@
 import importlib
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -25,14 +26,26 @@ PaddleMHCHealthMonitor = mhc_monitor.PaddleMHCHealthMonitor
 class FakeHC(nn.Layer):
     """Stand-in for HyperConnectionModule exposing compute_mappings."""
 
-    def __init__(self, n, h_pre, h_post, h_res):
+    def __init__(self, n, h_pre, h_post, h_res, h_res_logits=None):
         super().__init__()
         self.n = n
         self._h_pre = h_pre
         self._h_post = h_post
         self._h_res = h_res
+        # Raw pre-Sinkhorn mixing logits. Zeros -> uniform rows -> every column
+        # sum is exactly 1, i.e. the healthy case.
+        if h_res_logits is None:
+            h_res_logits = paddle.zeros([*h_pre.shape[:-1], n * n])
+        self._h_res_logits = h_res_logits
+
+    def _compute_h(self, proj, r):
+        return self._h_pre, self._h_post, self._h_res_logits
 
     def compute_mappings(self, x):
+        # Mirrors the real module: _compute_h yields the raw logits, the Sinkhorn
+        # projection then turns them into h_res. Going through self._compute_h is
+        # what lets the monitor's instance-attribute shadowing see the logits.
+        self._compute_h(None, None)
         return self._h_pre, self._h_post, self._h_res
 
     def fused_h_res_h_post_bda(
@@ -159,6 +172,46 @@ class MHCMetricsTest(unittest.TestCase):
         )
         self.assertAlmostEqual(float(stats["branch_residual_share"]), 0.0, places=6)
 
+    def test_softmax_extrema_are_one_over_n_for_uniform_logits(self):
+        stats = mhc_metrics.h_res_softmax_extrema(paddle.zeros([5, 16]), 4)
+        self.assertAlmostEqual(float(stats["h_res_softmax_min"]), 0.25, places=6)
+        self.assertAlmostEqual(float(stats["h_res_softmax_max"]), 0.25, places=6)
+
+    def test_softmax_min_matches_exp_minus_range_over_S(self):
+        # p_min = exp(-R) / S with S = 1/p_max, so -log(p_min) = R + log(S).
+        # Row 2 has the widest spread (0 - (-4) = 4) and holds the smallest weight.
+        logits = paddle.to_tensor(
+            [[-2.0, 0.0, -3.0, -2.0], [-3.0, 0.0, -2.0, -1.0], [-3.0, -2.0, -4.0, 0.0], [-2.0, -2.0, -3.0, 0.0]],
+            dtype="float32",
+        ).reshape([1, 16])
+        p = paddle.nn.functional.softmax(logits.reshape([1, 4, 4]), axis=-1)
+        s = 1.0 / float(p[0, 2].max())
+        stats = mhc_metrics.h_res_softmax_extrema(logits, 4)
+        self.assertAlmostEqual(float(stats["h_res_softmax_min"]), math.exp(-4.0) / s, places=6)
+
+    def test_softmax_max_saturates_where_min_still_resolves(self):
+        # Row 0 is one winner against three losers at -R; spreads of 18 and 200
+        # both pin `max` at exactly 1.0, so it cannot separate them, while `min`
+        # and the logit range can.
+        near = paddle.zeros([1, 16])
+        far = paddle.zeros([1, 16])
+        near[0, 1:4] = -18.0
+        far[0, 1:4] = -200.0
+        s_near = mhc_metrics.h_res_softmax_extrema(near, 4)
+        s_far = mhc_metrics.h_res_softmax_extrema(far, 4)
+        self.assertEqual(float(s_near["h_res_softmax_max"]), 1.0)
+        self.assertEqual(float(s_far["h_res_softmax_max"]), 1.0)
+        self.assertGreater(float(s_near["h_res_softmax_min"]), float(s_far["h_res_softmax_min"]))
+
+    def test_softmax_min_underflows_to_zero_past_the_alarm(self):
+        # A spread past ~103 drives softmax's smallest entry below fp32's smallest
+        # denormal, so the series bottoms out at exactly 0. That is past the alarm
+        # (1.18e-38, i.e. a spread of ~87) and the model cannot tell 0 from 1e-44
+        # either — `_sinkhorn_normalize` adds the same 1e-6 to both.
+        far = paddle.zeros([1, 16])
+        far[0, 1:4] = -200.0
+        self.assertEqual(float(mhc_metrics.h_res_softmax_extrema(far, 4)["h_res_softmax_min"]), 0.0)
+
 
 class MHCMonitorTest(unittest.TestCase):
     def setUp(self):
@@ -218,20 +271,17 @@ class MHCMonitorTest(unittest.TestCase):
             # h_pre == 0.5 everywhere, h_post == 1.0 everywhere.
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_pre_mean"], 0.5, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_mean"], 1.0, places=5)
-            # amax_gain_fwd is a gatekeeper: global only, no per-layer series.
-            self.assertNotIn(f"mhc_health/layer_0/{comp}_amax_gain_fwd", latest)
-            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_amax_gain_fwd"], 1.0, places=4)
-        # The retired series must stay gone.
-        for comp in ("attn", "mlp"):
-            for key in ("amax_gain_bwd", "composite_amax_gain_fwd", "composite_amax_gain_bwd"):
-                self.assertNotIn(f"mhc_health/layer_0/{comp}_{key}", latest)
-                self.assertNotIn(f"mhc_health/global_{comp}_{key}", latest)
+            # Both amax gains are emitted per layer and globally.
+            for key in ("amax_gain_fwd", "amax_gain_bwd"):
+                self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_{key}"], 1.0, places=4)
+                self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_{key}"], 1.0, places=4)
 
-    def test_amax_gain_fwd_is_the_row_sum(self):
-        # An asymmetric, row-stochastic (but not column-stochastic) h_res pins the
-        # convention: amax_gain_fwd must read the ROW sums (1.0 here), never the
-        # column sums (1.5 here). Identity matrices cannot tell the two apart,
-        # which is how the fwd/bwd label mix-up stayed invisible.
+    def test_amax_gain_axes_are_not_swapped(self):
+        # An asymmetric h_res pins the convention. Streams mix as
+        # `out = h_res^T @ x`, so _fwd must read the COLUMN sums of h_res (1.5
+        # here) and _bwd the ROW sums (1.0 here) — single layer and composite
+        # agree. Identity matrices cannot tell the two apart, which is how the
+        # fwd/bwd label mix-up stayed invisible.
         n, s, b = 2, 1, 1
         h_res = paddle.to_tensor([[0.75, 0.25], [0.75, 0.25]]).reshape([1, 1, n, n]).expand([s, b, n, n])
         hc = FakeHC(
@@ -248,7 +298,171 @@ class MHCMonitorTest(unittest.TestCase):
         monitor.step()
 
         latest = training_logs.get_latest(prefix="mhc_health")
-        self.assertAlmostEqual(latest["mhc_health/global_attn_amax_gain_fwd"], 1.0, places=5)
+        self.assertAlmostEqual(latest["mhc_health/global_attn_amax_gain_fwd"], 1.5, places=5)
+        self.assertAlmostEqual(latest["mhc_health/global_attn_amax_gain_bwd"], 1.0, places=5)
+        self.assertAlmostEqual(latest["mhc_health/global_attn_composite_amax_gain_fwd_max"], 1.5, places=5)
+        self.assertAlmostEqual(latest["mhc_health/global_attn_composite_amax_gain_bwd_max"], 1.0, places=5)
+
+    def test_softmax_extrema_are_recorded_and_reduce_by_extremum_across_layers(self):
+        # layer_0 healthy (uniform logits), layer_1 saturated. The global series
+        # must reduce by MIN / MAX so the sick layer is not averaged away.
+        n, s, b = 4, 2, 3
+        saturated = (
+            paddle.to_tensor(
+                [[-25.7, 0.0, -100.0, -61.0], [-33.4, 0.0, -89.0, -48.0]]
+                + [[-34.0, -24.9, -104.0, 0.0], [-79.4, -72.6, -104.0, 0.0]],
+                dtype="float32",
+            )
+            .reshape([1, 1, n * n])
+            .expand([s, b, n * n])
+        )
+
+        def sick_hc():
+            return FakeHC(
+                n=n,
+                h_pre=paddle.full([s, b, n], 0.5),
+                h_post=paddle.ones([s, b, n]),
+                h_res=paddle.eye(n).reshape([1, 1, n, n]).expand([s, b, n, n]),
+                h_res_logits=paddle.assign(saturated),
+            )
+
+        model = _mhc_model([self._identity_layer(n, s, b), FakeLayer(attn=sick_hc(), mlp=sick_hc())])
+
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_softmax_min"], 0.25, places=5)
+            self.assertLess(latest[f"mhc_health/layer_1/{comp}_h_res_softmax_min"], 1e-30)
+            self.assertLess(latest[f"mhc_health/global_{comp}_h_res_softmax_min"], 1e-30)
+            # max: uniform layer also reads 1/n, saturated layer pins at 1.0, and
+            # the global series reduces by MAX.
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_softmax_max"], 0.25, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_1/{comp}_h_res_softmax_max"], 1.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_h_res_softmax_max"], 1.0, places=5)
+
+    def test_composite_is_built_in_layer_order_not_call_order(self):
+        # Regression test for what retired the previous composite metric: it was
+        # accumulated in call order, which under recompute is the reverse-layer
+        # backward replay. Here the hooks are fired in reverse on purpose.
+        n, s, b = 4, 1, 1
+        mats = [
+            paddle.to_tensor(
+                [[0.9, 0.1, 0.0, 0.0], [0.1, 0.9, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+                dtype="float32",
+            ),
+            paddle.to_tensor(
+                [[1.0, 0.0, 0.0, 0.0], [0.0, 1.5, 0.0, 0.0], [0.0, 0.0, 0.5, 0.5], [0.0, 0.0, 0.5, 0.5]],
+                dtype="float32",
+            ),
+            paddle.to_tensor(
+                [[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                dtype="float32",
+            ),
+        ]
+
+        def row_gain(m):
+            return float(m.sum(axis=-1).abs().max())
+
+        def col_gain(m):
+            return float(m.sum(axis=-2).abs().max())
+
+        def chain(seq, gain):
+            # apply_h_res mixes with h_res^T, so the composite operator is built
+            # from the transposes.
+            out, acc = [], None
+            for m in seq:
+                op = m.transpose([1, 0])
+                acc = op if acc is None else paddle.matmul(op, acc)
+                out.append(gain(acc))
+            return out
+
+        expected = chain(mats, row_gain)
+        expected_bwd = chain(mats, col_gain)
+        # Guard against a vacuous test: the reversed product must actually differ.
+        self.assertNotAlmostEqual(expected[-1], chain(list(reversed(mats)), row_gain)[-1], places=4)
+
+        def layer_for(mat):
+            def make_hc():
+                return FakeHC(
+                    n=n,
+                    h_pre=paddle.full([s, b, n], 0.5),
+                    h_post=paddle.ones([s, b, n]),
+                    h_res=paddle.assign(mat.reshape([1, 1, n, n]).expand([s, b, n, n])),
+                )
+
+            return FakeLayer(attn=make_hc(), mlp=make_hc())
+
+        model = _mhc_model([layer_for(m) for m in mats])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(list(reversed(targets)), x_dim=n * 8)  # deliberately out of order
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            for idx, (want_fwd, want_bwd) in enumerate(zip(expected, expected_bwd)):
+                self.assertAlmostEqual(
+                    latest[f"mhc_health/layer_{idx}/{comp}_composite_amax_gain_fwd_max"], want_fwd, places=4
+                )
+                self.assertAlmostEqual(
+                    latest[f"mhc_health/layer_{idx}/{comp}_composite_amax_gain_bwd_max"], want_bwd, places=4
+                )
+            # Global reduces by max over layers.
+            self.assertAlmostEqual(
+                latest[f"mhc_health/global_{comp}_composite_amax_gain_fwd_max"], max(expected), places=4
+            )
+            self.assertAlmostEqual(
+                latest[f"mhc_health/global_{comp}_composite_amax_gain_bwd_max"], max(expected_bwd), places=4
+            )
+
+    def test_composite_is_one_for_identity_chain(self):
+        n, s, b = 4, 2, 3
+        model = _mhc_model([self._identity_layer(n, s, b) for _ in range(3)])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            for idx in range(3):
+                self.assertAlmostEqual(
+                    latest[f"mhc_health/layer_{idx}/{comp}_composite_amax_gain_fwd_max"], 1.0, places=5
+                )
+
+    def test_composite_skips_mtp_layers(self):
+        # MTP layers are off the main trunk; multiplying them into the chain has no
+        # physical meaning. Marking layer_1 as MTP must leave the layer_0 value
+        # untouched and emit nothing for layer_1.
+        n, s, b = 4, 2, 3
+        model = _mhc_model([self._identity_layer(n, s, b) for _ in range(2)])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        monitor._mtp_layer_ids.add(1)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            self.assertAlmostEqual(
+                latest[f"mhc_health/layer_0/{comp}_composite_amax_gain_fwd_max"], 1.0, places=5
+            )
+            self.assertNotIn(f"mhc_health/layer_1/{comp}_composite_amax_gain_fwd_max", latest)
+
+    def test_composite_snapshot_is_cleared_each_step(self):
+        n, s, b = 4, 2, 3
+        model = _mhc_model([self._identity_layer(n, s, b)])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        self.assertTrue(monitor._h_res_snapshot)
+        monitor.step()
+        # Stale matrices must not survive into the next step's product.
+        self.assertFalse(monitor._h_res_snapshot)
 
     def test_branch_residual_share_is_recorded_from_bda(self):
         n, s, b, c = 4, 2, 3, 6

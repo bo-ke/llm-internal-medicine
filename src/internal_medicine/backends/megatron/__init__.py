@@ -7,6 +7,7 @@ from .gather import install_gather_fn
 from .massive_activation_monitor import MassiveActivationMonitor, setup_massive_activation_monitor
 from .mhc_monitor import MHCHealthMonitor, setup_mhc_monitor
 from .moe_monitor import MoESpecialistMonitor, setup_moe_monitor
+from .optim_update_monitor import OptimUpdateMonitor, setup_optim_update_monitor
 from .ple_monitor import PLEHealthMonitor, setup_ple_monitor
 from .qk_monitor import QKStatsMonitor, setup_qk_monitor
 
@@ -19,6 +20,8 @@ _MONITOR_MAP = {
     "massive_act": setup_massive_activation_monitor,
     "mhc_health": setup_mhc_monitor,
 }
+
+_ALWAYS_ON_MONITORS = {"optim": setup_optim_update_monitor}
 
 
 def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
@@ -33,12 +36,13 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
     if monitor_dict is None:
         monitor_dict = {}
 
-    for name in monitors:
-        if name not in _MONITOR_MAP:
+    for name in [*_ALWAYS_ON_MONITORS, *monitors]:
+        setup_fn = _ALWAYS_ON_MONITORS.get(name) or _MONITOR_MAP.get(name)
+        if setup_fn is None:
             logger.warning(f"[InternalMedicine/megatron] Unknown monitor: {name}, skipping")
             continue
         try:
-            _MONITOR_MAP[name](
+            setup_fn(
                 model,
                 monitor_dict=monitor_dict,
                 monitor_interval=monitor_interval,
@@ -66,4 +70,6 @@ __all__ = [
     "setup_massive_activation_monitor",
     "MHCHealthMonitor",
     "setup_mhc_monitor",
+    "OptimUpdateMonitor",
+    "setup_optim_update_monitor",
 ]

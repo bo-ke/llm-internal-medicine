@@ -18,6 +18,7 @@ return tuple. Currently adapted for StandardMoEGate (PaddleFormers).
 import logging
 
 import paddle
+import paddle.distributed as dist
 import paddle.nn as nn
 
 from .base import PaddleProbe
@@ -81,13 +82,37 @@ def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=
     return intersection / union.clip(min=1.0)
 
 
-def _per_expert_stacked_norms(w1, w2=None):
-    """Per-expert L2 norm over stacked expert weights, fully vectorized."""
+def _per_expert_stacked_sumsq(w1, w2=None):
+    """Per-expert sum of squares over stacked expert weights, fully vectorized.
+
+    Returns the sum of squares rather than the norm: under the 'allgather' MoE
+    dispatcher each expert is sharded along its intermediate dim, so the
+    per-shard sums must be reduced across the EP group *before* the sqrt.
+    """
     num_experts = w1.shape[0]
     sq = (w1.detach().astype("float32").reshape([num_experts, -1]) ** 2).sum(axis=-1)
     if w2 is not None:
         sq = sq + (w2.detach().astype("float32").reshape([num_experts, -1]) ** 2).sum(axis=-1)
-    return paddle.sqrt(sq)
+    return sq
+
+
+def _intermediate_shard_group(experts):
+    """EP group along which every expert's intermediate dim is sharded, or None.
+
+    ``moe_layer`` builds the fused expert module with
+    ``intermediate_size_per_partition = moe_intermediate_size // EP`` when
+    ``moe_token_dispatcher_type == 'allgather'`` and EP > 1 — every rank then
+    holds *all* experts but only a 1/EP slice of each. Without reducing, every
+    weight-norm metric reads low by sqrt(EP) (and shared_routed_ratio high by
+    the same factor) the moment that dispatcher is switched on.
+    """
+    if experts is None:
+        return None
+    local = getattr(experts, "intermediate_size_per_partition", None)
+    full = getattr(getattr(experts, "config", None), "moe_intermediate_size", None)
+    if not local or not full or local >= full:
+        return None
+    return getattr(experts, "ep_group", None)
 
 
 def _module_sumsq(module):
@@ -320,13 +345,42 @@ class PaddleMoEMonitor(PaddleProbe):
         """Compute per-layer expert weight norms for all monitored MoE layers."""
         if not self._buffers_allocated or not self._should_monitor():
             return
+        pending = []
+        shard_group = None
         for layer_idx, moe_layer in self._expert_norm_layers:
             try:
                 with paddle.no_grad():
-                    self._compute_expert_metrics(layer_idx, moe_layer)
+                    routed_sq, shared_sq, group = self._collect_expert_sumsq(moe_layer)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[PaddleMoEMonitor] expert-norm collect error layer {layer_idx}: {e}")
+                continue
+            if group is not None:
+                shard_group = group
+            pending.append((layer_idx, routed_sq, shared_sq, group is not None))
+        if not pending:
+            return
+        with paddle.no_grad():
+            # One collective for the whole model rather than one per layer: the
+            # intermediate-dim shards only carry 1/EP of each expert, so the
+            # sums must be reduced before the sqrt.
+            sharded = [sq for _, sq, _, needs_reduce in pending if needs_reduce and sq is not None]
+            if sharded and shard_group is not None:
+                sizes = [int(sq.shape[0]) for sq in sharded]
+                flat = paddle.concat([sq.reshape([-1]) for sq in sharded])
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=shard_group)
+                reduced = iter(paddle.split(flat, sizes))
+                pending = [
+                    (
+                        layer_idx,
+                        next(reduced) if (needs_reduce and sq is not None) else sq,
+                        shared_sq,
+                        needs_reduce,
+                    )
+                    for layer_idx, sq, shared_sq, needs_reduce in pending
+                ]
+            for layer_idx, routed_sq, shared_sq, _ in pending:
+                self._record_expert_metrics(layer_idx, routed_sq, shared_sq)
 
     def _compute_gate_metrics(self, layer_idx, gate, outputs, moe_layer):
         """Compute router metrics from gate forward output."""
@@ -364,29 +418,33 @@ class PaddleMoEMonitor(PaddleProbe):
             self.record_layer_metric(layer_idx, "expert_bias_max", bias.max())
             self.record_layer_metric(layer_idx, "expert_bias_min", bias.min())
 
-    def _compute_expert_metrics(self, layer_idx, moe_layer):
-        routed_norm_mean = None
+    def _collect_expert_sumsq(self, moe_layer):
+        """Per-expert / shared-expert sums of squares for one MoE layer.
+
+        Returns ``(routed_sumsq[num_experts] | None, shared_sumsq | None,
+        shard_group | None)``. Sqrt is deferred to ``_record_expert_metrics`` so
+        an intermediate-sharded layout can be reduced across EP first.
+        """
+        routed_sq = None
+        shard_group = None
 
         # grouped-gemm experts: weight1/weight2 are [num_experts, ...] blocks.
         if hasattr(moe_layer, "grouped_gemm_experts") and moe_layer.grouped_gemm_experts is not None:
             ggm = moe_layer.grouped_gemm_experts
             if hasattr(ggm, "weight1") and hasattr(ggm, "weight2"):
-                norms = _per_expert_stacked_norms(ggm.weight1, ggm.weight2)
-                norm_stats = _norm_stats(norms)
-                for name, val in norm_stats.items():
-                    self.record_layer_metric(layer_idx, name, val)
-                routed_norm_mean = norm_stats.get("expert_norm_mean")
+                routed_sq = _per_expert_stacked_sumsq(ggm.weight1, ggm.weight2)
+                shard_group = _intermediate_shard_group(ggm)
 
         elif hasattr(moe_layer, "experts") and moe_layer.experts is not None:
             experts = moe_layer.experts
-            norms = None
             # Fused-expert layout (moe_expert_fusion=True): self.experts is a
             # single module whose up_gate_proj/down_proj weights carry a leading
             # expert dim [num_experts, ...]. Vectorize over that dim.
             if hasattr(experts, "up_gate_proj") and hasattr(experts, "down_proj"):
-                w1 = experts.up_gate_proj.weight
-                w2 = experts.down_proj.weight
-                norms = _per_expert_stacked_norms(w1, w2)
+                routed_sq = _per_expert_stacked_sumsq(
+                    experts.up_gate_proj.weight, experts.down_proj.weight
+                )
+                shard_group = _intermediate_shard_group(experts)
             elif isinstance(experts, (list, nn.LayerList)) or hasattr(experts, "__iter__"):
                 # Non-fused layout: LayerList of per-expert modules. One sum-sq
                 # per expert (each is a small handful of params), then stack.
@@ -396,25 +454,35 @@ class PaddleMoEMonitor(PaddleProbe):
                         continue
                     sq = _module_sumsq(expert)
                     if sq is not None:
-                        per_expert.append(paddle.sqrt(sq))
+                        per_expert.append(sq)
                 if per_expert:
-                    norms = paddle.stack(per_expert)
-            if norms is not None:
-                norm_stats = _norm_stats(norms)
-                for name, val in norm_stats.items():
-                    self.record_layer_metric(layer_idx, name, val)
-                routed_norm_mean = norm_stats.get("expert_norm_mean")
+                    routed_sq = paddle.stack(per_expert)
 
+        shared_sq = None
         if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
+            # Shared experts are replicated, never intermediate-sharded
+            # (moe_layer builds them with the full moe_shared_expert_intermediate_size),
+            # so they stay out of the EP reduction.
             shared_sq = _module_sumsq(moe_layer.shared_experts)
-            if shared_sq is not None:
-                shared_norm = paddle.sqrt(shared_sq)
-                self.record_layer_metric(layer_idx, "shared_expert_norm", shared_norm)
-                if routed_norm_mean is not None:
-                    # clip 防止除零（对齐 megatron compute_shared_routed_ratio），保持 GPU 张量无 D2H
-                    self.record_layer_metric(
-                        layer_idx, "shared_routed_ratio", shared_norm / routed_norm_mean.clip(min=1e-8)
-                    )
+
+        return routed_sq, shared_sq, shard_group
+
+    def _record_expert_metrics(self, layer_idx, routed_sq, shared_sq):
+        routed_norm_mean = None
+        if routed_sq is not None:
+            norm_stats = _norm_stats(paddle.sqrt(routed_sq))
+            for name, val in norm_stats.items():
+                self.record_layer_metric(layer_idx, name, val)
+            routed_norm_mean = norm_stats.get("expert_norm_mean")
+
+        if shared_sq is not None:
+            shared_norm = paddle.sqrt(shared_sq)
+            self.record_layer_metric(layer_idx, "shared_expert_norm", shared_norm)
+            if routed_norm_mean is not None:
+                # clip 防止除零（对齐 megatron compute_shared_routed_ratio），保持 GPU 张量无 D2H
+                self.record_layer_metric(
+                    layer_idx, "shared_routed_ratio", shared_norm / routed_norm_mean.clip(min=1e-8)
+                )
 
     def remove_hooks(self):
         super().remove_hooks()

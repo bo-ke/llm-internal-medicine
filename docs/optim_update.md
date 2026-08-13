@@ -1,6 +1,6 @@
 # Optimizer Update Monitor (`optim/*`)
 
-每个 training step 上报三个标量，与 grad norm / param norm 并排读：
+每 `monitor_interval` 步上报三个标量，与 grad norm / param norm 并排读：
 
 | 指标 | 公式 | 含义 |
 |---|---|---|
@@ -8,10 +8,14 @@
 | `optim/param_rms` | `sqrt(mean(θ_new²))` | 更新后的参数尺度 |
 | `optim/update_param_ratio` | `update_rms / param_rms` | trust ratio，健康量级 ~1e-3 |
 
-**始终开启，没有配置开关，也不需要调用方多写一行**：它在 `_ALWAYS_ON_MONITORS` 里而不在
+**始终装上，没有开关，也不需要调用方多写一行**：它在 `_ALWAYS_ON_MONITORS` 里而不在
 `_MONITOR_MAP` 里，因此 `setup_internal_medicine` / `setup_monitors` 无论 `monitors` 传什么
-都会装上它；不是 `internal_medicine_monitors` 的一项，也不受
-`internal_medicine_monitor_interval` 门控。每 step 都算，随 `logger.log_interval` 打印。
+都会装上它，不需要在 `internal_medicine_monitors` 里点名。
+
+**上报频率受 `internal_medicine_monitor_interval` 门控**，与模型侧 monitor 一致：这三个都是
+慢变量（实测 50 步内 `param_rms` 一位不变），每 step 报一次只会刷屏，还要多付两次 collective。
+门开在 **wrapper 里**而不只是上报时，所以未被监控的 step 上连和都不算 —— wrapper 只多一次布尔
+判断，`step()` 里的 collective 也完全不发起。
 
 指标 key 前缀是 `optim/`，而 `monitor_dict` 的 key 也是 `optim` —— 两者刻意一致，这样调用方
 "遍历 `monitor_dict` key 当 prefix 打印 `training_logs`" 的既有循环就会自动带上这三个值，

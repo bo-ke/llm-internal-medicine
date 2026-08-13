@@ -1107,6 +1107,83 @@ class MegatronOptimUpdateMonitorTest(unittest.TestCase):
         finally:
             monitor.remove_hooks()
 
+    # ---------------- monitor_interval gating ----------------
+
+    def test_reports_only_on_monitored_steps(self):
+        """With monitor_interval=3 only every 3rd step reports. These are slow-moving
+        scalars, so per-step reporting is just log noise plus two collectives."""
+        torch.manual_seed(20)
+        opt = _FakeDistOpt(torch.randn(8192) * 0.02)
+        monitor = OptimUpdateMonitor(monitor_interval=3)
+        monitor.attach_optimizer(opt)
+        reported = []
+        try:
+            for _ in range(7):
+                opt.apply_update(torch.randn(8192) * 3e-4)
+                opt._copy_main_params_to_model_params()
+                reported.append(bool(monitor.step()))
+        finally:
+            monitor.remove_hooks()
+        # step_count runs 0,1,..; the gate fires when count % 3 == 0, i.e. steps 1, 4, 7.
+        self.assertEqual(reported, [True, False, False, True, False, False, True])
+
+    def test_skipped_step_does_no_work_at_all(self):
+        """The gate lives in the WRAPPER, not just at report time: on a skipped step
+        nothing is accumulated, so there is no sum to reduce and no collective to issue."""
+        torch.manual_seed(21)
+        opt = _FakeDistOpt(torch.randn(4096) * 0.02)
+        monitor = OptimUpdateMonitor(monitor_interval=5)
+        monitor.attach_optimizer(opt)
+        try:
+            monitor.step_count = 2  # 2 % 5 != 0 -> unmonitored
+            opt.apply_update(torch.randn(4096) * 3e-4)
+            opt._copy_main_params_to_model_params()
+            self.assertEqual(monitor._pending_dense, [], "wrapper must not accumulate")
+            self.assertEqual(monitor._pending_expert, [])
+            self.assertEqual(monitor.step(), {})
+            self.assertEqual(training_logs.get_latest(prefix="optim"), {})
+        finally:
+            monitor.remove_hooks()
+
+    def test_copy_back_still_happens_on_skipped_steps(self):
+        """Gating must never change the model: the real copy has to run either way."""
+        torch.manual_seed(22)
+        opt = _FakeDistOpt(torch.randn(2048) * 0.02)
+        monitor = OptimUpdateMonitor(monitor_interval=100)
+        monitor.attach_optimizer(opt)
+        try:
+            monitor.step_count = 7  # unmonitored
+            opt.apply_update(torch.randn(2048) * 1e-4)
+            opt._copy_main_params_to_model_params()
+            self.assertEqual(opt.copy_calls, 1)
+            self.assertTrue(torch.equal(opt.model_param, opt.main_param.to(opt.model_param.dtype)))
+        finally:
+            monitor.remove_hooks()
+
+    def test_global_step_syncs_the_gate(self):
+        """The trainer passes its own iteration via step(global_step=...); the gate must
+        follow the trainer's counter so the interval lines up with the log interval."""
+        opt = _FakeDistOpt(torch.randn(512) * 0.02)
+        monitor = OptimUpdateMonitor(monitor_interval=10)
+        monitor.attach_optimizer(opt)
+        try:
+            monitor.step(global_step=49)
+            self.assertTrue(monitor._should_monitor(), "50 % 10 == 0 -> monitored")
+            monitor.step(global_step=50)
+            self.assertFalse(monitor._should_monitor(), "51 % 10 != 0 -> skipped")
+        finally:
+            monitor.remove_hooks()
+
+    def test_setup_helper_threads_monitor_interval(self):
+        opt = _FakeDistOpt(torch.randn(512) * 0.02)
+        monitor_dict = {}
+        setup_optim_update_monitor(None, optimizer=opt, monitor_dict=monitor_dict, monitor_interval=50)
+        monitor = monitor_dict[optim_update_module.METRIC_PREFIX]
+        try:
+            self.assertEqual(monitor.monitor_interval, 50)
+        finally:
+            monitor.remove_hooks()
+
     def test_setup_helper_registers_under_the_metric_prefix(self):
         """The monitor_dict key must equal METRIC_PREFIX ("optim"), because callers print
         training_logs by iterating monitor_dict keys as metric prefixes — a mismatched key

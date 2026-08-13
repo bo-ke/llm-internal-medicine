@@ -1,6 +1,7 @@
 """Optimizer update-magnitude monitor for the Megatron backend.
 
-Emits three always-on scalars per training step, alongside grad-norm / param-norm:
+Always installed (no ``monitors`` opt-in), reported every ``monitor_interval`` steps
+alongside grad-norm / param-norm:
 
     optim/update_rms        sqrt(mean((theta_new - theta_old)**2))
     optim/param_rms         sqrt(mean(theta_new**2))
@@ -86,7 +87,9 @@ class OptimUpdateMonitor:
     ``step()`` (which runs outside any forward, so collectives are free to happen).
     """
 
-    def __init__(self, verbose: bool = False, debias_low_precision: bool = True):
+    def __init__(self, monitor_interval: int = 1, verbose: bool = False, debias_low_precision: bool = True):
+        self.monitor_interval = monitor_interval
+        self.step_count = 0
         self.verbose = verbose
         self.debias_low_precision = debias_low_precision
         self._patched: list[tuple[Any, str, Any, bool]] = []
@@ -100,6 +103,17 @@ class OptimUpdateMonitor:
         self._warned_fp32 = False
         self._warned_no_pairs = False
         self.latest: dict[str, float] = {}
+
+    def _should_monitor(self) -> bool:
+        """Same interval gate as ``BaseMonitor``, on the optimizer step counter.
+
+        Gating in the WRAPPER (not just at report time) is what makes the interval
+        actually cheap: on a skipped step no sums are computed, so the wrapper costs one
+        boolean and the collectives in ``step`` never fire.
+        """
+        if not self.monitor_interval:
+            return False
+        return self.step_count % self.monitor_interval == 0
 
     def attach_optimizer(self, optimizer) -> bool:
         """Wrap this optimizer instance's main-param copy. Returns True if any wrapped."""
@@ -187,6 +201,8 @@ class OptimUpdateMonitor:
         self._patched.append((target, method, original, was_instance_attr))
 
     def _measure_safe(self, opt) -> None:
+        if not self._should_monitor():
+            return
         try:
             self._measure(opt)
         except Exception as e:
@@ -301,16 +317,23 @@ class OptimUpdateMonitor:
     def step(self, global_step: int | None = None) -> dict[str, float]:
         """Reduce the step's sums, publish the scalars, and return them.
 
+        Advances the interval counter first (mirroring ``BaseMonitor.step``), then reports
+        only if the wrapper actually collected anything. On a skipped step the pending
+        buckets are empty, so this returns ``{}`` without issuing any collective.
+
         Main params are sharded over DP+CP by the distributed optimizer and split again
         over TP/PP, so the sums pool over the shard group and then the model-parallel
         group — mirroring ``calc_params_l2_norm``. Expert params live on different groups
         (expert-DP, then expert-TP/PP), hence the separate bucket. RMS is nonlinear in the
         sums, so all pooling happens before the division.
         """
+        if global_step is not None:
+            self.step_count = global_step
+        self.step_count += 1
         dense, self._pending_dense = self._pending_dense, []
         expert, self._pending_expert = self._pending_expert, []
         self.latest = {}
-        if not dense and not expert and not self._patched:
+        if not dense and not expert:
             return self.latest
 
         device = None
@@ -364,21 +387,26 @@ def setup_optim_update_monitor(
     model=None,
     optimizer=None,
     monitor_dict: dict | None = None,
+    monitor_interval: int = 1,
     verbose: bool = False,
     **_ignored,
 ):
-    """Enable ``optim/update_rms`` + ``param_rms``. Always on; no per-monitor kwargs.
+    """Enable ``optim/update_rms`` + ``param_rms``. Always installed; no opt-in needed.
 
     ``model`` is accepted and ignored so this can sit in the same registry as the
     model-side monitors and be driven by the same ``setup_internal_medicine`` call. With
     no ``optimizer`` given (the normal path — it does not exist at model-setup time) the
     mcore optimizer CLASSES are patched instead, which covers whatever is built later.
 
+    ``monitor_interval`` is honoured exactly like the model-side monitors: these are
+    slow-moving scalars, so reporting them every step would only add log noise and two
+    collectives per step.
+
     Registered under the ``optim`` key, matching ``METRIC_PREFIX``, so a caller that
     prints ``training_logs`` by iterating ``monitor_dict`` keys as prefixes picks these up
     with no extra wiring.
     """
-    monitor = OptimUpdateMonitor(verbose=verbose)
+    monitor = OptimUpdateMonitor(monitor_interval=monitor_interval, verbose=verbose)
     if optimizer is not None:
         monitor.attach_optimizer(optimizer)
     else:

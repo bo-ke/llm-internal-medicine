@@ -136,17 +136,38 @@ def _norm_stats(norms):
     }
 
 
+def _act_stats(act, name_prefix):
+    """L2-norm mean, abs-max, and mean of an activation tensor. Returns dict of 0-dim GPU tensors."""
+    act_f32 = act.detach().astype("float32")
+    flat = act_f32.reshape([-1, act_f32.shape[-1]])  # [tokens, hidden]
+    return {
+        f"{name_prefix}_norm": flat.norm(p=2, axis=-1).mean(),
+        f"{name_prefix}_abs_max": flat.abs().max(),
+        f"{name_prefix}_mean": flat.mean(),
+    }
+
+
 class PaddleMoEMonitor(PaddleProbe):
     METRIC_PREFIX = "moe_health"
-    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max", "expert_bias_max"}
-    MIN_AGGREGATED = {"score_sum_min", "expert_norm_min", "expert_bias_min"}
+    MAX_AGGREGATED = {
+        "score_sum_max", "expert_norm_max", "expert_bias_max",
+        "shared_act_abs_max", "routed_act_abs_max",
+        "router_scalar_max",
+    }
+    MIN_AGGREGATED = {
+        "score_sum_min", "expert_norm_min", "expert_bias_min",
+        "router_scalar_min",
+    }
 
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self._patched_gates = []
+        self._patched_moe_layers = []
         self._expert_norm_layers = []
+        self._shared_act_norm_cache: dict = {}  # layer_idx -> 0-dim GPU tensor
+        self._routed_act_norm_cache: dict = {}  # layer_idx -> 0-dim GPU tensor
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -174,6 +195,14 @@ class PaddleMoEMonitor(PaddleProbe):
                     "expert_bias_max",
                     "expert_bias_min",
                 ]
+            if hasattr(moe_layer, "gate") and hasattr(moe_layer.gate, "routed_scaling_factor_param"):
+                gate_metrics += [
+                    "router_scalar_mean",
+                    "router_scalar_std",
+                    "router_scalar_max",
+                    "router_scalar_min",
+                    "router_scalar_ratio",
+                ]
             expert_metrics = [
                 "expert_norm_mean",
                 "expert_norm_std",
@@ -182,7 +211,15 @@ class PaddleMoEMonitor(PaddleProbe):
                 "shared_expert_norm",
                 "shared_routed_ratio",
             ]
-            for m in gate_metrics + expert_metrics:
+            act_metrics = []
+            if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
+                act_metrics += ["shared_act_norm", "shared_act_abs_max", "shared_act_mean"]
+            if hasattr(moe_layer, "_post_routed_output"):
+                act_metrics += [
+                    "routed_act_norm", "routed_act_abs_max", "routed_act_mean",
+                    "shared_routed_act_ratio",
+                ]
+            for m in gate_metrics + expert_metrics + act_metrics:
                 self.declare_layer_metric(layer_idx, m)
 
         self.allocate_buffers()
@@ -193,6 +230,16 @@ class PaddleMoEMonitor(PaddleProbe):
                 self._patch_gate_cache(moe_layer.gate)
                 hook = moe_layer.gate.register_forward_post_hook(self._make_gate_hook(layer_idx, moe_layer))
                 self.hooks.append(hook)
+            # Shared expert activation hook
+            if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
+                hook = moe_layer.shared_experts.register_forward_post_hook(
+                    self._make_shared_expert_hook(layer_idx)
+                )
+                self.hooks.append(hook)
+            # Routed expert activation: patch _post_routed_output (called right
+            # after routed experts, before adding shared output — no D2H).
+            if hasattr(moe_layer, "_post_routed_output"):
+                self._patch_post_routed_output(moe_layer, layer_idx)
             # Expert weight norms are NOT collected from a forward hook: under
             # offline FP8 quant the bf16 expert weights are cleared at step
             # begin. collect_expert_norms() reads them before quant instead.
@@ -285,6 +332,61 @@ class PaddleMoEMonitor(PaddleProbe):
 
         gate._im_patched = True
         self._patched_gates.append(gate)
+
+    def _make_shared_expert_hook(self, layer_idx: int):
+        monitor = self
+
+        def hook_fn(layer, inputs, outputs):
+            if not layer.training or not monitor._should_monitor():
+                return
+            try:
+                with paddle.no_grad():
+                    # shared_experts returns (output, output_bias) or just output
+                    act = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+                    stats = _act_stats(act, "shared_act")
+                    for name, val in stats.items():
+                        monitor.record_layer_metric(layer_idx, name, val)
+                    monitor._shared_act_norm_cache[layer_idx] = stats["shared_act_norm"]
+            except Exception as e:
+                if monitor.verbose:
+                    logger.error(f"[PaddleMoEMonitor] shared_expert hook error layer {layer_idx}: {e}")
+
+        return hook_fn
+
+    def _patch_post_routed_output(self, moe_layer, layer_idx: int):
+        """Replace moe_layer._post_routed_output to capture routed expert output."""
+        original_fn = moe_layer._post_routed_output
+        monitor = self
+
+        def patched_post_routed_output(output):
+            result = original_fn(output)
+            if moe_layer.training and monitor._should_monitor():
+                try:
+                    with paddle.no_grad():
+                        stats = _act_stats(result, "routed_act")
+                        for name, val in stats.items():
+                            monitor.record_layer_metric(layer_idx, name, val)
+                        # ratio: shared_act_norm / routed_act_norm (filled after shared hook runs)
+                        monitor._routed_act_norm_cache[layer_idx] = stats["routed_act_norm"]
+                except Exception as e:
+                    if monitor.verbose:
+                        logger.error(f"[PaddleMoEMonitor] _post_routed_output patch error layer {layer_idx}: {e}")
+            return result
+
+        moe_layer._im_original_post_routed_output = original_fn
+        moe_layer._post_routed_output = patched_post_routed_output
+        self._patched_moe_layers.append(moe_layer)
+
+    def _flush_act_ratio(self):
+        """After both shared and routed hooks have run, record the norm ratio."""
+        for layer_idx in list(self._routed_act_norm_cache):
+            routed_norm = self._routed_act_norm_cache.pop(layer_idx)
+            shared_norm = self._shared_act_norm_cache.pop(layer_idx, None)
+            if shared_norm is not None:
+                ratio = shared_norm / routed_norm.clip(min=1e-8)
+                self.record_layer_metric(layer_idx, "shared_routed_act_ratio", ratio)
+        # clear any leftover shared-only entries
+        self._shared_act_norm_cache.clear()
 
     def _find_moe_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer]]:
         def has_moe(layer):
@@ -418,6 +520,16 @@ class PaddleMoEMonitor(PaddleProbe):
             self.record_layer_metric(layer_idx, "expert_bias_max", bias.max())
             self.record_layer_metric(layer_idx, "expert_bias_min", bias.min())
 
+        if hasattr(gate, "routed_scaling_factor_param"):
+            scalar = gate.routed_scaling_factor_param.detach().astype("float32")  # [num_experts]
+            self.record_layer_metric(layer_idx, "router_scalar_mean", scalar.mean())
+            self.record_layer_metric(layer_idx, "router_scalar_std", scalar.std())
+            self.record_layer_metric(layer_idx, "router_scalar_max", scalar.max())
+            self.record_layer_metric(layer_idx, "router_scalar_min", scalar.min())
+            self.record_layer_metric(
+                layer_idx, "router_scalar_ratio", scalar.max() / scalar.min().clip(min=1e-8)
+            )
+
     def _collect_expert_sumsq(self, moe_layer):
         """Per-expert / shared-expert sums of squares for one MoE layer.
 
@@ -497,9 +609,20 @@ class PaddleMoEMonitor(PaddleProbe):
                 if hasattr(gate, attr):
                     delattr(gate, attr)
         self._patched_gates = []
+        for moe_layer in self._patched_moe_layers:
+            original_fn = getattr(moe_layer, "_im_original_post_routed_output", None)
+            if original_fn is not None:
+                moe_layer._post_routed_output = original_fn
+            for attr in ("_im_original_post_routed_output",):
+                if hasattr(moe_layer, attr):
+                    delattr(moe_layer, attr)
+        self._patched_moe_layers = []
         self._expert_norm_layers = []
+        self._shared_act_norm_cache.clear()
+        self._routed_act_norm_cache.clear()
 
     def step(self):
+        self._flush_act_ratio()
         super().step()
 
 

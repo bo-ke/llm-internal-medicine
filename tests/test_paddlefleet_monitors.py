@@ -265,17 +265,37 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/global_full_router_entropy"], 3.0, places=4)
         self.assertNotIn("moe_health/global_router_entropy", latest)
 
-    def test_fused_expert_norm_matches_per_expert_concat_norm(self):
-        """Vectorized per-expert norm equals the old concat([w1_i, w2_i]).norm()."""
+    def test_fused_expert_sumsq_matches_per_expert_concat_norm(self):
+        """Vectorized per-expert sum-of-squares sqrts to the old concat([w1_i, w2_i]).norm()."""
         moe_monitor_mod = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
         num_experts, h, i = 4, 8, 6
         w1 = paddle.randn([num_experts, h, i], dtype="float32")
         w2 = paddle.randn([num_experts, i, h], dtype="float32")
 
-        got = moe_monitor_mod._per_expert_stacked_norms(w1, w2)
+        got = paddle.sqrt(moe_monitor_mod._per_expert_stacked_sumsq(w1, w2))
         expected = paddle.stack([paddle.concat([w1[e].flatten(), w2[e].flatten()]).norm() for e in range(num_experts)])
         self.assertEqual(list(got.shape), [num_experts])
         self.assertTrue(bool(paddle.allclose(got, expected, atol=1e-5)))
+
+    def test_intermediate_shard_group_detects_allgather_layout(self):
+        """An expert module holding only I/EP of each expert reports its EP group."""
+        moe_monitor_mod = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
+        ep_group = object()
+
+        replicated = SimpleNamespace(
+            intermediate_size_per_partition=2048,
+            config=SimpleNamespace(moe_intermediate_size=2048),
+            ep_group=ep_group,
+        )
+        self.assertIsNone(moe_monitor_mod._intermediate_shard_group(replicated))
+
+        sharded = SimpleNamespace(
+            intermediate_size_per_partition=256,
+            config=SimpleNamespace(moe_intermediate_size=2048),
+            ep_group=ep_group,
+        )
+        self.assertIs(moe_monitor_mod._intermediate_shard_group(sharded), ep_group)
+        self.assertIsNone(moe_monitor_mod._intermediate_shard_group(None))
 
     def test_collect_expert_norms_fused_layout_records_metrics(self):
         """collect_expert_norms records expert + shared norms for a fused-expert MoE layer."""

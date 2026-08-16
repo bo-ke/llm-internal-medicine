@@ -167,8 +167,6 @@ class TrainingLogs:
     def gather_and_aggregate(self):
         """Gather metrics from all ranks and aggregate by naming convention."""
         all_metrics = self.get_latest()
-        if not all_metrics:
-            return {}
 
         gather_fn = getattr(self, "_gather_fn", None)
         if gather_fn is None:

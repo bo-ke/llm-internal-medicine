@@ -163,9 +163,10 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
         self.assertIsNone(result[0].attn_type)
 
     def test_iter_monitor_layers_marks_unwrapped_mtp_layer(self):
-        main_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False))
-        mtp_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False))
-        mtp_wrapper = SimpleNamespace(transformer_layer=mtp_layer)
+        config = SimpleNamespace(num_hidden_layers=1)
+        main_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), config=config)
+        mtp_layer = SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), config=config)
+        mtp_wrapper = SimpleNamespace(transformer_layer=mtp_layer, config=config)
 
         result = layer_discovery.iter_monitor_layers(
             [main_layer, mtp_wrapper],
@@ -174,6 +175,57 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
 
         self.assertEqual([item.idx for item in result], [0, 1])
         self.assertEqual([item.is_mtp for item in result], [False, True])
+
+    def test_resolve_layer_idx_strips_head_empty_layer_offset(self):
+        """PaddleFleet sets layer_number = logical_idx + num_empty_layers_add_in_head."""
+        config = SimpleNamespace(num_empty_layers_add_in_head=2)
+        layer = SimpleNamespace(layer_number=5, config=config)
+        self.assertEqual(layer_discovery.resolve_layer_idx(layer, 0, 4), 3)
+
+        # No head empty layers (the common case) keeps the raw number.
+        plain = SimpleNamespace(layer_number=5, config=SimpleNamespace())
+        self.assertEqual(layer_discovery.resolve_layer_idx(plain, 0, 4), 5)
+
+        # Explicit logical attrs win and are never offset.
+        self.assertEqual(
+            layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9
+        )
+
+    def test_mtp_layer_idx_is_absolute_not_max_of_local_main_layers(self):
+        """On a PP stage holding a partial stack, MTP must not be numbered max(local)+1."""
+        config = SimpleNamespace(num_hidden_layers=43)
+        # Last pipeline stage: only layers 36..37 of a 43-layer model, plus MTP.
+        main_layers = [
+            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config)
+            for n in (36, 37)
+        ]
+        mtp_wrapper = SimpleNamespace(
+            transformer_layer=SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), config=config),
+            layer_number=0,
+            config=config,
+        )
+
+        result = layer_discovery.iter_monitor_layers(
+            [*main_layers, mtp_wrapper], lambda layer: hasattr(layer, "self_attn")
+        )
+
+        self.assertEqual([item.idx for item in result], [36, 37, 43])
+        self.assertEqual([item.is_mtp for item in result], [False, False, True])
+
+    def test_mtp_layer_idx_is_absolute_when_no_main_layer_matched(self):
+        """The degenerate 'nothing matched' case must not produce id 0."""
+        config = SimpleNamespace(num_hidden_layers=43)
+        mtp_wrapper = SimpleNamespace(
+            transformer_layer=SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), config=config),
+            layer_number=0,
+            config=config,
+        )
+
+        result = layer_discovery.iter_monitor_layers(
+            [SimpleNamespace(), mtp_wrapper], lambda layer: hasattr(layer, "self_attn")
+        )
+
+        self.assertEqual([item.idx for item in result], [43])
 
 
 class PaddleMoEMonitorTest(unittest.TestCase):

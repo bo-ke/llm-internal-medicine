@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -195,13 +198,42 @@ def classify_attn_type(layer) -> str | None:
     return attn_meta(layer)[0]
 
 
+def _layer_config(layer):
+    """Return the ``TransformerConfig`` of a layer or of the layer it wraps."""
+    config = getattr(layer, "config", None)
+    if config is None:
+        config = getattr(getattr(layer, "transformer_layer", None), "config", None)
+    return config
+
+
+def _head_offset(layer) -> int:
+    """``num_empty_layers_add_in_head`` of the stack this layer belongs to."""
+    offset = getattr(_layer_config(layer), "num_empty_layers_add_in_head", 0) or 0
+    return offset if isinstance(offset, int) else 0
+
+
 def resolve_layer_idx(layer, local_idx: int, num_local_layers: int, pp_rank: int = 0, layer_offset: int = 0) -> int:
     """Resolve a PaddleFleet metric layer id without converting 0-based ids."""
-    for attr in ("layer_idx", "layer_index", "idx", "layer_number"):
+    for attr in ("layer_idx", "layer_index", "idx"):
         value = getattr(layer, attr, None)
         if isinstance(value, int):
             return value
+    layer_number = getattr(layer, "layer_number", None)
+    if isinstance(layer_number, int):
+        return layer_number - _head_offset(layer)
     return pp_rank * num_local_layers + layer_offset + local_idx
+
+
+def _absolute_mtp_idx(wrapper, layer, mtp_local_idx: int) -> int | None:
+    """Absolute metric id of an MTP layer, or ``None`` when undeterminable."""
+    config = _layer_config(wrapper) or _layer_config(layer)
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+        return None
+    local = getattr(wrapper, "layer_number", None)
+    if not isinstance(local, int) or local < 0:
+        local = mtp_local_idx
+    return num_hidden_layers + local
 
 
 def iter_monitor_layers(
@@ -245,12 +277,20 @@ def iter_monitor_layers(
         idx = resolve_layer_idx(layer, local_idx, num_main_layers, pp_rank=pp_rank, layer_offset=layer_offset)
         monitor_layers.append(_make(idx, layer, False))
 
-    next_mtp_idx = max((item.idx for item in monitor_layers), default=layer_offset - 1) + 1
     for mtp_idx, wrapper in enumerate(mtp_wrappers):
         layer = unwrap_mtp_layer(wrapper)
         if not matches(layer):
             continue
-        idx = next_mtp_idx + mtp_idx
+        idx = _absolute_mtp_idx(wrapper, layer, mtp_idx)
+        if idx is None:
+            logger.warning(
+                "Skipping MTP metric layer: num_hidden_layers is unavailable, so no "
+                "layout-independent id can be assigned. Deriving one from the main layer ids "
+                "present on this rank would silently mislabel it (that rule collapses to id 0 "
+                "when no main layer matched), so no metric is emitted for this layer."
+            )
+            continue
         monitor_layers.append(_make(idx, layer, True))
 
     return monitor_layers
+

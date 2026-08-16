@@ -59,6 +59,29 @@ class CoreMonitoringTest(unittest.TestCase):
         self.assertEqual(latest["dummy/global_common"], 4.0)
         self.assertEqual(latest["dummy/global_sparse"], 4.0)
 
+    def test_gather_is_collective_even_when_this_rank_has_no_metrics(self):
+        """A PP stage with no monitored layer must still enter the gather.
+
+        ``_gather_fn`` wraps ``all_gather_object``; skipping it on an empty rank
+        hangs every other rank in the collective (observed as a PP=4 deadlock).
+        """
+        calls = []
+
+        def fake_gather(local_metrics):
+            calls.append(dict(local_metrics))
+            # Pretend another rank reported one layer.
+            return [local_metrics, {"dummy/layer_0/mean": 4.0}]
+
+        training_logs.set_gather_fn(fake_gather)
+        try:
+            self.assertEqual(training_logs.get_latest(), {})
+            aggregated = training_logs.gather_and_aggregate()
+        finally:
+            training_logs.set_gather_fn(None)
+
+        self.assertEqual(calls, [{}], "gather_fn must be called even with no local metrics")
+        self.assertEqual(aggregated, {"dummy/layer_0/mean": 4.0})
+
     def test_log_flags_are_respected(self):
         probe = DummyProbe(log_per_layer=False, log_global=True)
         probe._record_metrics(0, {"mean": 2.0})

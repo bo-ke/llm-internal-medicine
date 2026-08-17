@@ -200,7 +200,7 @@ setup_internal_medicine()
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
-| 1 | `max` | `qk_stats/.../max` | `max(Q·K^T/√d)` | 每层+全局 | Logit 最大值，数值稳定性 |
+| 1 | `max` | `qk_stats/.../max` | `max(sQ·K^T)` | 每层+全局 | Logit 最大值，数值稳定性 |
 | 2 | `mean` | `qk_stats/.../mean` | `mean(valid_logits)` | 每层+全局 | Logit 基准量级 |
 | 3 | `entropy_avg` | `qk_stats/.../entropy_avg` | `-Σ(p·log(p))` 均值 | 每层+全局 | 注意力集中度 |
 | 4 | `sink` | `qk_stats/.../sink` | `mean(softmax[..., 0])` | 每层+全局 | Token-0 注意力权重 |
@@ -210,6 +210,8 @@ setup_internal_medicine()
 | 8 | `sink_head_max` | `qk_stats/.../sink_head_max` | `max(sink_per_head)` | 每层+全局 | 最强 sink head 权重 |
 | 9 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
 | 10 | `attn_sink_logit` | `qk_stats/.../attn_sink_logit` | `mean(sink_logit)` | 每层+全局 | learned sink logit 量级漂移；稀疏层取 `attn_sink`，full 层取 `softmax_offset` |
+
+其中 `s` 取 attention 层运行时的 `softmax_scale`；未显式设置时回退为 `1 / sqrt(head_dim)`。
 
 > **learnable / off-by-one softmax 的 sink 折叠**：当 `core_attention.softmax_offset`
 > 存在时（`softmax_type` 为 `learnable` / `off-by-one`），`entropy_avg` / `sink` 会把这个

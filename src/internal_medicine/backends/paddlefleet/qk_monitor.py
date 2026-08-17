@@ -113,6 +113,7 @@ def _compute_qk_stats_triton(
     row_stride: int = 1,
     q_row_offset: int = 0,
     attn_sink: paddle.Tensor | None = None,
+    softmax_scale: float | None = None,
 ) -> dict:
     """Triton kernel path for paddle tensors.
 
@@ -132,7 +133,7 @@ def _compute_qk_stats_triton(
 
     batch, num_heads, seq_len_q, head_dim = q.shape
     seq_len_k = k.shape[2]
-    scale = 1.0 / (head_dim**0.5)
+    scale = 1.0 / (head_dim**0.5) if softmax_scale is None else float(softmax_scale)
 
     BLOCK_M = 64
     BLOCK_N = 64
@@ -223,6 +224,7 @@ def compute_qk_stats_paddle(
     row_stride: int = 1,
     q_row_offset: int = 0,
     attn_sink: paddle.Tensor | None = None,
+    softmax_scale: float | None = None,
 ) -> dict:
     """Compute QK stats via Triton kernel.
 
@@ -238,6 +240,8 @@ def compute_qk_stats_paddle(
             ``core_attention.softmax_offset`` whenever it exists — without it the
             reported distribution is renormalised over the real keys only and does
             not match what the model computes.
+        softmax_scale: runtime scale applied to ``QK^T`` by the attention layer.
+            ``None`` preserves the standard ``1 / sqrt(head_dim)`` default.
 
     The [B, S, H, D] -> [B, H, S, D] reordering is expressed via strides
     (no contiguous copy); the triton kernel reads strided memory directly.
@@ -262,6 +266,7 @@ def compute_qk_stats_paddle(
         row_stride=row_stride,
         q_row_offset=q_row_offset,
         attn_sink=attn_sink,
+        softmax_scale=softmax_scale,
     )
 
 
@@ -810,6 +815,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
                         row_stride=effective_stride,
                         q_row_offset=q_row_offset,
                         attn_sink=None if sink_logit is None else sink_logit.detach().astype("float32"),
+                        softmax_scale=getattr(layer, "softmax_scale", None),
                     )
 
                     if self.cp_size > 1 and self.cp_group is not None:

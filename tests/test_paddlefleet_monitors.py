@@ -187,17 +187,14 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
         self.assertEqual(layer_discovery.resolve_layer_idx(plain, 0, 4), 5)
 
         # Explicit logical attrs win and are never offset.
-        self.assertEqual(
-            layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9
-        )
+        self.assertEqual(layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9)
 
     def test_mtp_layer_idx_is_absolute_not_max_of_local_main_layers(self):
         """On a PP stage holding a partial stack, MTP must not be numbered max(local)+1."""
         config = SimpleNamespace(num_hidden_layers=43)
         # Last pipeline stage: only layers 36..37 of a 43-layer model, plus MTP.
         main_layers = [
-            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config)
-            for n in (36, 37)
+            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config) for n in (36, 37)
         ]
         mtp_wrapper = SimpleNamespace(
             transformer_layer=SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), config=config),
@@ -774,6 +771,67 @@ class PaddleQKKernelComputeTest(unittest.TestCase):
                 paddle.allclose(grouped[key], expanded[key], atol=1e-4, rtol=1e-4).item(),
                 f"{key} mismatch: grouped={grouped[key].item()} expanded={expanded[key].item()}",
             )
+
+    def test_nondefault_softmax_scale_matches_dense_reference(self):
+        q, k = self._gqa_inputs(B=1, S=64, Hq=4, Hkv=4, D=16, seed=17)
+        scale = 0.137
+
+        actual = self.qk.compute_qk_stats_paddle(q, k, causal=True, softmax_scale=scale)
+
+        qh = q.transpose([0, 2, 1, 3])
+        kh = k.transpose([0, 2, 1, 3])
+        logits = paddle.matmul(qh, kh, transpose_y=True) * scale
+        causal = paddle.tril(paddle.ones([q.shape[1], k.shape[1]], dtype="bool"))
+        masked_logits = paddle.where(causal, logits, paddle.full_like(logits, -1e10))
+        probability = paddle.nn.functional.softmax(masked_logits, axis=-1)
+        entropy = -(probability * paddle.log(probability.clip(min=1e-30))).sum(axis=-1)
+
+        self.assertTrue(paddle.allclose(actual["max_global"], masked_logits.max(), atol=5e-3, rtol=1e-4).item())
+        self.assertTrue(paddle.allclose(actual["entropy_global"], entropy.mean(), atol=1e-3, rtol=1e-4).item())
+        self.assertTrue(paddle.allclose(actual["sink_global"], probability[..., 0].mean(), atol=1e-4, rtol=1e-4).item())
+
+    def test_monitor_hook_uses_core_attention_runtime_scale(self):
+        class CoreAttention(nn.Layer):
+            def __init__(self, softmax_scale):
+                super().__init__()
+                self.softmax_scale = softmax_scale
+
+            def forward(self, query, key, value):
+                return value
+
+        class Attention(nn.Layer):
+            def __init__(self, softmax_scale):
+                super().__init__()
+                self.core_attention = CoreAttention(softmax_scale)
+
+        class TransformerLayer(nn.Layer):
+            def __init__(self, softmax_scale):
+                super().__init__()
+                self.layer_idx = 0
+                self.self_attn = Attention(softmax_scale)
+
+        class Model(nn.Layer):
+            def __init__(self, softmax_scale):
+                super().__init__()
+                self.layers = nn.LayerList([TransformerLayer(softmax_scale)])
+
+        scale = 0.173
+        q, k = self._gqa_inputs(B=1, S=32, Hq=2, Hkv=2, D=16, seed=23)
+        value = paddle.randn(q.shape, dtype="float32")
+        reference = self.qk.compute_qk_stats_paddle(q, k, causal=True, softmax_scale=scale)
+        model = Model(scale)
+        monitor = PaddleQKStatsMonitor()
+        monitor.register_hooks(model)
+        training_logs.reset()
+
+        model.layers[0].self_attn.core_attention(q, k, value)
+        monitor.step()
+
+        metrics = training_logs.get_latest(prefix="qk_stats/layer_0/")
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/max"], float(reference["max_global"]), places=3)
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/entropy_avg"], float(reference["entropy_global"]), places=3)
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/sink"], float(reference["sink_global"]), places=4)
+        monitor.remove_hooks()
 
     def test_row_stride_is_near_unbiased_for_mean_class_metrics(self):
         """Subsampling query rows must keep the row-averaged metrics close to

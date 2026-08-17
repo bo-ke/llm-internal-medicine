@@ -48,6 +48,21 @@ from .massive_activation_metrics import (
 
 logger = logging.getLogger(__name__)
 
+_POSITIONS = ("layer_input", "attn_out", "post_attn_residual", "ffn_or_moe_out", "post_ffn_residual")
+_POSITION_METRICS = ("rms", "abs_max", "abs_p99", "outlier_ratio")
+
+
+def _position_stats(tensor: paddle.Tensor) -> dict[str, paddle.Tensor]:
+    value = tensor.detach().astype("float32")
+    absolute = value.abs()
+    rms = paddle.sqrt(value.square().mean())
+    return {
+        "rms": rms,
+        "abs_max": absolute.max(),
+        "abs_p99": paddle.quantile(absolute.reshape([-1]), 0.99),
+        "outlier_ratio": (absolute > 10.0 * rms.clip(min=1e-10)).astype("float32").mean(),
+    }
+
 
 class PaddleMassiveActivationMonitor(PaddleProbe):
     """Monitor massive activations in the residual stream.
@@ -66,7 +81,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         "topk_channel_norm",
         "activation_rms",
         "massive_act_channel_count",
-    }
+    } | {f"{position}_{metric}" for position in _POSITIONS for metric in ("rms", "abs_max", "abs_p99")}
 
     def __init__(
         self,
@@ -103,6 +118,11 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         self._warned_per_channel_aggregate = False
         self._post_norm_failed_layers: set[int] = set()
         self._hc_aggregate_failed_layers: set[int] = set()
+        self._position_cache: dict[int, dict[str, paddle.Tensor]] = {}
+
+    def step(self):
+        super().step()
+        self._position_cache.clear()
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -159,12 +179,14 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             "post_norm_sparsity",
             "post_norm_cosine",
         ] + [f"channel_count_gt_{_threshold_key(t)}" for t in self.absolute_thresholds]
+        position_metric_names = [f"{position}_{metric}" for position in _POSITIONS for metric in _POSITION_METRICS]
+        update_metric_names = ["attn_update_rms_ratio", "ffn_update_rms_ratio"]
 
         registered = 0
         for item in monitor_layers:
             if self.sample_layers and item.idx not in self.sample_layers:
                 continue
-            for m in metric_names:
+            for m in metric_names + position_metric_names + update_metric_names:
                 self.declare_layer_metric(item.idx, m, attn_type=item.attn_type)
             registered += 1
 
@@ -176,7 +198,35 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             hook = item.layer.register_forward_pre_hook(self._make_residual_hook(item.idx, item.attn_type))
             self.hooks.append(hook)
 
-        logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
+            attn = getattr(item.layer, "self_attn", None) or getattr(item.layer, "self_attention", None)
+            if attn is not None:
+                self.hooks.append(
+                    attn.register_forward_post_hook(self._make_branch_output_hook(item.idx, "attn_out", item.attn_type))
+                )
+
+            post_attn_boundary = getattr(item.layer, "mlp_hyper_connection", None)
+            if post_attn_boundary is None:
+                post_attn_boundary = getattr(item.layer, "post_attention_layernorm", None)
+            if post_attn_boundary is not None:
+                self.hooks.append(
+                    post_attn_boundary.register_forward_pre_hook(
+                        self._make_post_attn_residual_hook(item.idx, item.attn_type)
+                    )
+                )
+
+            ffn = getattr(item.layer, "mlp", None) or getattr(item.layer, "moe", None)
+            if ffn is not None:
+                self.hooks.append(
+                    ffn.register_forward_post_hook(
+                        self._make_branch_output_hook(item.idx, "ffn_or_moe_out", item.attn_type)
+                    )
+                )
+
+            self.hooks.append(
+                item.layer.register_forward_post_hook(self._make_layer_output_hook(item.idx, item.attn_type))
+            )
+
+        logger.info(f"[MassiveActMonitor] Registered {len(self.hooks)} hooks across {registered} layers.")
 
     def _make_residual_hook(self, layer_idx: int, attn_type: str | None = None):
         def hook_fn(module, inputs):
@@ -190,10 +240,92 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
                     return
 
                 with paddle.no_grad():
+                    self._position_cache[layer_idx] = {"layer_input": hidden_states.detach()}
+                    self._record_position(layer_idx, "layer_input", hidden_states, attn_type)
                     self._compute_and_log(layer_idx, hidden_states.detach(), module, attn_type=attn_type)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MassiveActMonitor] Error at layer {layer_idx}: {e}")
+
+        return hook_fn
+
+    def _record_position(
+        self,
+        layer_idx: int,
+        position: str,
+        tensor: paddle.Tensor,
+        attn_type: str | None,
+    ) -> None:
+        for metric, value in _position_stats(tensor).items():
+            self.record_layer_metric(layer_idx, f"{position}_{metric}", value, attn_type=attn_type)
+
+    def _record_update_ratio(
+        self,
+        layer_idx: int,
+        metric_name: str,
+        before: paddle.Tensor,
+        after: paddle.Tensor,
+        attn_type: str | None,
+    ) -> None:
+        if tuple(before.shape) != tuple(after.shape):
+            return
+        before_fp32 = before.detach().astype("float32")
+        update_fp32 = after.detach().astype("float32") - before_fp32
+        ratio = paddle.sqrt(update_fp32.square().mean()) / paddle.sqrt(before_fp32.square().mean()).clip(min=1e-30)
+        self.record_layer_metric(layer_idx, metric_name, ratio, attn_type=attn_type)
+
+    def _make_branch_output_hook(self, layer_idx: int, position: str, attn_type: str | None):
+        def hook_fn(module, _inputs, outputs):
+            if not module.training or not self._should_monitor():
+                return
+            output = self._extract_output_tensor(outputs)
+            if output is None:
+                return
+            with paddle.no_grad():
+                self._record_position(layer_idx, position, output, attn_type)
+
+        return hook_fn
+
+    def _make_post_attn_residual_hook(self, layer_idx: int, attn_type: str | None):
+        def hook_fn(module, inputs):
+            if not module.training or not self._should_monitor():
+                return
+            post_attn = self._extract_hidden_states(inputs)
+            cache = self._position_cache.get(layer_idx)
+            if post_attn is None or cache is None:
+                return
+            with paddle.no_grad():
+                self._record_position(layer_idx, "post_attn_residual", post_attn, attn_type)
+                self._record_update_ratio(
+                    layer_idx,
+                    "attn_update_rms_ratio",
+                    cache["layer_input"],
+                    post_attn,
+                    attn_type,
+                )
+                cache["post_attn_residual"] = post_attn.detach()
+
+        return hook_fn
+
+    def _make_layer_output_hook(self, layer_idx: int, attn_type: str | None):
+        def hook_fn(module, _inputs, outputs):
+            if not module.training or not self._should_monitor():
+                return
+            layer_output = self._extract_output_tensor(outputs)
+            cache = self._position_cache.pop(layer_idx, None)
+            if layer_output is None or cache is None:
+                return
+            with paddle.no_grad():
+                self._record_position(layer_idx, "post_ffn_residual", layer_output, attn_type)
+                post_attn = cache.get("post_attn_residual")
+                if post_attn is not None:
+                    self._record_update_ratio(
+                        layer_idx,
+                        "ffn_update_rms_ratio",
+                        post_attn,
+                        layer_output,
+                        attn_type,
+                    )
 
         return hook_fn
 
@@ -212,6 +344,16 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             return first.get("hidden_states")
         if isinstance(first, paddle.Tensor):
             return first
+        return None
+
+    @staticmethod
+    def _extract_output_tensor(outputs):
+        if isinstance(outputs, paddle.Tensor):
+            return outputs
+        if isinstance(outputs, dict):
+            return outputs.get("hidden_states")
+        if isinstance(outputs, tuple | list) and outputs:
+            return PaddleMassiveActivationMonitor._extract_output_tensor(outputs[0])
         return None
 
     def _compute_and_log(

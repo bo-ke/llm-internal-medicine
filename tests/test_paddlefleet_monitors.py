@@ -904,6 +904,95 @@ class PaddleMassiveActivationMonitorTest(unittest.TestCase):
         self.assertEqual(latest["massive_act/global_channel_count_gt_2"], 3.0)
         self.assertEqual(latest["massive_act/global_channel_count_gt_3"], 1.0)
 
+    def test_module_position_metrics_follow_actual_residual_path(self):
+        class Branch(nn.Layer):
+            def __init__(self, scale, bias):
+                super().__init__()
+                self.scale = scale
+                self.bias = bias
+
+            def forward(self, hidden_states):
+                output = hidden_states * self.scale
+                bias = paddle.full_like(hidden_states, self.bias)
+                return output, bias
+
+        class TransformerLayer(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layer_idx = 0
+                self.input_layernorm = nn.Identity()
+                self.self_attn = Branch(scale=2.0, bias=1.0)
+                self.post_attention_layernorm = nn.Identity()
+                self.mlp = Branch(scale=-0.5, bias=-2.0)
+
+            def forward(self, hidden_states):
+                attn_out, attn_bias = self.self_attn(hidden_states)
+                post_attn = hidden_states + attn_out + attn_bias
+                mlp_input = self.post_attention_layernorm(post_attn)
+                ffn_out, ffn_bias = self.mlp(mlp_input)
+                return post_attn + ffn_out + ffn_bias
+
+        class Model(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.LayerList([TransformerLayer()])
+
+        hidden_states = paddle.to_tensor([[[1.0, 2.0], [-1.0, 0.5]]], dtype="float32")
+        expected_attn_out = 2.0 * hidden_states
+        expected_post_attn = hidden_states + expected_attn_out + 1.0
+        expected_ffn_out = -0.5 * expected_post_attn
+        expected_output = expected_post_attn + expected_ffn_out - 2.0
+        expected_attn_ratio = paddle.sqrt(((expected_post_attn - hidden_states) ** 2).mean()) / paddle.sqrt(
+            (hidden_states**2).mean()
+        )
+        expected_ffn_ratio = paddle.sqrt(((expected_output - expected_post_attn) ** 2).mean()) / paddle.sqrt(
+            (expected_post_attn**2).mean()
+        )
+
+        training_logs.reset()
+        model = Model()
+        monitor = PaddleMassiveActivationMonitor(cosine_sample_pairs=2)
+        monitor.register_hooks(model)
+        actual_output = model.layers[0](hidden_states)
+        monitor.step()
+
+        self.assertTrue(paddle.allclose(actual_output, expected_output).item())
+        metrics = training_logs.get_latest(prefix="massive_act/layer_0/")
+        for position in (
+            "layer_input",
+            "attn_out",
+            "post_attn_residual",
+            "ffn_or_moe_out",
+            "post_ffn_residual",
+        ):
+            for metric_name in ("rms", "abs_max", "abs_p99", "outlier_ratio"):
+                self.assertIn(f"massive_act/layer_0/{position}_{metric_name}", metrics)
+        self.assertAlmostEqual(
+            metrics["massive_act/layer_0/attn_out_rms"],
+            float(paddle.sqrt((expected_attn_out**2).mean())),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metrics["massive_act/layer_0/post_attn_residual_abs_max"],
+            float(expected_post_attn.abs().max()),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metrics["massive_act/layer_0/ffn_or_moe_out_rms"],
+            float(paddle.sqrt((expected_ffn_out**2).mean())),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metrics["massive_act/layer_0/post_ffn_residual_abs_max"],
+            float(expected_output.abs().max()),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metrics["massive_act/layer_0/attn_update_rms_ratio"], float(expected_attn_ratio), places=6
+        )
+        self.assertAlmostEqual(metrics["massive_act/layer_0/ffn_update_rms_ratio"], float(expected_ffn_ratio), places=6)
+        monitor.remove_hooks()
+
 
 class PaddleQKMonitorTest(unittest.TestCase):
     def test_resolve_layer_idx_uses_shared_base_logic(self):

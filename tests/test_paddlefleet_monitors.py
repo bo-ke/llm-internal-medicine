@@ -3,6 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -20,7 +21,8 @@ PaddleMassiveActivationMonitor = importlib.import_module(
 ).PaddleMassiveActivationMonitor
 PaddleMoEMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor").PaddleMoEMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
-PaddleQKStatsMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor").PaddleQKStatsMonitor
+qk_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor")
+PaddleQKStatsMonitor = qk_monitor_module.PaddleQKStatsMonitor
 paddlefleet_backend = importlib.import_module("internal_medicine.backends.paddlefleet")
 layer_discovery = importlib.import_module("internal_medicine.backends.paddlefleet.layer_discovery")
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
@@ -187,17 +189,14 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
         self.assertEqual(layer_discovery.resolve_layer_idx(plain, 0, 4), 5)
 
         # Explicit logical attrs win and are never offset.
-        self.assertEqual(
-            layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9
-        )
+        self.assertEqual(layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9)
 
     def test_mtp_layer_idx_is_absolute_not_max_of_local_main_layers(self):
         """On a PP stage holding a partial stack, MTP must not be numbered max(local)+1."""
         config = SimpleNamespace(num_hidden_layers=43)
         # Last pipeline stage: only layers 36..37 of a 43-layer model, plus MTP.
         main_layers = [
-            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config)
-            for n in (36, 37)
+            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config) for n in (36, 37)
         ]
         mtp_wrapper = SimpleNamespace(
             transformer_layer=SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), config=config),
@@ -741,6 +740,58 @@ class PaddleQKMonitorTest(unittest.TestCase):
 
     def test_row_stride_default_is_exact_full_pass(self):
         self.assertEqual(PaddleQKStatsMonitor().row_stride, 1)
+
+    def test_dense_hook_records_qkv_vector_norms(self):
+        training_logs.reset()
+
+        class CoreAttention(nn.Layer):
+            def forward(self, query, key, value):
+                return value
+
+        class Attention(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.core_attention = CoreAttention()
+
+        class TransformerLayer(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layer_idx = 0
+                self.self_attn = Attention()
+
+        class Model(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.LayerList([TransformerLayer()])
+
+        zero = paddle.zeros([1, 1], dtype="float32")
+        fake_stats = {
+            "max_global": zero.sum(),
+            "mean_global": zero.sum(),
+            "entropy_global": zero.sum(),
+            "sink_global": zero.sum(),
+            "entropy_per_head": zero,
+            "sink_per_head": zero,
+        }
+        query = paddle.to_tensor([[[[3.0, 4.0]], [[0.0, 5.0]]]], dtype="float32")
+        key = paddle.to_tensor([[[[5.0, 12.0]], [[8.0, 15.0]]]], dtype="float32")
+        value = paddle.to_tensor([[[[7.0, 24.0]], [[20.0, 21.0]]]], dtype="float32")
+        model = Model()
+        monitor = PaddleQKStatsMonitor()
+
+        with mock.patch.object(qk_monitor_module, "compute_qk_stats_paddle", return_value=fake_stats):
+            monitor.register_hooks(model)
+            model.layers[0].self_attn.core_attention(query, key, value)
+            monitor.step()
+
+        metrics = training_logs.get_latest(prefix="qk_stats/layer_0/")
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/q_norm_mean"], 5.0)
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/q_norm_max"], 5.0)
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/k_norm_mean"], 15.0)
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/k_norm_max"], 17.0)
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/v_norm_mean"], 27.0)
+        self.assertAlmostEqual(metrics["qk_stats/layer_0/v_norm_max"], 29.0)
+        monitor.remove_hooks()
 
 
 class PaddleQKKernelComputeTest(unittest.TestCase):

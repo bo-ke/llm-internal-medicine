@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
+from .gate_head_metrics import compute_gate_head_metrics
 from .sink_head_metrics import compute_sink_head_classification
 from .triton_kernels import compute_qk_stats, compute_qk_stats_packed
 
@@ -28,13 +29,31 @@ _LAYER_METRICS = (
     "sink_head_ratio",
     "sink_head_max",
     "sink_nonsink_gap",
+    # LSE / gate: the learnable softmax offset acts as a per-head logistic gate
+    # sigma(lse - beta_h), so lse and beta must be read together. Gate-side keys are
+    # only emitted when the model actually has a softmax_offset.
+    "lse",
+    "lse_std",
+    "lse_std_max_mean_ratio",
+    "gate_avg",
+    "gate_std",
+    "gate_std_max_mean_ratio",
+    "gate_max_median_ratio",
+    "gate_min_median_ratio",
 )
 
 
 class QKStatsMonitor(TorchProbe):
     METRIC_PREFIX = "qk_stats"
-    MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
-    MIN_AGGREGATED = {"entropy_min"}
+    MAX_AGGREGATED = {
+        "max",
+        "entropy_max",
+        "sink_head_max",
+        "gate_max_median_ratio",
+        "lse_std_max_mean_ratio",
+        "gate_std_max_mean_ratio",
+    }
+    MIN_AGGREGATED = {"entropy_min", "gate_min_median_ratio"}
 
     def __init__(
         self,
@@ -190,6 +209,21 @@ class QKStatsMonitor(TorchProbe):
                 sink_local = sink_per_head.mean(dim=0) if sink_per_head.dim() > 1 else sink_per_head
                 sink_class = compute_sink_head_classification(sink_local, threshold=self.sink_head_threshold)
 
+                # Head-dim reduction for lse/gate. Each is [B, H] (or [1, H] packed);
+                # collapse the batch dim first so the head statistics are per head.
+                def _heads(key):
+                    val = stats.get(key)
+                    if val is None:
+                        return None
+                    return val.mean(dim=0) if val.dim() > 1 else val
+
+                gate_stats = compute_gate_head_metrics(
+                    _heads("lse_per_head"),
+                    _heads("gate_per_head"),
+                    _heads("lse_std_per_head"),
+                    _heads("gate_std_per_head"),
+                )
+
                 self.record_layer_metric(layer_idx, "max", stats["max_global"])
                 self.record_layer_metric(layer_idx, "mean", stats["mean_global"])
                 self.record_layer_metric(layer_idx, "entropy_avg", stats["entropy_global"])
@@ -199,6 +233,8 @@ class QKStatsMonitor(TorchProbe):
                 self.record_layer_metric(layer_idx, "sink_head_ratio", sink_class["sink_head_ratio"])
                 self.record_layer_metric(layer_idx, "sink_head_max", sink_class["sink_head_max"])
                 self.record_layer_metric(layer_idx, "sink_nonsink_gap", sink_class["sink_nonsink_gap"])
+                for name, val in gate_stats.items():
+                    self.record_layer_metric(layer_idx, name, val)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[QKMonitor] Error layer {layer_idx}: {e}")

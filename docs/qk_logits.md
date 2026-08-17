@@ -1,6 +1,6 @@
 # QK Stats Monitor
 
-QK 注意力统计监控模块，监控 9 个核心指标。
+QK 注意力统计监控模块，监控 9 个核心指标，外加 8 个 learnable-softmax-offset 相关的 LSE / gate 指标。
 
 通过 Triton 优化的 Online Softmax 内核，在单次前向传播中高效计算注意力矩阵的统计特征，覆盖数值稳定性、注意力集中度和 attention sink 现象。
 
@@ -179,6 +179,62 @@ Sink heads 和非 sink heads 在 token-0 注意力权重上的差异。
 - 低 gap = 所有 head 行为相似，没有强 sink 分化
 - Gap 上升趋势 = 模型在训练中逐步强化 sink 策略
 
+---
+
+## LSE / Gate 指标（learnable softmax offset）
+
+以下 8 个指标只在模型带 learnable softmax offset（`core_attention.softmax_offset`）时完整上报；无 offset 时只有 `lse` / `lse_std` / `lse_std_max_mean_ratio` 三个 LSE 侧指标，gate 侧四个键**完全不出现**（而不是按 `β = 0` 报一个别的模型的数）。
+
+### 为什么要把 lse 和 β 一起看
+
+带 per-head offset `β_h`（等价于一个 value 为 0、logit 为 `β_h` 的 sink 列）时，attention 输出是 vanilla attention 的纯缩放：
+
+```
+õ_t = σ(ℓ_t − β_h) · o_van_t,      ℓ_t = log Σ_j exp(s_tj)
+```
+
+所以 `gate = σ(ℓ − β)` **就是**那个输出缩放系数，而 `1 − gate` 是 offset 列自己的 softmax 权重。单看 `β_h` 说明不了任何事 —— 一个 head 是否放行信号，取决于 `ℓ_t` 落在 `β_h` 的哪一侧。这也是把 `lse` 单独拉出来的原因。
+
+> **两个"sink"不是一回事。** `1 − gate` 是那个 key-less offset 列的权重；上面第 4 项 `sink` 指标测的是**真实的第一个 token**（packed 下是各序列自己的 `seq_start`）。数学推导文档里 `α̃_sink = 1 − g` 指的是前者。二者数值上无关，实测 `gate + sink` 可以是 0.88 也可以是 1.03。代码里的恒等式断言是 `gate == 1 − α_offset`（精度 ~6e-8）。
+
+### 指标定义
+
+`ℓ_t` = 第 t 个 query 行的 pure-QK log-sum-exp（**不含** offset 列），`g_t = σ(ℓ_t − β_h)`。kernel 侧先在 query 行维度上求 per-head 的均值与总体标准差，host 侧再做 head 维归约：
+
+| 指标 | 定义 | 跨 rank |
+|------|------|---------|
+| `lse` | `mean_h(mean_t(ℓ_t))` | mean |
+| `lse_std` | `mean_h(std_t(ℓ_t))` | mean |
+| `lse_std_max_mean_ratio` | `max_h(std_t(ℓ_t)) / mean_h(std_t(ℓ_t))` | max |
+| `gate_avg` | `mean_h(mean_t(g_t))` | mean |
+| `gate_std` | `mean_h(std_t(g_t))` | mean |
+| `gate_std_max_mean_ratio` | `max_h(std_t(g_t)) / mean_h(std_t(g_t))` | max |
+| `gate_max_median_ratio` | `max_h(mean_t(g_t)) / median_h(mean_t(g_t))` | max |
+| `gate_min_median_ratio` | `min_h(mean_t(g_t)) / median_h(mean_t(g_t))` | min |
+
+std 一律是**总体标准差**（`unbiased=False`），沿 query 行维度算，kernel 内用流式 `E[x²] − E[x]²` 得到（多两个 accumulator，无需二次遍历），负值 clamp 到 0 以防灾难性相消。
+
+### 为什么两个 ratio 都要
+
+`β_h` 是 per-head 学出来的，head 之间的均值掩盖了最值得抓的失效模式 —— "每个 head 半开" 和 "一半全开一半全关" 的 `gate_avg` 可以完全相同。两个 ratio 以 **median** 为分母，因此是无标度的：它们报的是 head 之间分化了多少，而不是 gate 绝对值有多低（后者随 lr 和训练阶段漂移）。二者互补：
+
+- 单个 head 死掉 → 只有 `min/median` 反映（15 个健康 head + 1 个死 head，实测 0.002）
+- 大部分 head 关闭、只剩一个主导 → 只有 `max/median` 反映（实测 19~32x）
+- 两者都接近 1.0 → head 在同步移动
+
+`torch.median` 对偶数 head 数取**较小的中位元素**（不插值），与本仓库其他地方一致。
+
+std 侧的两个 ratio 分母用的是 **mean** 而非 median，抓的是另一件事：某个 head 的 query 间开合幅度是否突然放大（例如它开始只对少数 query 放行）。
+
+### 诊断意义
+
+- `lse` 持续上涨而 `gate_avg` 不动 → `β_h` 在跟着 logit 量级一起漂，gate 的工作点没变
+- `gate_avg → 0` → 该层几乎整体关闭，输出被压到 offset 列上（等价于极端 sink）
+- `gate_avg → 1` → offset 形同不存在，退化成 vanilla attention
+- `gate_std` 很小而 `gate_avg` 居中 → gate 是个静态缩放，没在做 per-token 门控
+- 任一 ratio 偏离 1.0 且持续走高 → head 之间在分化，值得配合 per-layer 曲线定位
+
+---
 
 ## Triton 内核说明
 
@@ -210,6 +266,19 @@ s_new = s_i × α_prev + α_curr[:, 0]    (仅当 block 包含 position 0)
 entropy = log(d_i) - h_i / d_i
 sink    = s_i / d_i
 ```
+
+### LSE / Gate 的取值时机
+
+`lse` / `gate` 直接读同一套 online-softmax 状态，不需要额外遍历：
+
+```
+ℓ_t  = log(d_i) + m_i
+g_t  = σ(ℓ_t − β_h)      (仅 HAS_SINK)
+```
+
+**必须在 offset 折叠进 `d_i` 之前取。** `HAS_SINK` 分支会把 offset 列并入分母（`d_i` 被重新缩放），之后 `log(d_i) + m_i` 就不再是 `log Σ_j exp(s_j)`，`gate` 也不再是干净的 sigmoid。kernel 里 `row_lse` 的赋值位置紧邻 fold 之前，改动这段代码时不要挪动顺序。
+
+packed 路径下这一点自动成立：取值时 `d_i` / `m_i` 只覆盖 `same_seq + causal` 放行的真实 key 列，所以 `lse` 白拿了 cu_seqlens 语义（逐序列、不跨序列泄露）。packed 的 std 必须由**全局和**重组（`Σx²/n − mean²`），不能对各 M-block 的 std 求平均 —— 每个 block 只看到自己那批行，per-block std 无法通过平均池化还原。
 
 ### GQA 处理
 

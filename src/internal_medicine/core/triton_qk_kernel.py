@@ -1,7 +1,18 @@
 """Shared Triton kernel for QK attention statistics — framework-independent.
 
-Computes per-head: max logit, mean logit, entropy, sink weight
+Computes per-head: max logit, mean logit, entropy, sink weight, LSE and gate
 using online softmax (O(S) memory, no S×S materialization).
+
+``lse`` / ``gate`` come from the learnable-softmax-offset identity: a per-head
+offset ``beta_h`` (equivalently a value-0 sink token with logit ``beta_h``) makes
+the attention output a pure rescale of vanilla attention,
+
+    o_tilde = sigma(lse_t - beta_h) * o_vanilla,    lse_t = log sum_j exp(s_tj)
+
+so ``gate = sigma(lse - beta)`` IS that output scale factor and ``1 - gate`` is
+the offset column's own softmax weight. Both are read off the online-softmax
+state that already exists (``log(d_i) + m_i``), captured BEFORE the offset is
+folded in so ``lse`` stays the pure-QK log-sum-exp.
 
 Supports asymmetric Q/K sequence lengths for Context-Parallel (CP) monitoring:
 each CP rank keeps its local Q shard (``seq_len_q = S/CP``) but sees the
@@ -37,6 +48,10 @@ def qk_stats_kernel(
     mean_logits_ptr,
     entropy_ptr,
     sink_ptr,
+    lse_ptr,
+    gate_ptr,
+    lse_std_ptr,
+    gate_std_ptr,
     count_ptr,
     # Shapes
     batch,
@@ -103,6 +118,10 @@ def qk_stats_kernel(
     head_valid_count = 0.0
     head_sum_entropy = 0.0
     head_sum_sink = 0.0
+    head_sum_lse = 0.0
+    head_sum_gate = 0.0
+    head_sum_lse_sq = 0.0
+    head_sum_gate_sq = 0.0
     head_valid_rows = 0.0
 
     # Stride between consecutive visited query rows within a block.
@@ -192,6 +211,16 @@ def qk_stats_kernel(
             h_i = h_new
             s_i = s_new
 
+        # Pure-QK log-sum-exp, captured BEFORE the offset column is folded in:
+        # once HAS_SINK rescales d_i the denominator is no longer sum_j exp(s_j),
+        # and gate would stop being a clean sigmoid. gate is the per-row output
+        # scale sigma(lse - beta); it is only meaningful when an offset exists.
+        row_lse = tl.log(d_i) + m_i
+        row_gate = tl.zeros([BLOCK_M], dtype=tl.float32)
+        if HAS_SINK:
+            beta = tl.load(attn_sink_ptr + head_idx).to(tl.float32)
+            row_gate = tl.sigmoid(row_lse - beta)
+
         # Fold the per-head sink logit as an extra key-less column: it enters
         # the denominator (and entropy) but not max/mean or the sink numerator.
         # h uses the OLD d_i before d_i is rescaled (see partial kernel).
@@ -225,6 +254,10 @@ def qk_stats_kernel(
 
         head_sum_entropy += tl.sum(tl.where(row_has_data & m_mask, row_entropy, 0.0))
         head_sum_sink += tl.sum(tl.where(row_has_data & m_mask, row_sink, 0.0))
+        head_sum_lse += tl.sum(tl.where(row_has_data & m_mask, row_lse, 0.0))
+        head_sum_gate += tl.sum(tl.where(row_has_data & m_mask, row_gate, 0.0))
+        head_sum_lse_sq += tl.sum(tl.where(row_has_data & m_mask, row_lse * row_lse, 0.0))
+        head_sum_gate_sq += tl.sum(tl.where(row_has_data & m_mask, row_gate * row_gate, 0.0))
         head_valid_rows += tl.sum((row_has_data & m_mask).to(tl.float32))
 
     # Write output
@@ -238,6 +271,16 @@ def qk_stats_kernel(
     tl.store(mean_logits_ptr + out_offset, head_sum_row_mean / safe_rows)
     tl.store(entropy_ptr + out_offset, head_sum_entropy / safe_rows)
     tl.store(sink_ptr + out_offset, head_sum_sink / safe_rows)
+    mean_lse = head_sum_lse / safe_rows
+    mean_gate = head_sum_gate / safe_rows
+    # Population std over query rows, from the streamed sums:
+    # var = E[x^2] - E[x]^2, clamped at 0 against catastrophic cancellation.
+    var_lse = tl.maximum(head_sum_lse_sq / safe_rows - mean_lse * mean_lse, 0.0)
+    var_gate = tl.maximum(head_sum_gate_sq / safe_rows - mean_gate * mean_gate, 0.0)
+    tl.store(lse_ptr + out_offset, mean_lse)
+    tl.store(gate_ptr + out_offset, mean_gate)
+    tl.store(lse_std_ptr + out_offset, tl.sqrt(var_lse))
+    tl.store(gate_std_ptr + out_offset, tl.sqrt(var_gate))
     tl.store(count_ptr + out_offset, head_valid_count)
 
 
@@ -767,6 +810,10 @@ def qk_stats_packed_kernel(
     partial_count_ptr,
     partial_sum_entropy_ptr,
     partial_sum_sink_ptr,
+    partial_sum_lse_ptr,
+    partial_sum_gate_ptr,
+    partial_sum_lse_sq_ptr,
+    partial_sum_gate_sq_ptr,
     partial_valid_rows_ptr,
     # Shapes
     num_heads,
@@ -802,6 +849,8 @@ def qk_stats_packed_kernel(
         ``seq_start[m] <= n < seq_end[m]`` (no cross-sequence leakage), and
       * the attention-sink column for row m is that row's own sequence start
         ``seq_start[m]`` — NOT global token 0.
+      * ``lse`` / ``gate`` therefore also cover only that row's own sequence:
+        they are read off the online-softmax state after the same masking.
     Padding tokens carry ``seq_start == seq_end == 0`` so ``same_seq`` masks
     them out (empty valid range) and they contribute nothing.
 
@@ -909,6 +958,16 @@ def qk_stats_packed_kernel(
         h_i = h_new
         s_i = s_new
 
+    # Pure-QK log-sum-exp, captured BEFORE the offset column is folded in. d_i /
+    # m_i currently cover only real key columns, and those columns are exactly the
+    # ones same_seq + causal admitted -- so lse inherits the cu_seqlens semantics
+    # for free (per-sequence, no cross-sequence leakage).
+    row_lse = tl.log(d_i) + m_i
+    row_gate = tl.zeros([BLOCK_M], dtype=tl.float32)
+    if HAS_SINK:
+        beta = tl.load(attn_sink_ptr + head_idx).to(tl.float32)
+        row_gate = tl.sigmoid(row_lse - beta)
+
     # Fold the per-head sink logit as an extra key-less column on top of the
     # per-sequence sink column: it enters the denominator (and entropy) but not
     # max/mean or the sink numerator. h uses the OLD d_i before d_i is rescaled.
@@ -940,6 +999,10 @@ def qk_stats_packed_kernel(
     block_count = tl.sum(tl.where(m_mask, row_count_raw, 0.0))
     block_sum_entropy = tl.sum(tl.where(valid_mask, row_entropy, 0.0))
     block_sum_sink = tl.sum(tl.where(valid_mask, row_sink, 0.0))
+    block_sum_lse = tl.sum(tl.where(valid_mask, row_lse, 0.0))
+    block_sum_gate = tl.sum(tl.where(valid_mask, row_gate, 0.0))
+    block_sum_lse_sq = tl.sum(tl.where(valid_mask, row_lse * row_lse, 0.0))
+    block_sum_gate_sq = tl.sum(tl.where(valid_mask, row_gate * row_gate, 0.0))
     block_valid_rows = tl.sum(valid_mask.to(tl.float32))
 
     out_offset = head_idx * stride_p_head + pid_m * stride_p_m
@@ -950,4 +1013,8 @@ def qk_stats_packed_kernel(
     tl.store(partial_count_ptr + out_offset, block_count)
     tl.store(partial_sum_entropy_ptr + out_offset, block_sum_entropy)
     tl.store(partial_sum_sink_ptr + out_offset, block_sum_sink)
+    tl.store(partial_sum_lse_ptr + out_offset, block_sum_lse)
+    tl.store(partial_sum_gate_ptr + out_offset, block_sum_gate)
+    tl.store(partial_sum_lse_sq_ptr + out_offset, block_sum_lse_sq)
+    tl.store(partial_sum_gate_sq_ptr + out_offset, block_sum_gate_sq)
     tl.store(partial_valid_rows_ptr + out_offset, block_valid_rows)

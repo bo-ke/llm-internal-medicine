@@ -116,6 +116,41 @@ class CoreMonitoringTest(unittest.TestCase):
             self.assertTrue(training_logs._is_min_metric(key), key)
             self.assertFalse(training_logs._is_max_metric(key), key)
 
+    def test_head_dispersion_ratio_keys_aggregate_by_their_numerator(self):
+        """``*_max_*_ratio`` composes across ranks with max, ``*_min_*_ratio`` with min.
+
+        Neither ends in ``_max``/``_min``, so both need the suffix lists. The min case
+        also ends in ``median_ratio`` and must not be claimed by the max check.
+        """
+        for key in (
+            "qk_stats/layer_0/gate_max_median_ratio",
+            "qk_stats/global_gate_max_median_ratio",
+            "qk_stats/layer_0/lse_std_max_mean_ratio",
+            "qk_stats/global_gate_std_max_mean_ratio",
+        ):
+            self.assertTrue(training_logs._is_max_metric(key), key)
+            self.assertFalse(training_logs._is_min_metric(key), key)
+
+        for key in ("qk_stats/layer_0/gate_min_median_ratio", "qk_stats/global_gate_min_median_ratio"):
+            self.assertTrue(training_logs._is_min_metric(key), key)
+            self.assertFalse(training_logs._is_max_metric(key), key)
+
+        for key in ("qk_stats/global_lse", "qk_stats/global_gate_avg", "qk_stats/global_lse_std"):
+            self.assertFalse(training_logs._is_max_metric(key), key)
+            self.assertFalse(training_logs._is_min_metric(key), key)
+
+    def test_moe_load_max_median_ratio_also_matches_the_max_suffix(self):
+        """The generic suffix also catches MoE's ``load_max_median_ratio``.
+
+        Harmless: its input is already TPxCPxDP all-reduced, so every rank holds
+        the same value and max == mean. Pinned here so the coupling is visible if
+        that ever stops being true.
+        """
+        self.assertTrue(training_logs._is_max_metric("moe_health/global_load_max_median_ratio"))
+        # load_max_min_ratio does NOT match either suffix and stays on mean.
+        self.assertFalse(training_logs._is_max_metric("moe_health/global_load_max_min_ratio"))
+        self.assertFalse(training_logs._is_min_metric("moe_health/global_load_max_min_ratio"))
+
     def test_resolve_layer_idx_prefers_explicit_attrs_then_layer_number_then_offset(self):
         probe = DummyProbe()
 

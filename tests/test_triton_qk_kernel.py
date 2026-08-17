@@ -303,5 +303,175 @@ class PackedSinkFoldTest(unittest.TestCase):
         self.assertLess(tri["sink_global"].item(), 1e-2)
 
 
+class LseGateKernelTest(unittest.TestCase):
+    """LSE / gate outputs on both the dense and packed kernels.
+
+    Parity is asserted in fp32. In bf16 the PyTorch reference is the LESS accurate
+    side — it materializes bf16 logits then reduces, while the kernel accumulates in
+    fp32 — so a bf16 triton-vs-pytorch delta measures the reference, not the kernel.
+    ``test_bf16_kernel_matches_fp64_reference`` pins the kernel itself instead.
+    """
+
+    ATOL = 5e-3
+    KEYS = ("lse_per_head", "gate_per_head", "lse_std_per_head", "gate_std_per_head")
+
+    def _beta(self, num_heads=4):
+        return torch.tensor([0.5, -1.0, 2.0, 0.0], device="cuda")[:num_heads]
+
+    def _dense_fp32(self, batch=2, num_heads=4, seq_len=128, head_dim=64, seed=11):
+        torch.manual_seed(seed)
+        q = torch.randn(batch, num_heads, seq_len, head_dim, dtype=torch.float32, device="cuda")
+        k = torch.randn(batch, num_heads, seq_len, head_dim, dtype=torch.float32, device="cuda")
+        return q, k
+
+    def _dense_bf16(self, batch=1, num_heads=4, seq_len=96, head_dim=64, seed=3):
+        torch.manual_seed(seed)
+        q = torch.randn(batch, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(batch, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
+        return q, k
+
+    def _assert_heads_close(self, triton_out, ref_out, keys, tag=""):
+        for key in keys:
+            t, r = triton_out[key].float(), ref_out[key].float()
+            self.assertEqual(t.shape, r.shape, f"{tag} {key}: shape {t.shape} vs {r.shape}")
+            diff = (t - r).abs().max().item()
+            self.assertLess(diff, self.ATOL, f"{tag} {key}: maxdiff={diff:.3e}\ntriton={t}\nref={r}")
+
+    def test_dense_matches_pytorch_fp32(self):
+        q, k = self._dense_fp32()
+        beta = self._beta()
+        self._assert_heads_close(
+            compute_qk_stats_triton(q, k, causal=True, attn_sink=beta),
+            compute_qk_stats_pytorch(q, k, causal=True, attn_sink=beta),
+            self.KEYS,
+            tag="dense_fp32",
+        )
+
+    def test_packed_matches_pytorch_fp32(self):
+        torch.manual_seed(12)
+        # 50/70/72: the first boundary lands inside BLOCK_M=64, so the M-block
+        # partial reduce is exercised alongside a mid-block sequence switch.
+        q, k, cu = _make_packed_qk([50, 70, 72], num_heads=4, head_dim=64, dtype=torch.float32, seed=12)
+        qh, kh = _to_htd(q, k)
+        beta = self._beta()
+        self._assert_heads_close(
+            compute_qk_stats_triton_packed(qh, kh, cu, causal=True, attn_sink=beta),
+            compute_qk_stats_pytorch_packed(qh, kh, cu, causal=True, attn_sink=beta),
+            self.KEYS,
+            tag="packed_fp32",
+        )
+
+    def test_gate_equals_one_minus_offset_column_weight(self):
+        """``gate`` IS the offset column's complement — the defining identity.
+
+        ``1 - gate`` is the softmax weight of the key-less offset column, which is a
+        DIFFERENT column from the one the ``sink`` metric measures (that one is the
+        real first token). Asserting against a materialized softmax keeps the two
+        from being conflated again.
+
+        Inputs are bf16 on purpose: ``tl.dot`` runs fp32 inputs through TF32 (10-bit
+        mantissa, ~1e-5 logit error) whereas bf16 products are exact in the fp32
+        accumulator, so bf16 is the tighter test of the identity.
+        """
+        num_heads, head_dim = 4, 64
+        q, k = self._dense_bf16(num_heads=num_heads, head_dim=head_dim)
+        batch, _, seq_len, _ = q.shape
+        beta = self._beta(num_heads)
+
+        out = compute_qk_stats_triton(q, k, causal=True, attn_sink=beta)
+
+        logits = (q.double() @ k.double().transpose(-2, -1)) / head_dim**0.5
+        logits = logits.masked_fill(
+            torch.triu(torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool), 1), float("-inf")
+        )
+        offset_col = beta.double().reshape(1, num_heads, 1, 1).expand(batch, num_heads, seq_len, 1)
+        probs = torch.softmax(torch.cat([logits, offset_col], dim=-1), dim=-1)
+        alpha_offset = probs[..., -1].mean(-1).flatten()
+
+        gate = out["gate_per_head"].double().flatten()
+        self.assertLess((gate - (1.0 - alpha_offset)).abs().max().item(), 1e-6)
+
+    def test_bf16_kernel_matches_fp64_reference(self):
+        """The kernel accumulates in fp32, so bf16 inputs still land on fp64 truth."""
+        torch.manual_seed(0)
+        num_heads, head_dim = 4, 64
+        seq_lengths = [50, 70, 72]
+        q, k, cu = _make_packed_qk(seq_lengths, num_heads, head_dim, dtype=torch.bfloat16, seed=0)
+        qh, kh = _to_htd(q, k)
+        beta = self._beta(num_heads)
+
+        out = compute_qk_stats_triton_packed(qh, kh, cu, causal=True, attn_sink=beta)
+
+        # fp64 ground truth from the SAME bf16 inputs, one sequence at a time.
+        rows_lse = []
+        bounds = [0] + list(torch.tensor(seq_lengths).cumsum(0).tolist())
+        for i in range(len(bounds) - 1):
+            s, e = bounds[i], bounds[i + 1]
+            length = e - s
+            logits = (qh[:, s:e, :].double() @ kh[:, s:e, :].double().transpose(-2, -1)) / head_dim**0.5
+            logits = logits.masked_fill(
+                torch.triu(torch.ones(length, length, device="cuda", dtype=torch.bool), 1), float("-inf")
+            )
+            rows_lse.append(torch.logsumexp(logits, dim=-1))
+        row_lse = torch.cat(rows_lse, dim=-1)
+        row_gate = torch.sigmoid(row_lse - beta.double().reshape(num_heads, 1))
+
+        expected = {
+            "lse_per_head": row_lse.mean(-1),
+            "gate_per_head": row_gate.mean(-1),
+            "lse_std_per_head": row_lse.std(-1, unbiased=False),
+            "gate_std_per_head": row_gate.std(-1, unbiased=False),
+        }
+        for key, ref in expected.items():
+            got = out[key].double().flatten()
+            diff = (got - ref).abs().max().item()
+            self.assertLess(diff, 1e-4, f"{key}: maxdiff={diff:.3e}\ntriton={got}\nfp64={ref}")
+
+    def test_gate_keys_absent_without_offset(self):
+        q, k = self._dense_fp32()
+        for out in (
+            compute_qk_stats_triton(q, k, causal=True, attn_sink=None),
+            compute_qk_stats_pytorch(q, k, causal=True, attn_sink=None),
+        ):
+            self.assertIsNone(out["gate_per_head"])
+            self.assertIsNone(out["gate_std_per_head"])
+            # lse needs no offset to be meaningful and must survive.
+            self.assertIsNotNone(out["lse_per_head"])
+            self.assertIsNotNone(out["lse_std_per_head"])
+
+    def test_packed_lse_respects_sequence_boundaries(self):
+        """Packed LSE must cover only each row's own sequence.
+
+        Three 64-token sequences vs one 192-token sequence over identical tokens:
+        if the kernel leaked across boundaries the packed LSE would inherit the
+        longer row sums and come out strictly larger.
+        """
+        torch.manual_seed(21)
+        q, k, _ = _make_packed_qk([192], num_heads=4, head_dim=64, dtype=torch.float32, seed=21)
+        qh, kh = _to_htd(q, k)
+        split_cu = torch.tensor([0, 64, 128, 192], dtype=torch.int32, device="cuda")
+        whole_cu = torch.tensor([0, 192], dtype=torch.int32, device="cuda")
+
+        split = compute_qk_stats_triton_packed(qh, kh, split_cu, causal=True)
+        whole = compute_qk_stats_triton_packed(qh, kh, whole_cu, causal=True)
+
+        self.assertTrue(
+            (split["lse_per_head"].float() < whole["lse_per_head"].float()).all(),
+            f"split={split['lse_per_head']} whole={whole['lse_per_head']}",
+        )
+        # And the split result must equal the per-sequence reference exactly.
+        ref = compute_qk_stats_pytorch_packed(qh, kh, split_cu, causal=True)
+        self._assert_heads_close(split, ref, ("lse_per_head", "lse_std_per_head"), tag="split_vs_ref")
+
+    def test_large_offset_shuts_the_gate(self):
+        """A huge ``beta`` sends the offset column to weight ~1, so gate -> 0."""
+        q, k = self._dense_fp32()
+        num_heads = q.shape[1]
+        out = compute_qk_stats_triton(q, k, causal=True, attn_sink=torch.full((num_heads,), 50.0, device="cuda"))
+        self.assertLess(out["gate_per_head"].float().max().item(), 1e-6)
+        # A shut gate is shut on every row, so its spread over rows collapses too.
+        self.assertLess(out["gate_std_per_head"].float().max().item(), 1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()

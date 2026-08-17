@@ -29,6 +29,11 @@ massive_activation_metrics = importlib.import_module("internal_medicine.backends
 compute_sink_head_classification = importlib.import_module(
     "internal_medicine.backends.megatron.sink_head_metrics"
 ).compute_sink_head_classification
+compute_gate_head_metrics = importlib.import_module(
+    "internal_medicine.backends.megatron.gate_head_metrics"
+).compute_gate_head_metrics
+qk_monitor_module = importlib.import_module("internal_medicine.backends.megatron.qk_monitor")
+QKStatsMonitor = qk_monitor_module.QKStatsMonitor
 optim_update_module = importlib.import_module("internal_medicine.backends.megatron.optim_update_monitor")
 OptimUpdateMonitor = optim_update_module.OptimUpdateMonitor
 setup_optim_update_monitor = optim_update_module.setup_optim_update_monitor
@@ -897,6 +902,137 @@ class SinkHeadClassificationTest(unittest.TestCase):
         result = compute_sink_head_classification(torch.tensor([]), threshold=self.THRESHOLD)
         self.assertEqual(result["sink_nonsink_gap"].item(), 0.0)
         self.assertEqual(result["sink_head_ratio"].item(), 0.0)
+
+
+class GateHeadMetricsTest(unittest.TestCase):
+    """Head-dimension reduction of the per-head LSE/gate statistics.
+
+    The point of these metrics is head DISPERSION: a mean over heads cannot tell
+    "every head half open" from "half the heads open, half shut", and the second is
+    the failure worth catching.
+    """
+
+    def test_reports_all_keys_when_gate_present(self):
+        out = compute_gate_head_metrics(
+            torch.tensor([4.0, 5.0, 6.0, 5.0]),
+            torch.tensor([0.4, 0.5, 0.6, 0.5]),
+            torch.tensor([1.0, 1.0, 1.0, 1.0]),
+            torch.tensor([0.1, 0.1, 0.1, 0.1]),
+        )
+        self.assertEqual(
+            set(out),
+            {
+                "lse",
+                "lse_std",
+                "lse_std_max_mean_ratio",
+                "gate_avg",
+                "gate_std",
+                "gate_std_max_mean_ratio",
+                "gate_max_median_ratio",
+                "gate_min_median_ratio",
+            },
+        )
+        self.assertAlmostEqual(out["lse"].item(), 5.0, places=5)
+        self.assertAlmostEqual(out["gate_avg"].item(), 0.5, places=5)
+        # torch.median takes the LOWER middle element for an even count: 0.5 here.
+        self.assertAlmostEqual(out["gate_max_median_ratio"].item(), 0.6 / 0.5, places=5)
+        self.assertAlmostEqual(out["gate_min_median_ratio"].item(), 0.4 / 0.5, places=5)
+        # Uniform stds -> both dispersion ratios collapse to 1.
+        self.assertAlmostEqual(out["lse_std_max_mean_ratio"].item(), 1.0, places=5)
+        self.assertAlmostEqual(out["gate_std_max_mean_ratio"].item(), 1.0, places=5)
+
+    def test_gate_keys_omitted_without_offset(self):
+        out = compute_gate_head_metrics(torch.tensor([4.0, 5.0]), None, torch.tensor([1.0, 3.0]), None)
+        self.assertEqual(set(out), {"lse", "lse_std", "lse_std_max_mean_ratio"})
+        self.assertAlmostEqual(out["lse_std"].item(), 2.0, places=5)
+        self.assertAlmostEqual(out["lse_std_max_mean_ratio"].item(), 1.5, places=5)
+
+    def test_one_dead_head_shows_only_in_min_ratio(self):
+        gate = torch.tensor([0.5] * 15 + [0.001])
+        out = compute_gate_head_metrics(torch.zeros(16), gate)
+        self.assertAlmostEqual(out["gate_max_median_ratio"].item(), 1.0, places=5)
+        self.assertLess(out["gate_min_median_ratio"].item(), 0.01)
+
+    def test_one_dominant_head_shows_only_in_max_ratio(self):
+        gate = torch.tensor([0.02] * 15 + [0.9])
+        out = compute_gate_head_metrics(torch.zeros(16), gate)
+        self.assertGreater(out["gate_max_median_ratio"].item(), 10.0)
+        self.assertAlmostEqual(out["gate_min_median_ratio"].item(), 1.0, places=5)
+
+    def test_zero_gate_median_does_not_divide_by_zero(self):
+        out = compute_gate_head_metrics(torch.zeros(4), torch.zeros(4), torch.zeros(4), torch.zeros(4))
+        for key in ("gate_max_median_ratio", "gate_min_median_ratio", "gate_std_max_mean_ratio"):
+            self.assertTrue(math.isfinite(out[key].item()), key)
+
+    def test_empty_input_returns_nothing(self):
+        self.assertEqual(compute_gate_head_metrics(torch.tensor([]), torch.tensor([])), {})
+        self.assertEqual(compute_gate_head_metrics(None, None), {})
+
+    def test_all_outputs_are_zero_dim(self):
+        """Hot-path contract: record_* takes GPU 0-dim tensors, never Python floats."""
+        out = compute_gate_head_metrics(
+            torch.tensor([4.0, 5.0]), torch.tensor([0.4, 0.6]), torch.tensor([1.0, 2.0]), torch.tensor([0.1, 0.2])
+        )
+        for key, val in out.items():
+            self.assertIsInstance(val, torch.Tensor, key)
+            self.assertEqual(val.dim(), 0, key)
+
+
+class MegatronQKLseGateEndToEndTest(unittest.TestCase):
+    """The hook must land lse/gate in training_logs, and drop gate without an offset.
+
+    Runs the PyTorch reference path so no GPU/Triton is required.
+    """
+
+    SEQ_LEN, BATCH, HEADS, HEAD_DIM = 16, 1, 4, 8
+
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def _qk(self):
+        torch.manual_seed(7)
+        shape = (self.SEQ_LEN, self.BATCH, self.HEADS, self.HEAD_DIM)
+        return torch.randn(*shape), torch.randn(*shape)
+
+    def _run_hook(self, softmax_offset):
+        monitor = QKStatsMonitor(use_triton=False, log_per_layer=True, log_global=True)
+        for name in qk_monitor_module._LAYER_METRICS:
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor.verbose = True
+
+        core_attention = SimpleNamespace(softmax_offset=softmax_offset)
+        monitor._make_compute_hook(0)(core_attention, self._qk(), {})
+        monitor.step()
+        return training_logs.get_latest(prefix="qk_stats")
+
+    def test_records_lse_and_gate_with_offset(self):
+        latest = self._run_hook(torch.tensor([0.5, -1.0, 2.0, 0.0]))
+        for name in (
+            "lse",
+            "lse_std",
+            "lse_std_max_mean_ratio",
+            "gate_avg",
+            "gate_std",
+            "gate_std_max_mean_ratio",
+            "gate_max_median_ratio",
+            "gate_min_median_ratio",
+        ):
+            self.assertIn(f"qk_stats/layer_0/{name}", latest)
+            self.assertIn(f"qk_stats/global_{name}", latest)
+        self.assertGreater(latest["qk_stats/global_gate_avg"], 0.0)
+        self.assertLessEqual(latest["qk_stats/global_gate_avg"], 1.0)
+
+    def test_gate_keys_absent_without_offset(self):
+        latest = self._run_hook(None)
+        self.assertIn("qk_stats/layer_0/lse", latest)
+        self.assertIn("qk_stats/layer_0/lse_std", latest)
+        for name in ("gate_avg", "gate_std", "gate_max_median_ratio", "gate_min_median_ratio"):
+            self.assertNotIn(f"qk_stats/layer_0/{name}", latest)
+            self.assertNotIn(f"qk_stats/global_{name}", latest)
 
 
 class _FakeDistOpt:

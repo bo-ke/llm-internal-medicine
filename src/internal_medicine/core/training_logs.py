@@ -21,7 +21,15 @@ MAX_AGGREGATED_SUFFIXES = (
     "channel_p99",
     "activation_rms",
     "massive_act_channel_count",
+    # dispersion ratios whose numerator is a max: compose across ranks with max
+    "max_median_ratio",
+    "max_mean_ratio",
 )
+
+# Dispersion ratios whose numerator is a min. ``_ratio`` does not end in ``_min``,
+# and ``min_median_ratio`` also ends in ``median_ratio``, so the min check must be
+# consulted first (see ``_is_max_metric``).
+MIN_AGGREGATED_SUFFIXES = ("min_median_ratio",)
 
 # Absolute-threshold channel counts: the threshold is the trailing token
 # (``channel_count_gt_10``), so this cannot be a fixed suffix.
@@ -114,6 +122,10 @@ class TrainingLogs:
 
     @staticmethod
     def _is_max_metric(key: str) -> bool:
+        # min-suffix wins: "gate_min_median_ratio" also ends in "median_ratio",
+        # so the max check must not claim it.
+        if TrainingLogs._is_min_metric(key):
+            return False
         return (
             "/max" in key
             or key.endswith("_max")
@@ -123,7 +135,7 @@ class TrainingLogs:
 
     @staticmethod
     def _is_min_metric(key: str) -> bool:
-        return "/min" in key or key.endswith("_min")
+        return "/min" in key or key.endswith("_min") or key.endswith(MIN_AGGREGATED_SUFFIXES)
 
     def __getitem__(self, v):
         return self.meters[v]

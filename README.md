@@ -217,6 +217,31 @@ setup_internal_medicine()
 > （`sink` 分子与 `max` / `mean` 仍只统计真实 key）。vanilla softmax（无 offset）行为不变。
 > megatron 与 paddlefleet 两个后端语义一致。
 
+#### LSE / Gate 指标（megatron 后端，需 `softmax_offset`）
+
+带 per-head offset `β_h` 时 attention 输出是 vanilla 的纯缩放 `õ = σ(ℓ − β_h)·o_van`，其中
+`ℓ` 是 pure-QK log-sum-exp（不含 offset 列）。因此 `gate = σ(ℓ − β)` 就是输出缩放系数，
+`1 − gate` 是 offset 列自己的 softmax 权重。`β_h` 单看无意义，必须和 `ℓ` 一起读。
+
+| # | 指标 | 日志键 | 公式 | 跨 rank | 诊断意义 |
+|---|------|--------|------|---------|----------|
+| 11 | `lse` | `qk_stats/.../lse` | `mean_h(mean_t(ℓ_t))` | mean | pure-QK logit 质量的绝对量级 |
+| 12 | `lse_std` | `qk_stats/.../lse_std` | `mean_h(std_t(ℓ_t))` | mean | `ℓ` 在 query 间的波动 |
+| 13 | `lse_std_max_mean_ratio` | `qk_stats/.../lse_std_max_mean_ratio` | `max_h(std) / mean_h(std)` | max | 某 head 的 query 间波动是否失衡 |
+| 14 | `gate_avg` | `qk_stats/.../gate_avg` | `mean_h(mean_t(g_t))` | mean | 该层整体放行比例；→0 全关，→1 退化 vanilla |
+| 15 | `gate_std` | `qk_stats/.../gate_std` | `mean_h(std_t(g_t))` | mean | gate 是否真在做 per-token 门控 |
+| 16 | `gate_std_max_mean_ratio` | `qk_stats/.../gate_std_max_mean_ratio` | `max_h(std) / mean_h(std)` | max | 某 head 的开合幅度是否突然放大 |
+| 17 | `gate_max_median_ratio` | `qk_stats/.../gate_max_median_ratio` | `max_h(g) / median_h(g)` | max | 「多数关闭、一个主导」 |
+| 18 | `gate_min_median_ratio` | `qk_stats/.../gate_min_median_ratio` | `min_h(g) / median_h(g)` | min | 「单个 head 死掉」 |
+
+> **两个 "sink" 不要混。** `1 − gate` 是那个 key-less offset 列的权重；第 4 项 `sink` 指标测的是
+> **真实第一个 token**（packed 下是各序列自己的 `seq_start`）。二者数值上无关（实测 `gate + sink`
+> 可以是 0.88 也可以是 1.03）。代码中的恒等式断言是 `gate == 1 − α_offset`。
+>
+> 无 `softmax_offset` 时 gate 侧 5 个键（14~18）**完全不上报**，只保留 `lse` / `lse_std` /
+> `lse_std_max_mean_ratio`；不会按 `β = 0` 补一个别的模型的数。std 一律是总体标准差，沿 query 行维度算。
+
+
 ### 混合注意力栈的层类型标签 (attn_type)
 
 指标键会带上层类型前缀，避免不同注意力类型的统计混在同一张图里。
@@ -534,7 +559,8 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 
 ## 附录: 完整指标速查表
 
-共 50 个指标键 (13 MoE + 9 QK + 21 MassiveAct + 7 PLE)。
+共 64 个指标键 (18 MoE + 18 QK + 21 MassiveAct + 7 PLE)。QK 的 8 个 LSE/gate 键中，
+gate 侧 5 个只在模型带 `softmax_offset` 时上报。
 
 | Monitor | 指标 | 公式 | SmoothedValue 模式 | 健康信号 |
 |---------|------|------|--------------------|----------|
@@ -566,6 +592,14 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **QK** | `sink_head_max` | `max(sink_per_head)` | max | 最强 sink head |
 | **QK** | `sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | mean | Sink vs 非Sink gap |
 | **QK** | `attn_sink_logit` | `mean(sink_logit)` | mean | learned sink 量级（稀疏层 `attn_sink` / full 层 `softmax_offset`） |
+| **QK** | `lse` | `mean_h(mean_t(ℓ_t))` | mean | pure-QK LSE 量级（不含 offset 列） |
+| **QK** | `lse_std` | `mean_h(std_t(ℓ_t))` | mean | `ℓ` 的 query 间波动 |
+| **QK** | `lse_std_max_mean_ratio` | `max_h(std)/mean_h(std)` | max | 接近 1 = 各 head 波动一致 |
+| **QK** | `gate_avg` | `mean_h(σ(ℓ−β))` | mean | →0 该层全关，→1 退化 vanilla |
+| **QK** | `gate_std` | `mean_h(std_t(g_t))` | mean | 过小 = gate 只是静态缩放 |
+| **QK** | `gate_std_max_mean_ratio` | `max_h(std)/mean_h(std)` | max | 接近 1 = 各 head 开合幅度一致 |
+| **QK** | `gate_max_median_ratio` | `max_h(g)/median_h(g)` | max | 接近 1 = head 同步；高 = 单 head 主导 |
+| **QK** | `gate_min_median_ratio` | `min_h(g)/median_h(g)` | min | 接近 1 = head 同步；低 = 有 head 死掉 |
 | **MassiveAct** | `channel_max` | `max(abs(H_i))` | max | 通道峰值激活 |
 | **MassiveAct** | `channel_median` | `median(per_channel_max)` | max | 通道峰值基准量级 |
 | **MassiveAct** | `channel_p95` | `p95(per_channel_max)` | max | 高分位通道幅度 |

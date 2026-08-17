@@ -18,7 +18,11 @@ def compute_qk_stats_triton(
     """
     Compute QK statistics using optimized Triton kernel.
     Input: [B, H, S, D] (already permuted by compute_qk_stats).
-    Returns: Max Logits, Mean Logits, Entropy, Sink Weights.
+    Returns: Max Logits, Mean Logits, Entropy, Sink Weights, LSE, Gate.
+
+    ``lse`` is the pure-QK log-sum-exp (offset column excluded); ``gate`` is
+    ``sigmoid(lse - attn_sink)``, the per-row output rescale the offset induces.
+    ``gate`` is meaningless without ``attn_sink`` and is dropped by the caller then.
 
     ``attn_sink``: optional per-query-head sink logit ``[H]`` folded into the
     softmax denominator (``None`` = vanilla, real-key-only).
@@ -31,6 +35,10 @@ def compute_qk_stats_triton(
     mean_logits = torch.empty((batch, num_heads), device=q.device, dtype=torch.float32)
     entropy = torch.empty((batch, num_heads), device=q.device, dtype=torch.float32)
     sink = torch.empty((batch, num_heads), device=q.device, dtype=torch.float32)
+    lse = torch.empty((batch, num_heads), device=q.device, dtype=torch.float32)
+    gate = torch.empty((batch, num_heads), device=q.device, dtype=torch.float32)
+    lse_std = torch.empty((batch, num_heads), device=q.device, dtype=torch.float32)
+    gate_std = torch.empty((batch, num_heads), device=q.device, dtype=torch.float32)
     count = torch.empty((batch, num_heads), device=q.device, dtype=torch.float32)
 
     grid = (batch * num_heads,)
@@ -54,6 +62,10 @@ def compute_qk_stats_triton(
         mean_logits,
         entropy,
         sink,
+        lse,
+        gate,
+        lse_std,
+        gate_std,
         count,
         batch,
         num_heads,
@@ -86,6 +98,10 @@ def compute_qk_stats_triton(
         "mean_per_head": mean_logits,
         "entropy_per_head": entropy,
         "sink_per_head": sink,
+        "lse_per_head": lse,
+        "gate_per_head": gate if sink_present else None,
+        "lse_std_per_head": lse_std,
+        "gate_std_per_head": gate_std if sink_present else None,
         "max_global": max_logits.max(),
         "mean_global": mean_logits.mean(),
         "entropy_global": entropy.mean(),
@@ -97,7 +113,7 @@ def compute_qk_stats_pytorch(
     q: torch.Tensor, k: torch.Tensor, causal: bool = True, attn_sink: torch.Tensor | None = None
 ) -> dict:
     """
-    Reference PyTorch implementation including Entropy and Sink.
+    Reference PyTorch implementation including Entropy, Sink, LSE and Gate.
     Input: [B, H, S, D] (already permuted by compute_qk_stats).
 
     ``attn_sink``: optional per-query-head sink logit ``[H]`` folded in as one
@@ -147,11 +163,28 @@ def compute_qk_stats_pytorch(
     sink_probs = probs[..., 0]  # [B, H, S]
     avg_sink = sink_probs.mean(dim=-1)  # [B, H]
 
+    # LSE over REAL keys only (offset column excluded), then the induced gate.
+    row_lse = torch.logsumexp(logits.masked_fill(~valid_mask, float("-inf")), dim=-1)  # [B, H, S]
+    avg_lse = row_lse.mean(dim=-1)  # [B, H]
+    std_lse = row_lse.std(dim=-1, unbiased=False)  # population std over query rows
+    if attn_sink is not None:
+        beta = attn_sink.reshape(1, num_heads, 1).to(row_lse.dtype)
+        row_gate = torch.sigmoid(row_lse - beta)  # [B, H, S]
+        avg_gate = row_gate.mean(dim=-1)
+        std_gate = row_gate.std(dim=-1, unbiased=False)
+    else:
+        avg_gate = None
+        std_gate = None
+
     return {
         "max_per_head": max_per_head,
         "mean_per_head": mean_per_head,
         "entropy_per_head": avg_entropy,
         "sink_per_head": avg_sink,
+        "lse_per_head": avg_lse,
+        "gate_per_head": avg_gate,
+        "lse_std_per_head": std_lse,
+        "gate_std_per_head": std_gate,
         "max_global": max_per_head.max(),
         "mean_global": mean_per_head.mean(),
         "entropy_global": avg_entropy.mean(),
@@ -265,6 +298,10 @@ def compute_qk_stats_triton_packed(
     p_count = _buf()
     p_sum_entropy = _buf()
     p_sum_sink = _buf()
+    p_sum_lse = _buf()
+    p_sum_gate = _buf()
+    p_sum_lse_sq = _buf()
+    p_sum_gate_sq = _buf()
     p_valid_rows = _buf()
 
     grid = (num_heads, num_m_blocks)
@@ -285,6 +322,10 @@ def compute_qk_stats_triton_packed(
         p_count,
         p_sum_entropy,
         p_sum_sink,
+        p_sum_lse,
+        p_sum_gate,
+        p_sum_lse_sq,
+        p_sum_gate_sq,
         p_valid_rows,
         num_heads,
         total_tokens,
@@ -314,18 +355,36 @@ def compute_qk_stats_triton_packed(
     mean_per_head = p_sum_row_mean.sum(dim=1) / safe_rows
     entropy_per_head = p_sum_entropy.sum(dim=1) / safe_rows
     sink_per_head = p_sum_sink.sum(dim=1) / safe_rows
+    lse_per_head = p_sum_lse.sum(dim=1) / safe_rows
+    gate_per_head = (p_sum_gate.sum(dim=1) / safe_rows) if sink_present else None
+    # std is recombined from the GLOBAL sums (not averaged over M-blocks): each block
+    # only saw its own rows, so per-block stds cannot be pooled by averaging.
+    lse_std_per_head = (p_sum_lse_sq.sum(dim=1) / safe_rows - lse_per_head.square()).clamp_min(0).sqrt()
+    if sink_present:
+        gate_std_per_head = (p_sum_gate_sq.sum(dim=1) / safe_rows - gate_per_head.square()).clamp_min(0).sqrt()
+    else:
+        gate_std_per_head = None
 
     # Shape [1, H] to match the dense [B, H] convention consumed by the hook.
     max_per_head = max_per_head.unsqueeze(0)
     mean_per_head = mean_per_head.unsqueeze(0)
     entropy_per_head = entropy_per_head.unsqueeze(0)
     sink_per_head = sink_per_head.unsqueeze(0)
+    lse_per_head = lse_per_head.unsqueeze(0)
+    lse_std_per_head = lse_std_per_head.unsqueeze(0)
+    if gate_per_head is not None:
+        gate_per_head = gate_per_head.unsqueeze(0)
+        gate_std_per_head = gate_std_per_head.unsqueeze(0)
 
     return {
         "max_per_head": max_per_head,
         "mean_per_head": mean_per_head,
         "entropy_per_head": entropy_per_head,
         "sink_per_head": sink_per_head,
+        "lse_per_head": lse_per_head,
+        "gate_per_head": gate_per_head,
+        "lse_std_per_head": lse_std_per_head,
+        "gate_std_per_head": gate_std_per_head,
         "max_global": max_per_head.max(),
         "mean_global": mean_per_head.mean(),
         "entropy_global": entropy_per_head.mean(),
@@ -360,6 +419,10 @@ def compute_qk_stats_pytorch_packed(
     sum_row_mean = torch.zeros(num_heads, device=device)
     sum_entropy = torch.zeros(num_heads, device=device)
     sum_sink = torch.zeros(num_heads, device=device)
+    sum_lse = torch.zeros(num_heads, device=device)
+    sum_gate = torch.zeros(num_heads, device=device)
+    sum_lse_sq = torch.zeros(num_heads, device=device)
+    sum_gate_sq = torch.zeros(num_heads, device=device)
     valid_rows = torch.zeros(num_heads, device=device)
     max_per_head = torch.full((num_heads,), -1e10, device=device)
 
@@ -409,12 +472,32 @@ def compute_qk_stats_pytorch_packed(
         # sink = prob of each row's own sequence-start (local column 0)
         sum_sink += probs[..., 0].sum(dim=-1)
 
+        # LSE over this sequence's REAL keys only (offset column excluded).
+        row_lse = torch.logsumexp(logits.masked_fill(~valid_mask, float("-inf")), dim=-1)  # [H, L]
+        sum_lse += row_lse.sum(dim=-1)
+        sum_lse_sq += row_lse.square().sum(dim=-1)
+        if attn_sink is not None:
+            beta = attn_sink.reshape(num_heads, 1).to(row_lse.dtype)
+            row_gate = torch.sigmoid(row_lse - beta)
+            sum_gate += row_gate.sum(dim=-1)
+            sum_gate_sq += row_gate.square().sum(dim=-1)
+
         valid_rows += (row_count > 0).sum(dim=-1).to(valid_rows.dtype)
 
     safe_rows = valid_rows.clamp(min=1)
     mean_per_head = (sum_row_mean / safe_rows).unsqueeze(0)
     entropy_per_head = (sum_entropy / safe_rows).unsqueeze(0)
     sink_per_head = (sum_sink / safe_rows).unsqueeze(0)
+    mean_lse = sum_lse / safe_rows
+    lse_per_head = mean_lse.unsqueeze(0)
+    lse_std_per_head = (sum_lse_sq / safe_rows - mean_lse.square()).clamp_min(0).sqrt().unsqueeze(0)
+    if attn_sink is not None:
+        mean_gate = sum_gate / safe_rows
+        gate_per_head = mean_gate.unsqueeze(0)
+        gate_std_per_head = (sum_gate_sq / safe_rows - mean_gate.square()).clamp_min(0).sqrt().unsqueeze(0)
+    else:
+        gate_per_head = None
+        gate_std_per_head = None
     max_per_head = max_per_head.unsqueeze(0)
 
     return {
@@ -422,6 +505,10 @@ def compute_qk_stats_pytorch_packed(
         "mean_per_head": mean_per_head,
         "entropy_per_head": entropy_per_head,
         "sink_per_head": sink_per_head,
+        "lse_per_head": lse_per_head,
+        "gate_per_head": gate_per_head,
+        "lse_std_per_head": lse_std_per_head,
+        "gate_std_per_head": gate_std_per_head,
         "max_global": max_per_head.max(),
         "mean_global": mean_per_head.mean(),
         "entropy_global": entropy_per_head.mean(),

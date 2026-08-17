@@ -104,6 +104,48 @@ class PaddleFleetSetupTest(unittest.TestCase):
         self.assertTrue(first["dummy"].removed)
         self.assertIs(second["dummy"], created[1])
 
+    def test_setup_monitors_accepts_comma_separated_names(self):
+        enabled = []
+
+        def setup_dummy(_model, monitor_dict=None, monitor_name=None, **_kwargs):
+            enabled.append(monitor_name)
+            monitor_dict[monitor_name] = DummyMonitor()
+
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP.update(
+            {
+                "first": lambda model, **kwargs: setup_dummy(model, monitor_name="first", **kwargs),
+                "second": lambda model, **kwargs: setup_dummy(model, monitor_name="second", **kwargs),
+            }
+        )
+
+        paddlefleet_backend.setup_monitors(
+            SimpleNamespace(),
+            monitors=" first, second, first ",
+            monitor_dict={},
+        )
+
+        self.assertEqual(enabled, ["first", "second"])
+
+    def test_setup_monitors_propagates_and_cleans_setup_failure(self):
+        partial = DummyMonitor()
+
+        def setup_broken(_model, monitor_dict=None, **_kwargs):
+            monitor_dict["broken"] = partial
+            raise RuntimeError("setup failed")
+
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP["broken"] = setup_broken
+        model = SimpleNamespace()
+        monitors = {}
+
+        with self.assertRaisesRegex(RuntimeError, "setup failed"):
+            paddlefleet_backend.setup_monitors(model, monitors=["broken"], monitor_dict=monitors)
+
+        self.assertTrue(partial.removed)
+        self.assertNotIn("broken", monitors)
+        self.assertNotIn("broken", getattr(model, paddlefleet_backend._MODEL_MONITOR_ATTR))
+
 
 class PaddleLayerDiscoveryTest(unittest.TestCase):
     def test_get_decoder_layers_flattens_virtual_pipeline_chunks(self):
@@ -187,17 +229,14 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
         self.assertEqual(layer_discovery.resolve_layer_idx(plain, 0, 4), 5)
 
         # Explicit logical attrs win and are never offset.
-        self.assertEqual(
-            layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9
-        )
+        self.assertEqual(layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9)
 
     def test_mtp_layer_idx_is_absolute_not_max_of_local_main_layers(self):
         """On a PP stage holding a partial stack, MTP must not be numbered max(local)+1."""
         config = SimpleNamespace(num_hidden_layers=43)
         # Last pipeline stage: only layers 36..37 of a 43-layer model, plus MTP.
         main_layers = [
-            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config)
-            for n in (36, 37)
+            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config) for n in (36, 37)
         ]
         mtp_wrapper = SimpleNamespace(
             transformer_layer=SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), config=config),

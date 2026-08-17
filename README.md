@@ -45,6 +45,10 @@ for step in range(num_steps):
         monitor.step()
 ```
 
+`monitors` 同时接受名称列表和逗号分隔字符串，例如
+`"qk_stats,moe_health"`。未知名称会告警并跳过；已请求 monitor 的初始化失败会
+直接抛出异常，避免训练在诊断功能未生效时静默继续。
+
 ### 配合 NeMo Trainer 使用
 
 ```python

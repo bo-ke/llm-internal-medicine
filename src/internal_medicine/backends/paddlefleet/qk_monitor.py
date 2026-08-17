@@ -481,7 +481,14 @@ def compute_qk_stats_sparse_paddle(
 
 class PaddleQKStatsMonitor(PaddleProbe):
     METRIC_PREFIX = "qk_stats"
-    MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
+    MAX_AGGREGATED = {
+        "q_norm_max",
+        "k_norm_max",
+        "v_norm_max",
+        "max",
+        "entropy_max",
+        "sink_head_max",
+    }
     MIN_AGGREGATED = {"entropy_min"}
 
     def __init__(
@@ -566,7 +573,11 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 self.cp_size,
             )
 
-        for layer_idx, _attn_module, item in attention_layers:
+        for layer_idx, attn_module, item in attention_layers:
+            if not self._is_sparse_layer(item) and hasattr(attn_module, "core_attention"):
+                for name in ("q", "k", "v"):
+                    self.declare_layer_metric(layer_idx, f"{name}_norm_mean", attn_type=item.attn_type)
+                    self.declare_layer_metric(layer_idx, f"{name}_norm_max", attn_type=item.attn_type)
             for m in (
                 "max",
                 "mean",
@@ -580,20 +591,21 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 "sink_nonsink_gap",
             ):
                 self.declare_layer_metric(layer_idx, m, attn_type=item.attn_type)
-            if self._is_sparse_layer(item) or self._learnable_sink(_attn_module) is not None:
+            if self._is_sparse_layer(item) or self._learnable_sink(attn_module) is not None:
                 self.declare_layer_metric(layer_idx, "attn_sink_logit", attn_type=item.attn_type)
 
         self.allocate_buffers()
 
         for layer_idx, attn_module, item in attention_layers:
-            if self._is_sparse_layer(item):
+            is_sparse = self._is_sparse_layer(item)
+            if is_sparse:
                 patch = self._patch_sparse_attn(layer_idx, attn_module, item)
                 if patch is not None:
                     self.hooks.append(patch)
                     continue
             if hasattr(attn_module, "core_attention"):
                 hook = attn_module.core_attention.register_forward_pre_hook(
-                    self._make_compute_hook(layer_idx, item.attn_type)
+                    self._make_compute_hook(layer_idx, item.attn_type, record_qkv_norms=not is_sparse)
                 )
                 self.hooks.append(hook)
 
@@ -763,7 +775,13 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 self._warned_cp_gather_failed = True
             return None
 
-    def _make_compute_hook(self, layer_idx: int, attn_type: str | None = None):
+    def _make_compute_hook(
+        self,
+        layer_idx: int,
+        attn_type: str | None = None,
+        *,
+        record_qkv_norms: bool = True,
+    ):
         def hook_fn(layer, inputs):
             if not layer.training:
                 return
@@ -771,7 +789,25 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 return
             try:
                 query, key = inputs[0], inputs[1]
+                value = inputs[2] if len(inputs) > 2 else None
                 with paddle.no_grad():
+                    if record_qkv_norms:
+                        for name, tensor in (("q", query), ("k", key), ("v", value)):
+                            if not isinstance(tensor, paddle.Tensor):
+                                continue
+                            vector_norm = paddle.linalg.norm(tensor.detach().astype("float32"), axis=-1)
+                            self.record_layer_metric(
+                                layer_idx,
+                                f"{name}_norm_mean",
+                                vector_norm.mean(),
+                                attn_type=attn_type,
+                            )
+                            self.record_layer_metric(
+                                layer_idx,
+                                f"{name}_norm_max",
+                                vector_norm.max(),
+                                attn_type=attn_type,
+                            )
                     if self.cp_size > 1:
                         # CP > 1: gather K only, keep Q local.
                         query = query.detach()

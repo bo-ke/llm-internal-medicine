@@ -210,6 +210,8 @@ setup_internal_medicine()
 | 8 | `sink_head_max` | `qk_stats/.../sink_head_max` | `max(sink_per_head)` | 每层+全局 | 最强 sink head 权重 |
 | 9 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
 | 10 | `attn_sink_logit` | `qk_stats/.../attn_sink_logit` | `mean(sink_logit)` | 每层+全局 | learned sink logit 量级漂移；稀疏层取 `attn_sink`，full 层取 `softmax_offset` |
+| 11 | `{q,k,v}_norm_mean` | `qk_stats/.../{q,k,v}_norm_mean` | `mean(||q/k/v||₂)` | 每层+全局 | Dense core-attention 的平均向量尺度 |
+| 12 | `{q,k,v}_norm_max` | `qk_stats/.../{q,k,v}_norm_max` | `max(||q/k/v||₂)` | 每层+全局 | Dense core-attention 的局部尺度峰值 |
 
 其中 `s` 取 attention 层运行时的 `softmax_scale`；未显式设置时回退为 `1 / sqrt(head_dim)`。
 

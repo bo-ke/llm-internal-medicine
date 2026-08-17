@@ -1,12 +1,24 @@
 # QK Stats Monitor
 
-QK 注意力统计监控模块，监控 9 个核心指标。
+QK 注意力统计监控模块，覆盖 Q/K/V 激活向量尺度、attention logits、熵与 sink。
 
 通过 Triton 优化的 Online Softmax 内核，在单次前向传播中高效计算注意力矩阵的统计特征，覆盖数值稳定性、注意力集中度和 attention sink 现象。
 
 ---
 
 ## 监控指标
+
+### Q/K/V Vector Norms
+
+对于 dense core-attention 实际接收的每个 token/head 向量，记录：
+
+```text
+{q,k,v}_norm_mean = mean(||q/k/v||₂)
+{q,k,v}_norm_max  = max(||q/k/v||₂)
+```
+
+这组指标用于区分 Q/K 尺度增长与方向对齐造成的 logit 变化，并观察 V 分支的尺度漂移。CSA/HCA
+稀疏调用只暴露组合后的 KV 表示，无法可靠拆出独立 V，因此不输出这组指标。
 
 ### 1. Max Logit (注意力 Logit 最大值)
 

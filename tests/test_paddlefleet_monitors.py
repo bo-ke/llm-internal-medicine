@@ -1,4 +1,5 @@
 import importlib
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -187,17 +188,14 @@ class PaddleLayerDiscoveryTest(unittest.TestCase):
         self.assertEqual(layer_discovery.resolve_layer_idx(plain, 0, 4), 5)
 
         # Explicit logical attrs win and are never offset.
-        self.assertEqual(
-            layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9
-        )
+        self.assertEqual(layer_discovery.resolve_layer_idx(SimpleNamespace(layer_idx=9, config=config), 0, 4), 9)
 
     def test_mtp_layer_idx_is_absolute_not_max_of_local_main_layers(self):
         """On a PP stage holding a partial stack, MTP must not be numbered max(local)+1."""
         config = SimpleNamespace(num_hidden_layers=43)
         # Last pipeline stage: only layers 36..37 of a 43-layer model, plus MTP.
         main_layers = [
-            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config)
-            for n in (36, 37)
+            SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), layer_number=n, config=config) for n in (36, 37)
         ]
         mtp_wrapper = SimpleNamespace(
             transformer_layer=SimpleNamespace(self_attn=SimpleNamespace(is_swa=False), config=config),
@@ -250,6 +248,100 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         latest = training_logs.get_latest(prefix="moe_health")
         self.assertAlmostEqual(latest["moe_health/layer_0/router_entropy"], 2.0, places=4)
         self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 2.0, places=4)
+
+    def test_distribution_metrics_distinguish_balanced_and_collapsed_load(self):
+        balanced = moe_monitor_module._distribution_metrics(paddle.to_tensor([2.0, 2.0, 2.0, 2.0]))
+        collapsed = moe_monitor_module._distribution_metrics(paddle.to_tensor([8.0, 0.0, 0.0, 0.0]))
+        empty = moe_monitor_module._distribution_metrics(paddle.zeros([4]))
+
+        self.assertAlmostEqual(float(balanced["cv"]), 0.0, places=6)
+        self.assertAlmostEqual(float(balanced["entropy_norm"]), 1.0, places=6)
+        self.assertAlmostEqual(float(balanced["max_frac"]), 0.25, places=6)
+        self.assertGreater(float(collapsed["cv"]), float(balanced["cv"]))
+        self.assertLess(float(collapsed["entropy_norm"]), float(balanced["entropy_norm"]))
+        self.assertAlmostEqual(float(collapsed["max_frac"]), 1.0, places=6)
+        self.assertTrue(all(math.isfinite(float(value)) for value in empty.values()))
+        self.assertTrue(all(float(value) == 0.0 for value in empty.values()))
+
+    def test_gate_hook_records_actual_assignment_and_positive_gate_mass(self):
+        class Gate(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.num_experts_per_tok = 2
+                self.n_group = 1
+                self.topk_group = 1
+                self.norm_topk_prob = False
+
+            def gate_score_func(self, scores):
+                return scores
+
+            def forward(self, scores):
+                gates = self.gate_score_func(scores)
+                top_gate, top_idx = paddle.topk(gates, self.num_experts_per_tok, axis=-1)
+                mask = paddle.nn.functional.one_hot(top_idx, num_classes=gates.shape[-1]).sum(axis=1)
+                combine_weights = gates * mask.astype("float32")
+                signed = paddle.where(
+                    paddle.arange(gates.shape[-1]).reshape([1, -1]) == 3,
+                    -combine_weights,
+                    combine_weights,
+                )
+                return None, top_gate, top_idx, signed, mask, None, None, None
+
+        class MoE(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.gate = Gate()
+
+        class TransformerLayer(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layer_idx = 0
+                self.mlp = MoE()
+
+        class Model(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.LayerList([TransformerLayer()])
+
+        router_input = paddle.to_tensor(
+            [
+                [0.60, 0.40, 0.10, 0.05],
+                [0.10, 0.05, 0.60, 0.40],
+                [0.60, 0.10, 0.40, 0.05],
+                [0.10, 0.60, 0.05, 0.40],
+            ],
+            dtype="float32",
+        )
+        model = Model()
+        monitor = PaddleMoEMonitor()
+        monitor.register_hooks(model)
+        model.layers[0].mlp.gate(router_input)
+        monitor.step()
+
+        metrics = training_logs.get_latest(prefix="moe_health/layer_0/")
+        self.assertAlmostEqual(metrics["moe_health/layer_0/assignment_load_cv"], 0.0, places=6)
+        self.assertAlmostEqual(metrics["moe_health/layer_0/assignment_load_entropy_norm"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["moe_health/layer_0/assignment_load_max_frac"], 0.25, places=6)
+        self.assertAlmostEqual(metrics["moe_health/layer_0/gate_mass_max_frac"], 0.30, places=6)
+        self.assertAlmostEqual(metrics["moe_health/layer_0/gate_mass_min_frac"], 0.20, places=6)
+        self.assertGreater(metrics["moe_health/layer_0/router_margin_min"], 0.0)
+        self.assertAlmostEqual(
+            metrics["moe_health/layer_0/router_input_rms"],
+            float(paddle.sqrt((router_input**2).mean())),
+            places=6,
+        )
+        self.assertGreaterEqual(metrics["moe_health/layer_0/router_entropy_norm"], 0.0)
+        self.assertLessEqual(metrics["moe_health/layer_0/router_entropy_norm"], 1.0)
+        monitor.remove_hooks()
+
+    def test_assignment_mask_ignores_invalid_expert_ids(self):
+        probabilities = paddle.to_tensor([[0.7, 0.2, 0.1], [0.1, 0.3, 0.6]], dtype="float32")
+        invalid_indices = paddle.to_tensor([[-1, 3], [4, -2]], dtype="int64")
+        outputs = (None, None, invalid_indices)
+
+        assignment_mask = moe_monitor_module._assignment_mask(probabilities, outputs, k=2)
+
+        self.assertEqual(float(assignment_mask.sum()), 0.0)
 
     def test_mtp_layer_marker_is_encoded_in_metric_key(self):
         monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)

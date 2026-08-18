@@ -1946,6 +1946,32 @@ class PaddleAttnUpdateMonitorTest(unittest.TestCase):
         registry = importlib.import_module("internal_medicine.core.registry")
         self.assertIn("attn_update", registry.AVAILABLE_MONITORS["paddlefleet"])
 
+    def test_setup_entry_point_registers_a_working_monitor(self):
+        """The map holds ``setup_attn_update_monitor``, so that is what production calls.
+
+        It has to hand the monitor back through ``monitor_dict`` -- nothing else
+        keeps a reference, so ``step()`` would never be reached -- thread its
+        keyword arguments into the monitor, and return the model untouched.
+        """
+        attn = self._attn()
+        model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
+        monitors = {}
+
+        returned = attn_update_module.setup_attn_update_monitor(
+            model, monitor_dict=monitors, monitor_interval=1, num_heads_monitored=2
+        )
+
+        self.assertIs(returned, model)
+        monitor = monitors["attn_update"]
+        self.assertIsInstance(monitor, PaddleAttnUpdateMonitor)
+        self.assertEqual(monitor.num_heads_monitored, 2)
+        self.assertEqual([idx for idx, _t, _f in monitor._layers], [0])
+
+        monitor.step()  # base point
+        self._perturb(attn)
+        monitor.step()
+        self.assertIn("attn_update/layer_0/delta2_norm", training_logs.get_latest(prefix="attn_update"))
+
     # ── sampling interval ────────────────────────────────────────────────
 
     def test_sample_interval_defaults_to_monitor_interval(self):
@@ -2072,6 +2098,40 @@ class PaddleAttnUpdateMonitorTest(unittest.TestCase):
         factors = attn_update_module.resolve_qk_factors(attn)
         expected = attn.q_proj.weight[:, 4:8] * attn.q_norm.weight.reshape([1, -1])
         self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected, atol=1e-5).item())
+
+    def test_split_qk_slices_a_per_layer_qk_norm_by_head(self):
+        """A norm covering all heads at once must be sliced, not broadcast.
+
+        Folding head 1's columns with head 0's scale would silently corrupt the
+        QK circuit, so the head offset is checked on both heads.
+        """
+        attn = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            q_norm=SimpleNamespace(weight=paddle.rand([8]) + 0.5),
+            hidden_size_per_attention_head=4,
+        )
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertNotEqual(attn.q_norm.weight.shape[0], factors["head_dim"])
+
+        for head in (0, 1):
+            start = head * 4
+            scale = attn.q_norm.weight[start : start + 4].reshape([1, -1])
+            expected = attn.q_proj.weight[:, start : start + 4] * scale
+            got = attn_update_module.effective_wq(factors, head)
+            self.assertTrue(paddle.allclose(got, expected, atol=1e-5).item(), f"head {head}")
+
+    def test_qk_norm_of_an_unreadable_width_is_dropped_rather_than_guessed(self):
+        """Neither per-head nor per-layer: fold nothing instead of the wrong slice."""
+        attn = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            q_norm=SimpleNamespace(weight=paddle.rand([5]) + 0.5),
+            hidden_size_per_attention_head=4,
+        )
+        factors = attn_update_module.resolve_qk_factors(attn)
+        got = attn_update_module.effective_wq(factors, 1)
+        self.assertTrue(paddle.allclose(got, attn.q_proj.weight[:, 4:8], atol=1e-5).item())
 
     def test_mixed_layouts_in_one_model_are_bucketed_by_shape(self):
         """Different circuit widths cannot share a batched eigensolve."""

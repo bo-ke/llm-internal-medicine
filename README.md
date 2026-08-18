@@ -338,6 +338,12 @@ global 指标已按层类型拆分，不要再把不同类型平均到一起。
 | 19 | `logit_lens_logsumexp_mean` | `massive_act/.../logit_lens_logsumexp_mean` | `mean_t(logsumexp(final_norm(h)·Wᵀ))` | 每层+全局 | logit-lens 对数配分均值，追踪 logit 原始尺度 |
 | 20 | `logit_lens_cross_entropy_mean` | `massive_act/.../logit_lens_cross_entropy_mean` | `mean_t(log_z − l[y])` | 每层+全局 | logit-lens 逐层交叉熵，末层≈LM loss |
 | 21 | `hidden_spectral_entropy` | `massive_act/.../hidden_spectral_entropy` | `-Σ p_i log p_i, p_i=σ_i²/‖h‖_F²` | 每层+全局 | post-norm 隐状态谱熵(有效秩)，表征多样性/秩坍缩 |
+| 22 | `{position}_{rms,abs_max,abs_p99,outlier_ratio}` | `massive_act/.../{position}_*` | 五个真实执行位置的尺度与 tail | 每层+全局 | 定位异常由 Attention、FFN/MoE 还是 residual 累积产生 |
+| 23 | `{attn,ffn}_update_rms_ratio` | `massive_act/.../{attn,ffn}_update_rms_ratio` | `RMS(residual_after-residual_before)/RMS(residual_before)` | 每层+全局 | 模块对 residual stream 的实际写入比例 |
+
+PaddleFleet 的 `position` 为 `layer_input`、`attn_out`、`post_attn_residual`、
+`ffn_or_moe_out`、`post_ffn_residual`。两个 residual 位置从真实 forward 边界采样，update ratio
+由实际 residual 差分计算，因此包含 bias、dropout、BDA 与 mHC residual mixing 的影响。
 
 > **注**: 指标 18-20 (`logit_lens_*`) 为**默认关闭**的可选项（熵/logsumexp 由 `log_logit_lens_entropy=True`
 > 开启，交叉熵由 `log_logit_lens_cross_entropy=True` 开启）。

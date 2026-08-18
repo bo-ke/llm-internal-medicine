@@ -1,4 +1,5 @@
 import importlib
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -284,6 +285,217 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 3.0, places=4)
         self.assertAlmostEqual(latest["moe_health/global_score_sum_max"], 0.9, places=4)
 
+    def test_singular_values_match_svd_reference(self):
+        """The Gram spectrum equals the SVD spectrum (order is unspecified)."""
+        paddle.seed(0)
+        w = paddle.randn([32, 80])
+        got = paddle.sort(moe_monitor_module._singular_values(w), descending=True)
+        reference = paddle.linalg.svd(w, full_matrices=False)[1]
+        self.assertEqual(list(got.shape), [32])
+        self.assertTrue(bool(paddle.allclose(got, reference, atol=1e-3)))
+
+    def test_singular_values_batched_matches_per_matrix(self):
+        """A batched [E, m, n] input yields one spectrum per matrix."""
+        paddle.seed(0)
+        w = paddle.randn([3, 16, 8])
+        batched = moe_monitor_module._singular_values(w)
+        self.assertEqual(list(batched.shape), [3, 8])
+        for e in range(3):
+            single = moe_monitor_module._singular_values(w[e])
+            self.assertTrue(bool(paddle.allclose(batched[e], single, atol=1e-4)))
+
+    def test_singular_values_return_none_for_unsupported_input(self):
+        self.assertIsNone(moe_monitor_module._singular_values(None))
+        self.assertIsNone(moe_monitor_module._singular_values(paddle.randn([10])))
+
+    def test_spectrum_metrics_reduce_over_trailing_axis(self):
+        """Batched sigma [E, k] reduces to one value per matrix."""
+        sigma = paddle.to_tensor([[1.0, 1.0, 1.0, 1.0], [1.0, 0.0, 0.0, 0.0]])
+        srank = moe_monitor_module._stable_rank(sigma)
+        entropy = moe_monitor_module._singular_value_entropy(sigma)
+        self.assertEqual(list(srank.shape), [2])
+        self.assertAlmostEqual(float(srank[0]), 4.0, places=4)
+        self.assertAlmostEqual(float(srank[1]), 1.0, places=4)
+        self.assertAlmostEqual(float(entropy[0]), math.log(4.0), places=4)
+        self.assertAlmostEqual(float(entropy[1]), 0.0, places=4)
+
+    def test_stable_rank_of_orthogonal_matrix_equals_full_rank(self):
+        """Flat spectrum => srank == min(m, n), the stable-rank upper bound."""
+        q, _ = paddle.linalg.qr(paddle.randn([32, 32]))
+        sigma = moe_monitor_module._singular_values(q)
+        self.assertAlmostEqual(float(moe_monitor_module._stable_rank(sigma)), 32.0, places=3)
+
+    def test_stable_rank_of_rank_one_matrix_is_one(self):
+        """One nonzero singular value => srank == 1, its lower bound."""
+        w = paddle.randn([64, 1]) @ paddle.randn([1, 128])
+        sigma = moe_monitor_module._singular_values(w)
+        self.assertAlmostEqual(float(moe_monitor_module._stable_rank(sigma)), 1.0, places=3)
+
+    def test_stable_rank_matches_frobenius_over_spectral_norm(self):
+        """srank == ||W||_F^2 / ||W||_2^2 computed straight from the SVD."""
+        paddle.seed(0)
+        w = paddle.randn([32, 80])
+        sigma = paddle.linalg.svd(w, full_matrices=False)[1]
+        reference = float((sigma**2).sum() / sigma.max() ** 2)
+        got = float(moe_monitor_module._stable_rank(moe_monitor_module._singular_values(w)))
+        self.assertAlmostEqual(got, reference, places=3)
+
+    def test_singular_value_entropy_of_orthogonal_matrix_equals_log_full_rank(self):
+        """Flat spectrum => H == log(min(m, n)), the entropy upper bound."""
+        q, _ = paddle.linalg.qr(paddle.randn([32, 32]))
+        sigma = moe_monitor_module._singular_values(q)
+        self.assertAlmostEqual(float(moe_monitor_module._singular_value_entropy(sigma)), math.log(32.0), places=3)
+
+    def test_singular_value_entropy_of_rank_one_matrix_is_near_zero(self):
+        """A single dominant singular value collapses H towards 0."""
+        w = paddle.randn([64, 1]) @ paddle.randn([1, 128])
+        sigma = moe_monitor_module._singular_values(w)
+        self.assertLess(float(moe_monitor_module._singular_value_entropy(sigma)), 0.5)
+
+    def test_singular_value_entropy_matches_svd_definition(self):
+        """H == -sum(p log p) with p = sigma / sum(sigma) from the SVD."""
+        paddle.seed(0)
+        w = paddle.randn([32, 80])
+        sigma = paddle.linalg.svd(w, full_matrices=False)[1]
+        p = sigma / sigma.sum()
+        reference = float(-(p * p.log()).sum())
+        got = float(moe_monitor_module._singular_value_entropy(moe_monitor_module._singular_values(w)))
+        self.assertAlmostEqual(got, reference, places=3)
+
+    def test_swiglu_gate_half_takes_first_half_of_output_dim(self):
+        """glu() applies SiLU to the first chunk, so the gate is w[..., :out // 2]."""
+        w = paddle.randn([2, 8, 16])
+        gate = moe_monitor_module._swiglu_gate_half(w)
+        self.assertEqual(list(gate.shape), [2, 8, 8])
+        self.assertTrue(bool(paddle.allclose(gate, w[..., :8])))
+
+    def test_expert_fc1_weight_resolves_supported_layouts(self):
+        """grouped-gemm weight1, fused up_gate_proj and LayerList all resolve."""
+        ggm_w = paddle.randn([2, 4, 8])
+        ggm_layer = SimpleNamespace(grouped_gemm_experts=SimpleNamespace(weight1=ggm_w))
+        self.assertTrue(bool(paddle.allclose(moe_monitor_module._expert_fc1_weight(ggm_layer), ggm_w)))
+
+        fused_w = paddle.randn([3, 4, 8])
+        fused_layer = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=fused_w)),
+        )
+        self.assertTrue(bool(paddle.allclose(moe_monitor_module._expert_fc1_weight(fused_layer), fused_w)))
+
+        per_expert = [SimpleNamespace(up_gate_proj=SimpleNamespace(weight=paddle.randn([4, 8]))) for _ in range(2)]
+        list_layer = SimpleNamespace(grouped_gemm_experts=None, experts=per_expert)
+        self.assertEqual(list(moe_monitor_module._expert_fc1_weight(list_layer).shape), [2, 4, 8])
+
+        self.assertIsNone(moe_monitor_module._expert_fc1_weight(SimpleNamespace()))
+
+    def test_compute_gate_spectrum_metrics_records_expert_and_shared_gate(self):
+        """Per-expert gate spectra reduce to mean/min/max; shared gate is scalar."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        for m in (
+            "expert_gate_stable_rank_mean",
+            "expert_gate_stable_rank_min",
+            "expert_gate_stable_rank_max",
+            "expert_gate_singular_entropy_mean",
+            "expert_gate_singular_entropy_min",
+            "expert_gate_singular_entropy_max",
+            "shared_gate_stable_rank",
+            "shared_gate_singular_entropy",
+        ):
+            monitor.declare_layer_metric(0, m)
+        monitor.allocate_buffers()
+
+        full_rank, _ = paddle.linalg.qr(paddle.randn([8, 8]))  # srank 8, H = log 8
+        collapsed = paddle.randn([8, 1]) @ paddle.randn([1, 8])  # srank 1, H ~ 0
+        gate = paddle.stack([full_rank, collapsed])  # [2, 8, 8]
+        fc1 = paddle.concat([gate, paddle.randn([2, 8, 8])], axis=-1)  # gate | up
+        shared_fc1 = paddle.concat([full_rank, paddle.randn([8, 8])], axis=-1)
+        moe_layer = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=fc1)),
+            shared_experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=shared_fc1)),
+        )
+
+        monitor._compute_gate_spectrum_metrics(0, moe_layer)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_max"], 8.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_min"], 1.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_mean"], 4.5, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_singular_entropy_max"], math.log(8.0), places=3)
+        self.assertLess(latest["moe_health/layer_0/expert_gate_singular_entropy_min"], 0.5)
+        self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_stable_rank"], 8.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_singular_entropy"], math.log(8.0), places=3)
+        self.assertNotIn("moe_health/layer_0/gate_weight_stable_rank", latest)
+
+    def test_compute_gate_spectrum_metrics_batches_shared_gate_of_different_shape(self):
+        """Shared and routed gate matrices of different shape still share one eigensolve.
+
+        This is the production layout: with ``moe_split_feature_routing`` the routed
+        experts run on half the hidden features, so their gate is ``[512, 512]`` while
+        the shared expert's is ``[1024, 512]``. Batching the gate matrices is
+        impossible, but their Grams are both ``k x k``, so exactly one
+        ``_gram_singular_values`` call must cover both -- alternating batch shapes
+        makes cuSOLVER re-initialize its workspace and costs ~8x.
+        """
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        for m in (
+            "expert_gate_stable_rank_mean",
+            "expert_gate_stable_rank_min",
+            "expert_gate_stable_rank_max",
+            "expert_gate_singular_entropy_mean",
+            "expert_gate_singular_entropy_min",
+            "expert_gate_singular_entropy_max",
+            "shared_gate_stable_rank",
+            "shared_gate_singular_entropy",
+        ):
+            monitor.declare_layer_metric(0, m)
+        monitor.allocate_buffers()
+
+        full_rank, _ = paddle.linalg.qr(paddle.randn([8, 8]))  # srank 8, H = log 8
+        collapsed = paddle.randn([8, 1]) @ paddle.randn([1, 8])  # srank 1, H ~ 0
+        fc1 = paddle.concat([paddle.stack([full_rank, collapsed]), paddle.randn([2, 8, 8])], axis=-1)
+        # Shared expert sees twice as many input features: gate half is [16, 8], and
+        # orthonormal columns again put every singular value at 1 -> srank 8, H = log 8.
+        tall_gate, _ = paddle.linalg.qr(paddle.randn([16, 8]))
+        shared_fc1 = paddle.concat([tall_gate, paddle.randn([16, 8])], axis=-1)
+        self.assertNotEqual(tall_gate.shape, fc1.shape[1:])
+        moe_layer = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=fc1)),
+            shared_experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=shared_fc1)),
+        )
+
+        real_solve = moe_monitor_module._gram_singular_values
+        calls = []
+
+        def counting_solve(gram):
+            calls.append(None if gram is None else tuple(gram.shape))
+            return real_solve(gram)
+
+        moe_monitor_module._gram_singular_values = counting_solve
+        try:
+            monitor._compute_gate_spectrum_metrics(0, moe_layer)
+        finally:
+            moe_monitor_module._gram_singular_values = real_solve
+        monitor.step()
+
+        self.assertEqual(calls, [(3, 8, 8)], "routed and shared Grams must batch into one solve")
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_max"], 8.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_min"], 1.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_stable_rank"], 8.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_singular_entropy"], math.log(8.0), places=3)
+
+    def test_compute_gate_spectrum_metrics_skips_layer_without_experts(self):
+        """A layer with no expert weights must not raise and records nothing."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        monitor.declare_layer_metric(0, "expert_gate_stable_rank_mean")
+        monitor.allocate_buffers()
+
+        monitor._compute_gate_spectrum_metrics(0, SimpleNamespace())
+        self.assertEqual(monitor._gpu_cnt["moe_health/layer_0/expert_gate_stable_rank_mean"], 0)
+
     def test_attn_type_tag_produces_typed_keys_and_split_global_aggregation(self):
         """When declare/record_layer_metric receives attn_type, keys are
         ``{prefix}/layer_N/{type}_{metric}`` and ``{prefix}/global_{type}_{metric}``.
@@ -349,7 +561,7 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertIsNone(moe_monitor_mod._intermediate_shard_group(None))
 
     def test_collect_expert_norms_fused_layout_records_metrics(self):
-        """collect_expert_norms records expert + shared norms for a fused-expert MoE layer."""
+        """collect_expert_norms records expert norms + gate spectra for a fused-expert MoE layer."""
         monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, verbose=False)
         for m in [
             "expert_norm_mean",
@@ -358,6 +570,12 @@ class PaddleMoEMonitorTest(unittest.TestCase):
             "expert_norm_max",
             "shared_expert_norm",
             "shared_routed_ratio",
+            "expert_gate_stable_rank_mean",
+            "expert_gate_stable_rank_min",
+            "expert_gate_stable_rank_max",
+            "expert_gate_singular_entropy_mean",
+            "expert_gate_singular_entropy_min",
+            "expert_gate_singular_entropy_max",
         ]:
             monitor.declare_layer_metric(0, m)
         monitor.allocate_buffers()
@@ -379,6 +597,11 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertIn("moe_health/layer_0/expert_norm_mean", latest)
         self.assertIn("moe_health/layer_0/shared_expert_norm", latest)
         self.assertGreater(latest["moe_health/layer_0/expert_norm_mean"], 0.0)
+        # Same step-begin pass also collects the SwiGLU gate spectrum: the gate
+        # half of a [3, 8, 6] fc1 is [3, 8, 3], so srank is in [1, 3].
+        self.assertIn("moe_health/layer_0/expert_gate_stable_rank_mean", latest)
+        self.assertGreaterEqual(latest["moe_health/layer_0/expert_gate_stable_rank_min"], 1.0)
+        self.assertLessEqual(latest["moe_health/layer_0/expert_gate_stable_rank_max"], 3.0)
 
     def test_collect_expert_norms_respects_monitor_interval(self):
         """Expert-norm collection is gated by the global monitor_interval."""

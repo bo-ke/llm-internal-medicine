@@ -124,6 +124,117 @@ def _module_sumsq(module):
     return sq
 
 
+def _gram(weight):
+    """Gram matrix of ``weight``, shaped ``[..., k, k]`` with ``k = min(m, n)``.
+
+    ``W W^T`` or ``W^T W``, whichever is the smaller square, so the eigensolve
+    below always runs on ``k x k``. bf16 params are cast to float32 because the
+    eigensolver needs at least fp32.
+
+    Returns a GPU tensor, or None when ``weight`` is missing, has fewer than two
+    dims, or is empty.
+    """
+    if weight is None:
+        return None
+    w = weight.detach().astype("float32")
+    if len(w.shape) < 2 or w.numel() == 0:
+        return None
+    m, n = w.shape[-2], w.shape[-1]
+    return paddle.matmul(w, w, transpose_y=True) if m <= n else paddle.matmul(w, w, transpose_x=True)
+
+
+def _gram_singular_values(gram):
+    """Singular values from a Gram matrix: ``sigma_i = sqrt(lambda_i)``.
+
+    ``[..., k, k]`` in, ``[..., k]`` out. The order is unspecified (``eigvalsh``
+    returns ascending); both metrics below are order-invariant. Returns a GPU
+    tensor (no host sync), or None for None input.
+    """
+    if gram is None:
+        return None
+    return paddle.sqrt(paddle.linalg.eigvalsh(gram).clip(min=0.0))
+
+
+def _singular_values(weight):
+    """Singular values of a matrix or a batch of matrices, via the Gram spectrum.
+
+    Accepts ``[m, n]`` or ``[..., m, n]`` and returns ``[..., min(m, n)]``.
+
+    ``sigma_i = sqrt(lambda_i(W^T W))`` is the SVD spectrum, but obtained far more
+    cheaply: on one EP rank's per-expert SwiGLU gate stack ([32, 512, 512]) a
+    batched ``paddle.linalg.svdvals`` measures ~8.5 s against ~196 ms for the
+    batched Gram + ``eigvalsh`` here, agreeing to ~1e-4 relative. At 18 layers
+    per step the SVD path would cost ~150 s/step, so it is not usable at this
+    granularity.
+    """
+    return _gram_singular_values(_gram(weight))
+
+
+def _stable_rank(sigma):
+    """Stable (numerical) rank, reduced over the trailing singular-value axis.
+
+    ``srank(W) = ||W||_F^2 / ||W||_2^2 = sum_i(sigma_i^2) / max_i(sigma_i)^2``,
+    living in ``[1, rank(W)]``: 1 means a single direction carries all the energy,
+    higher means the energy spreads over more directions. Continuous, unlike the
+    hard rank, so collapse shows up as a smooth decline.
+
+    Dominated by ``sigma_max`` — pair it with :func:`_singular_value_entropy`,
+    which weighs the whole spectrum. ``[..., k]`` in, ``[...]`` out.
+    """
+    sq = sigma * sigma
+    return sq.sum(axis=-1) / sq.max(axis=-1).clip(min=1e-12)
+
+
+def _singular_value_entropy(sigma):
+    """Shannon entropy of the normalized singular-value distribution.
+
+    ``H = -sum_i(p_i log p_i)`` with ``p_i = sigma_i / sum_j(sigma_j)``, in nats,
+    over ``[0, log(k)]``: 0 means the spectrum collapsed onto one direction,
+    ``log(k)`` means a flat spectrum (all directions used equally).
+    ``[..., k]`` in, ``[...]`` out.
+
+    Note the sigma (not sigma^2) weighting: the megatron-side
+    ``hidden_spectral_entropy`` normalizes by sigma^2, so the two are not
+    numerically comparable.
+    """
+    p = (sigma / sigma.sum(axis=-1, keepdim=True).clip(min=1e-12)).clip(min=1e-12)
+    return -(p * p.log()).sum(axis=-1)
+
+
+def _swiglu_gate_half(fc1_weight):
+    """The SiLU-gated half of a fused SwiGLU fc1 weight.
+
+    ``GroupedMLPExpert`` doubles the fc1 output width for the gated unit and its
+    ``glu()`` chunks the activation in two along the last axis, applying SiLU to
+    the FIRST chunk. With paddle's ``[..., in, out]`` weight layout the gate
+    projection is therefore ``w[..., : out // 2]`` and the linear "up" projection
+    is the second half.
+    """
+    return fc1_weight[..., : fc1_weight.shape[-1] // 2]
+
+
+def _expert_fc1_weight(moe_layer):
+    """Routed-expert fc1 (fused gate+up) weight with a leading expert dim, or None.
+
+    Mirrors the layouts handled by ``_collect_expert_sumsq``: grouped-gemm
+    ``weight1``, the fused ``up_gate_proj.weight`` ([num_experts, in, 2*inter]),
+    and the non-fused ``LayerList`` of per-expert MLPs (stacked here).
+    """
+    ggm = getattr(moe_layer, "grouped_gemm_experts", None)
+    if ggm is not None and hasattr(ggm, "weight1"):
+        return ggm.weight1
+    experts = getattr(moe_layer, "experts", None)
+    if experts is None:
+        return None
+    if hasattr(experts, "up_gate_proj"):
+        return experts.up_gate_proj.weight
+    if isinstance(experts, (list, nn.LayerList)) or hasattr(experts, "__iter__"):
+        per_expert = [e.up_gate_proj.weight for e in experts if e is not None and hasattr(e, "up_gate_proj")]
+        if per_expert:
+            return paddle.stack(per_expert)
+    return None
+
+
 def _norm_stats(norms):
     """mean/std/min/max stats from a ``[num_experts]`` per-expert norm tensor (GPU tensors)."""
     if norms is None or norms.numel() == 0:
@@ -150,13 +261,22 @@ def _act_stats(act, name_prefix):
 class PaddleMoEMonitor(PaddleProbe):
     METRIC_PREFIX = "moe_health"
     MAX_AGGREGATED = {
-        "score_sum_max", "expert_norm_max", "expert_bias_max",
-        "shared_act_abs_max", "routed_act_abs_max",
+        "score_sum_max",
+        "expert_norm_max",
+        "expert_bias_max",
+        "shared_act_abs_max",
+        "routed_act_abs_max",
         "router_scalar_max",
+        "expert_gate_stable_rank_max",
+        "expert_gate_singular_entropy_max",
     }
     MIN_AGGREGATED = {
-        "score_sum_min", "expert_norm_min", "expert_bias_min",
+        "score_sum_min",
+        "expert_norm_min",
+        "expert_bias_min",
         "router_scalar_min",
+        "expert_gate_stable_rank_min",
+        "expert_gate_singular_entropy_min",
     }
 
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
@@ -210,13 +330,23 @@ class PaddleMoEMonitor(PaddleProbe):
                 "expert_norm_max",
                 "shared_expert_norm",
                 "shared_routed_ratio",
+                "expert_gate_stable_rank_mean",
+                "expert_gate_stable_rank_min",
+                "expert_gate_stable_rank_max",
+                "expert_gate_singular_entropy_mean",
+                "expert_gate_singular_entropy_min",
+                "expert_gate_singular_entropy_max",
+                "shared_gate_stable_rank",
+                "shared_gate_singular_entropy",
             ]
             act_metrics = []
             if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
                 act_metrics += ["shared_act_norm", "shared_act_abs_max", "shared_act_mean"]
             if hasattr(moe_layer, "_post_routed_output"):
                 act_metrics += [
-                    "routed_act_norm", "routed_act_abs_max", "routed_act_mean",
+                    "routed_act_norm",
+                    "routed_act_abs_max",
+                    "routed_act_mean",
                     "shared_routed_act_ratio",
                 ]
             for m in gate_metrics + expert_metrics + act_metrics:
@@ -232,9 +362,7 @@ class PaddleMoEMonitor(PaddleProbe):
                 self.hooks.append(hook)
             # Shared expert activation hook
             if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
-                hook = moe_layer.shared_experts.register_forward_post_hook(
-                    self._make_shared_expert_hook(layer_idx)
-                )
+                hook = moe_layer.shared_experts.register_forward_post_hook(self._make_shared_expert_hook(layer_idx))
                 self.hooks.append(hook)
             # Routed expert activation: patch _post_routed_output (called right
             # after routed experts, before adding shared output — no D2H).
@@ -452,6 +580,12 @@ class PaddleMoEMonitor(PaddleProbe):
         for layer_idx, moe_layer in self._expert_norm_layers:
             try:
                 with paddle.no_grad():
+                    self._compute_gate_spectrum_metrics(layer_idx, moe_layer)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[PaddleMoEMonitor] gate-spectrum collect error layer {layer_idx}: {e}")
+            try:
+                with paddle.no_grad():
                     routed_sq, shared_sq, group = self._collect_expert_sumsq(moe_layer)
             except Exception as e:
                 if self.verbose:
@@ -526,9 +660,54 @@ class PaddleMoEMonitor(PaddleProbe):
             self.record_layer_metric(layer_idx, "router_scalar_std", scalar.std())
             self.record_layer_metric(layer_idx, "router_scalar_max", scalar.max())
             self.record_layer_metric(layer_idx, "router_scalar_min", scalar.min())
-            self.record_layer_metric(
-                layer_idx, "router_scalar_ratio", scalar.max() / scalar.min().clip(min=1e-8)
-            )
+            self.record_layer_metric(layer_idx, "router_scalar_ratio", scalar.max() / scalar.min().clip(min=1e-8))
+
+    def _compute_gate_spectrum_metrics(self, layer_idx, moe_layer):
+        """Spectrum health of the experts' SwiGLU gate projection.
+
+        One batched Gram eigensolve per layer covers every local expert plus the
+        shared expert. The per-expert stable ranks / entropies are reduced to
+        mean/min/max so the key count stays per-layer: 256 experts x 18 layers
+        would otherwise be 4608 series. Under expert parallelism each rank holds
+        its own shard of experts; the ``_max`` / ``_min`` keys reduce correctly
+        across ranks in ``training_logs.gather_and_aggregate``, and the mean is
+        exact because the expert count divides evenly across the EP group.
+
+        The shared expert rides along in the routed batch as a Gram matrix rather
+        than as a gate matrix. cuSOLVER re-initializes its ``syevj`` workspace
+        whenever the batch shape changes between calls, so alternating a
+        ``[32, k, k]`` solve with a ``[k, k]`` one costs 1287 ms/layer against
+        197 ms for the equivalent single ``[33, k, k]`` batch (measured in
+        isolated processes on the 4B-A500M shapes). Batching the gate matrices
+        directly cannot work here: this model's routed gate is ``[512, 512]``
+        while the shared one is ``[1024, 512]``. Their Grams are both ``k x k``
+        with the same ``k``, so they batch even when the sources do not.
+        """
+        fc1 = _expert_fc1_weight(moe_layer)
+        shared = getattr(moe_layer, "shared_experts", None)
+        shared_fc1 = getattr(getattr(shared, "up_gate_proj", None), "weight", None)
+        routed_gram = _gram(_swiglu_gate_half(fc1)) if fc1 is not None else None
+        shared_gram = _gram(_swiglu_gate_half(shared_fc1)) if shared_fc1 is not None else None
+
+        if routed_gram is not None and shared_gram is not None and shared_gram.shape == routed_gram.shape[1:]:
+            sigma = _gram_singular_values(paddle.concat([routed_gram, shared_gram.unsqueeze(0)], axis=0))
+            routed_sigma, shared_sigma = sigma[:-1], sigma[-1]
+        else:
+            routed_sigma = _gram_singular_values(routed_gram)
+            shared_sigma = _gram_singular_values(shared_gram)
+
+        if routed_sigma is not None:
+            for name, vals in (
+                ("stable_rank", _stable_rank(routed_sigma)),
+                ("singular_entropy", _singular_value_entropy(routed_sigma)),
+            ):
+                self.record_layer_metric(layer_idx, f"expert_gate_{name}_mean", vals.mean())
+                self.record_layer_metric(layer_idx, f"expert_gate_{name}_min", vals.min())
+                self.record_layer_metric(layer_idx, f"expert_gate_{name}_max", vals.max())
+
+        if shared_sigma is not None:
+            self.record_layer_metric(layer_idx, "shared_gate_stable_rank", _stable_rank(shared_sigma))
+            self.record_layer_metric(layer_idx, "shared_gate_singular_entropy", _singular_value_entropy(shared_sigma))
 
     def _collect_expert_sumsq(self, moe_layer):
         """Per-expert / shared-expert sums of squares for one MoE layer.
@@ -553,9 +732,7 @@ class PaddleMoEMonitor(PaddleProbe):
             # single module whose up_gate_proj/down_proj weights carry a leading
             # expert dim [num_experts, ...]. Vectorize over that dim.
             if hasattr(experts, "up_gate_proj") and hasattr(experts, "down_proj"):
-                routed_sq = _per_expert_stacked_sumsq(
-                    experts.up_gate_proj.weight, experts.down_proj.weight
-                )
+                routed_sq = _per_expert_stacked_sumsq(experts.up_gate_proj.weight, experts.down_proj.weight)
                 shard_group = _intermediate_shard_group(experts)
             elif isinstance(experts, (list, nn.LayerList)) or hasattr(experts, "__iter__"):
                 # Non-fused layout: LayerList of per-expert modules. One sum-sq

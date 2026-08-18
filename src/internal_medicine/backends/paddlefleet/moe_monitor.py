@@ -82,35 +82,62 @@ def _assignment_mask(
 
 
 def _routing_margin(
-    selection_scores: paddle.Tensor, assignment_mask: paddle.Tensor
+    selection_scores: paddle.Tensor,
+    assignment_mask: paddle.Tensor,
 ) -> tuple[paddle.Tensor, paddle.Tensor]:
-    """Selected-boundary margin per token for an ungrouped top-k router.
-
-    ``margin = min(selected score) - max(unselected score)``: how close the
-    top-k boundary is to flipping. Returns ``(margin, valid)``.
-
-    Tokens the router assigned to nothing have no boundary — ``_assignment_mask``
-    turns the router's ``-1`` padding (dropped / pad tokens) into an all-zero
-    row, which makes ``selected`` ``+inf`` and the raw margin ``+inf``. Those
-    rows are refilled with the batch's largest real margin so that ``min`` and
-    the low-tail quantiles (which cannot take a mask) stay finite and are not
-    dragged by non-tokens; ``valid`` lets the caller take an exact masked mean.
-    """
+    """Return per-token margins and a mask for rows where margin is defined."""
+    selected_mask = assignment_mask > 0
+    valid = selected_mask.any(axis=-1) & (~selected_mask).any(axis=-1)
     selected = paddle.where(
-        assignment_mask > 0,
+        selected_mask,
         selection_scores,
         paddle.full_like(selection_scores, float("inf")),
     ).min(axis=-1)
     unselected = paddle.where(
-        assignment_mask > 0,
+        selected_mask,
         paddle.full_like(selection_scores, float("-inf")),
         selection_scores,
     ).max(axis=-1)
-    raw = selected - unselected
-    valid = assignment_mask.sum(axis=-1) > 0
-    largest_real = paddle.where(valid, raw, paddle.full_like(raw, -1e30)).max()
-    margin = paddle.where(valid, raw, paddle.broadcast_to(largest_real, raw.shape))
-    return margin, valid
+    margin = selected - unselected
+    return paddle.where(valid, margin, paddle.zeros_like(margin)), valid
+
+
+def _masked_margin_metrics(
+    margin: paddle.Tensor,
+    valid: paddle.Tensor,
+) -> dict[str, paddle.Tensor]:
+    """Reduce routing margins over valid tokens only, without D2H sync."""
+    valid_f = valid.astype("float32")
+    valid_count = valid_f.sum()
+    safe_count = valid_count.clip(min=1.0)
+    zero = paddle.zeros([], dtype=margin.dtype)
+    has_valid = valid_count > 0
+
+    masked_margin = paddle.where(valid, margin, paddle.zeros_like(margin))
+    mean = masked_margin.sum() / safe_count
+
+    # Keep a fixed-size GPU tensor: invalid rows sort behind all valid rows and
+    # tensor-valued ranks select quantiles from only the valid prefix.
+    sorted_margin = paddle.sort(paddle.where(valid, margin, paddle.full_like(margin, float("inf"))))
+    count_i64 = valid.astype("int64").sum()
+    safe_count_i64 = count_i64.clip(min=1)
+
+    def quantile(q: float) -> paddle.Tensor:
+        rank = (safe_count_i64.astype("float32") - 1.0) * q
+        lower = paddle.floor(rank).astype("int64")
+        upper = paddle.ceil(rank).astype("int64")
+        lower_value = paddle.gather(sorted_margin, lower.reshape([1])).squeeze(0)
+        upper_value = paddle.gather(sorted_margin, upper.reshape([1])).squeeze(0)
+        value = lower_value + (upper_value - lower_value) * (rank - lower.astype("float32"))
+        return paddle.where(has_valid, value, zero)
+
+    return {
+        "router_margin_valid_ratio": valid_f.mean(),
+        "router_margin_mean": paddle.where(has_valid, mean, zero),
+        "router_margin_min": paddle.where(has_valid, sorted_margin[0], zero),
+        "router_margin_p10": quantile(0.10),
+        "router_margin_p01": quantile(0.01),
+    }
 
 
 def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=1, topk_group=1):
@@ -414,6 +441,7 @@ class PaddleMoEMonitor(PaddleProbe):
                 "router_margin_min",
                 "router_margin_p10",
                 "router_margin_p01",
+                "router_margin_valid_ratio",
             ]
             for prefix in ("assignment_load", "gate_mass"):
                 gate_metrics += [
@@ -786,16 +814,9 @@ class PaddleMoEMonitor(PaddleProbe):
                     selection_scores = cached_gates.astype("float32")
                     if hasattr(gate, "e_score_correction_bias"):
                         selection_scores = selection_scores + gate.e_score_correction_bias.detach().astype("float32")
-                    margin, margin_valid = _routing_margin(selection_scores, assignment_mask)
-                    valid_weight = margin_valid.astype("float32")
-                    self.record_layer_metric(
-                        layer_idx,
-                        "router_margin_mean",
-                        (margin * valid_weight).sum() / valid_weight.sum().clip(min=1.0),
-                    )
-                    self.record_layer_metric(layer_idx, "router_margin_min", margin.min())
-                    self.record_layer_metric(layer_idx, "router_margin_p10", paddle.quantile(margin, 0.10))
-                    self.record_layer_metric(layer_idx, "router_margin_p01", paddle.quantile(margin, 0.01))
+                    margin, valid_margin = _routing_margin(selection_scores, assignment_mask)
+                    for name, value in _masked_margin_metrics(margin, valid_margin).items():
+                        self.record_layer_metric(layer_idx, name, value)
 
         if hasattr(gate, "e_score_correction_bias"):
             top_idx_with_bias = None

@@ -391,6 +391,51 @@ class PaddleMoEMonitorTest(unittest.TestCase):
 
         self.assertEqual(float(assignment_mask.sum()), 0.0)
 
+    def test_routing_margin_is_finite_for_invalid_assignment_rows(self):
+        scores = paddle.to_tensor(
+            [[0.7, 0.2, 0.1], [0.6, 0.3, 0.1], [0.5, 0.4, 0.2]],
+            dtype="float32",
+        )
+        assignment_mask = paddle.to_tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            dtype="float32",
+        )
+
+        margin, valid = moe_monitor_module._routing_margin(scores, assignment_mask)
+        metrics = moe_monitor_module._masked_margin_metrics(margin, valid)
+
+        self.assertTrue(bool(paddle.isfinite(margin).all()))
+        self.assertAlmostEqual(float(margin[0]), 0.0)
+        self.assertAlmostEqual(float(margin[1]), 0.3)
+        self.assertAlmostEqual(float(margin[2]), 0.0)
+        self.assertEqual(valid.tolist(), [False, True, False])
+        for value in metrics.values():
+            if value is not metrics["router_margin_valid_ratio"]:
+                self.assertAlmostEqual(float(value), 0.3)
+        self.assertAlmostEqual(float(metrics["router_margin_valid_ratio"]), 1.0 / 3.0)
+
+    def test_routing_margin_metrics_return_zero_for_all_invalid_rows(self):
+        margin = paddle.zeros([3], dtype="float32")
+        valid = paddle.zeros([3], dtype="bool")
+
+        metrics = moe_monitor_module._masked_margin_metrics(margin, valid)
+
+        self.assertTrue(all(bool(paddle.isfinite(value)) for value in metrics.values()))
+        self.assertTrue(all(float(value) == 0.0 for value in metrics.values()))
+        self.assertAlmostEqual(float(metrics["router_margin_valid_ratio"]), 0.0)
+
+    def test_routing_margin_metrics_exclude_invalid_rows_from_all_reductions(self):
+        margin = paddle.to_tensor([0.0, 0.1, 0.3, 0.0], dtype="float32")
+        valid = paddle.to_tensor([False, True, True, False], dtype="bool")
+
+        metrics = moe_monitor_module._masked_margin_metrics(margin, valid)
+
+        self.assertAlmostEqual(float(metrics["router_margin_mean"]), 0.2)
+        self.assertAlmostEqual(float(metrics["router_margin_min"]), 0.1)
+        self.assertAlmostEqual(float(metrics["router_margin_p10"]), 0.12)
+        self.assertAlmostEqual(float(metrics["router_margin_p01"]), 0.102)
+        self.assertAlmostEqual(float(metrics["router_margin_valid_ratio"]), 0.5)
+
     def test_mtp_layer_marker_is_encoded_in_metric_key(self):
         monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
         monitor.mark_mtp_layers([1])
@@ -645,54 +690,6 @@ class PaddleMoEMonitorTest(unittest.TestCase):
 
         monitor._compute_gate_spectrum_metrics(0, SimpleNamespace())
         self.assertEqual(monitor._gpu_cnt["moe_health/layer_0/expert_gate_stable_rank_mean"], 0)
-
-    def test_routing_margin_is_finite_when_a_token_is_routed_nowhere(self):
-        """Unrouted rows (router -1 padding) must not turn any statistic into inf."""
-        scores = paddle.to_tensor(
-            [[0.6, 0.4, 0.1, 0.05], [0.1, 0.05, 0.6, 0.4], [0.9, 0.8, 0.7, 0.6]],
-            dtype="float32",
-        )
-        mask = paddle.to_tensor(
-            [[1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]],
-            dtype="float32",
-        )
-        margin, valid = moe_monitor_module._routing_margin(scores, mask)
-
-        self.assertTrue(bool(paddle.isfinite(margin).all()))
-        self.assertEqual([bool(v) for v in valid], [True, True, False])
-        # rows 0 and 1 both have boundary 0.4 - 0.1
-        self.assertAlmostEqual(float(margin[0]), 0.3, places=5)
-        self.assertAlmostEqual(float(margin[1]), 0.3, places=5)
-        # the unrouted row is refilled with the largest real margin, never inf
-        self.assertAlmostEqual(float(margin[2]), 0.3, places=5)
-
-    def test_routing_margin_mean_excludes_unrouted_tokens(self):
-        """The masked mean must equal the mean over routed tokens only."""
-        scores = paddle.to_tensor(
-            [[1.0, 0.9, 0.2, 0.1], [1.0, 0.5, 0.4, 0.3], [0.5, 0.5, 0.5, 0.5]],
-            dtype="float32",
-        )
-        mask = paddle.to_tensor(
-            [[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
-            dtype="float32",
-        )
-        margin, valid = moe_monitor_module._routing_margin(scores, mask)
-        weight = valid.astype("float32")
-        masked_mean = float((margin * weight).sum() / weight.sum().clip(min=1.0))
-
-        # row 0: 0.9 - 0.2 = 0.7   row 1: 0.5 - 0.4 = 0.1   row 2: excluded
-        self.assertAlmostEqual(masked_mean, 0.4, places=5)
-        # the unmasked mean would be pulled up by the refilled row
-        self.assertGreater(float(margin.mean()), masked_mean)
-
-    def test_routing_margin_all_tokens_unrouted_stays_finite(self):
-        """Degenerate all-zero mask must not emit inf either."""
-        scores = paddle.to_tensor([[0.4, 0.3, 0.2, 0.1]], dtype="float32")
-        mask = paddle.zeros([1, 4], dtype="float32")
-        margin, valid = moe_monitor_module._routing_margin(scores, mask)
-
-        self.assertTrue(bool(paddle.isfinite(margin).all()))
-        self.assertFalse(bool(valid.any()))
 
     def test_attn_type_tag_produces_typed_keys_and_split_global_aggregation(self):
         """When declare/record_layer_metric receives attn_type, keys are

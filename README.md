@@ -10,7 +10,7 @@
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 14 指标；仅在开启 mHC 层时生效)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
-- **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 33 指标；仅权重)
+- **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 36 指标；仅权重)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
 - **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
@@ -606,7 +606,9 @@ RMSNorm / QK-norm 的可学习 scale 在 QK 电路内部，故折进 `W_q` / `W_
 | 9 | `update_zmax_{max,p90,min}` | `mlp_update/layer_{i}/update_zmax_max` | `S^(l,e) = max_m z(r_m^(l,e))` | 每层+全局 | 专家级汇总分数 |
 | 10 | `shared_{m}_rel_update` | 同上 | `r_m` of shared expert | 每层+全局 | 共享专家，作路由专家的对照组 |
 
-`{m}` 取 `gate` / `up` / `down`。每层 33 个键（开 `log_spectrum` 后 42）。
+`{m}` 取 `gate` / `up` / `down`。每层 36 个键 = `update_zmax` 3 个 + 三块矩阵各 11 个（`rel_update` 6 + `delta_norm_mean` 1 + `stable_rank` 3 + `shared_{m}_rel_update` 1）；开 `log_spectrum` 后每块再加 3 个熵，共 45 个。
+
+> 逐层键落在 `mlp_update/layer_{i}/…`，全局聚合落在 `mlp_update/global_…`。dense 层（无 MoE）不声明指标，所以 18 层 MoE + 1 组 global = 684 个键。
 
 **专家级汇总分数**用 `max_m z(r_m)` 而不是平均：平均会让某一块矩阵的异常被另两块健康的摊薄，
 而平均原始范数会让尺度最大的那块矩阵决定结论。先在**同层专家间**做标准化把三块拉到同一尺度，

@@ -81,8 +81,21 @@ def _assignment_mask(
     return (one_hot * valid.unsqueeze(-1).astype("float32")).sum(axis=1).clip(max=1.0)
 
 
-def _routing_margin(selection_scores: paddle.Tensor, assignment_mask: paddle.Tensor) -> paddle.Tensor:
-    """Return selected-boundary margins for an ungrouped top-k router."""
+def _routing_margin(
+    selection_scores: paddle.Tensor, assignment_mask: paddle.Tensor
+) -> tuple[paddle.Tensor, paddle.Tensor]:
+    """Selected-boundary margin per token for an ungrouped top-k router.
+
+    ``margin = min(selected score) - max(unselected score)``: how close the
+    top-k boundary is to flipping. Returns ``(margin, valid)``.
+
+    Tokens the router assigned to nothing have no boundary — ``_assignment_mask``
+    turns the router's ``-1`` padding (dropped / pad tokens) into an all-zero
+    row, which makes ``selected`` ``+inf`` and the raw margin ``+inf``. Those
+    rows are refilled with the batch's largest real margin so that ``min`` and
+    the low-tail quantiles (which cannot take a mask) stay finite and are not
+    dragged by non-tokens; ``valid`` lets the caller take an exact masked mean.
+    """
     selected = paddle.where(
         assignment_mask > 0,
         selection_scores,
@@ -93,7 +106,11 @@ def _routing_margin(selection_scores: paddle.Tensor, assignment_mask: paddle.Ten
         paddle.full_like(selection_scores, float("-inf")),
         selection_scores,
     ).max(axis=-1)
-    return selected - unselected
+    raw = selected - unselected
+    valid = assignment_mask.sum(axis=-1) > 0
+    largest_real = paddle.where(valid, raw, paddle.full_like(raw, -1e30)).max()
+    margin = paddle.where(valid, raw, paddle.broadcast_to(largest_real, raw.shape))
+    return margin, valid
 
 
 def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=1, topk_group=1):
@@ -763,8 +780,13 @@ class PaddleMoEMonitor(PaddleProbe):
                     selection_scores = cached_gates.astype("float32")
                     if hasattr(gate, "e_score_correction_bias"):
                         selection_scores = selection_scores + gate.e_score_correction_bias.detach().astype("float32")
-                    margin = _routing_margin(selection_scores, assignment_mask)
-                    self.record_layer_metric(layer_idx, "router_margin_mean", margin.mean())
+                    margin, margin_valid = _routing_margin(selection_scores, assignment_mask)
+                    valid_weight = margin_valid.astype("float32")
+                    self.record_layer_metric(
+                        layer_idx,
+                        "router_margin_mean",
+                        (margin * valid_weight).sum() / valid_weight.sum().clip(min=1.0),
+                    )
                     self.record_layer_metric(layer_idx, "router_margin_min", margin.min())
                     self.record_layer_metric(layer_idx, "router_margin_p10", paddle.quantile(margin, 0.10))
                     self.record_layer_metric(layer_idx, "router_margin_p01", paddle.quantile(margin, 0.01))

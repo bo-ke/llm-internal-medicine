@@ -387,6 +387,51 @@ class PaddleMoEMonitorTest(unittest.TestCase):
 
         self.assertEqual(float(assignment_mask.sum()), 0.0)
 
+    def test_routing_margin_is_finite_for_invalid_assignment_rows(self):
+        scores = paddle.to_tensor(
+            [[0.7, 0.2, 0.1], [0.6, 0.3, 0.1], [0.5, 0.4, 0.2]],
+            dtype="float32",
+        )
+        assignment_mask = paddle.to_tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            dtype="float32",
+        )
+
+        margin, valid = moe_monitor_module._routing_margin(scores, assignment_mask)
+        metrics = moe_monitor_module._masked_margin_metrics(margin, valid)
+
+        self.assertTrue(bool(paddle.isfinite(margin).all()))
+        self.assertAlmostEqual(float(margin[0]), 0.0)
+        self.assertAlmostEqual(float(margin[1]), 0.3)
+        self.assertAlmostEqual(float(margin[2]), 0.0)
+        self.assertEqual(valid.tolist(), [False, True, False])
+        for value in metrics.values():
+            if value is not metrics["router_margin_valid_ratio"]:
+                self.assertAlmostEqual(float(value), 0.3)
+        self.assertAlmostEqual(float(metrics["router_margin_valid_ratio"]), 1.0 / 3.0)
+
+    def test_routing_margin_metrics_return_zero_for_all_invalid_rows(self):
+        margin = paddle.zeros([3], dtype="float32")
+        valid = paddle.zeros([3], dtype="bool")
+
+        metrics = moe_monitor_module._masked_margin_metrics(margin, valid)
+
+        self.assertTrue(all(bool(paddle.isfinite(value)) for value in metrics.values()))
+        self.assertTrue(all(float(value) == 0.0 for value in metrics.values()))
+        self.assertAlmostEqual(float(metrics["router_margin_valid_ratio"]), 0.0)
+
+    def test_routing_margin_metrics_exclude_invalid_rows_from_all_reductions(self):
+        margin = paddle.to_tensor([0.0, 0.1, 0.3, 0.0], dtype="float32")
+        valid = paddle.to_tensor([False, True, True, False], dtype="bool")
+
+        metrics = moe_monitor_module._masked_margin_metrics(margin, valid)
+
+        self.assertAlmostEqual(float(metrics["router_margin_mean"]), 0.2)
+        self.assertAlmostEqual(float(metrics["router_margin_min"]), 0.1)
+        self.assertAlmostEqual(float(metrics["router_margin_p10"]), 0.12)
+        self.assertAlmostEqual(float(metrics["router_margin_p01"]), 0.102)
+        self.assertAlmostEqual(float(metrics["router_margin_valid_ratio"]), 0.5)
+
     def test_mtp_layer_marker_is_encoded_in_metric_key(self):
         monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
         monitor.mark_mtp_layers([1])

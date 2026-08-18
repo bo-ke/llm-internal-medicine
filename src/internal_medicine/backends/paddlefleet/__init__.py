@@ -2,6 +2,7 @@
 
 import logging
 
+from .attn_update_monitor import PaddleAttnUpdateMonitor, setup_attn_update_monitor
 from .base import PaddleProbe
 from .gather import install_gather_fn
 from .massive_activation_monitor import PaddleMassiveActivationMonitor, setup_massive_activation_monitor
@@ -18,6 +19,7 @@ _MONITOR_MAP = {
     "massive_act": setup_massive_activation_monitor,
     "mhc_health": setup_mhc_monitor,
     "vha_health": setup_vha_monitor,
+    "attn_update": setup_attn_update_monitor,
 }
 
 _MODEL_MONITOR_ATTR = "_internal_medicine_paddlefleet_monitors"
@@ -106,4 +108,6 @@ __all__ = [
     "setup_mhc_monitor",
     "PaddleVHAHealthMonitor",
     "setup_vha_monitor",
+    "PaddleAttnUpdateMonitor",
+    "setup_attn_update_monitor",
 ]

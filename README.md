@@ -132,7 +132,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health`
+- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update`
 - `global_idx`: 全局层索引。优先取模块自带的 `layer.layer_number`（0-based 全局编号）；取不到时回退到
   `pp_rank × local_layers + local_idx`。`num_empty_layers_add_in_head > 0` 时所有层号整体偏移该值，看板对号要减掉
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
@@ -464,6 +464,97 @@ premix 的指标集由权重形状决定（方阵 → 10~12；非方阵 → 12~1
 
 ---
 
+## 七、Attn Update Monitor (attn_update)
+
+监控 QK 乘积增量（arXiv:2606.28116 §3.4）。记采样间隔 δ 内 `ΔW = W_t − W_{t−δ}`，
+QK 乘积的变化可精确拆成 `Δ₁ = Δ₂ + Δ₃`，本 monitor 监控其中两项：
+
+```
+Δ₂ = ΔW_q W_kᵀ + W_q ΔW_kᵀ = [ΔW_q, W_q][W_k, ΔW_k]ᵀ     (一阶，秩 ≤ 2·head_dim)
+Δ₃ = ΔW_q ΔW_kᵀ                                            (二阶，秩 ≤ head_dim)
+```
+
+**Δ₁ 故意不监控**：论文 Eq (5) 给出 `‖Δ₂‖_F = O(‖W‖_F‖ΔW‖_F)` 而 `‖Δ₃‖_F = O(‖ΔW‖_F²)`，
+早中期 `‖ΔW‖_F ≪ ‖W‖_F` 时 `Δ₁ ≈ Δ₂`，再花一个完整的 `2·head_dim` 核去重复测 Δ₂ 不值。
+**Δ₃ 保留**是因为它是唯一活在 Q/K 更新**耦合**空间里的项（论文：`can become visible before spectral
+concentration is obvious in the separate factor updates ΔW_q, ΔW_k`）。但要清楚它比 Δ₂ **晚**报警
+（论文实测排序 `Δ₁ ≈ Δ₂ < Δ₃ < ΔW`），买到的是一个新维度加一级便宜的确认，不是更早的预警。
+
+当因子宽度小于 `hidden` 时把谱计算挪到 thin-QR 核 `R_A R_Bᵀ` 上，`hidden × hidden` 的稠密乘积从不物化。
+
+三个指标都只是 `σ²` 的函数，所以用 Gram + `eigvalsh` 取谱，并且**所有层所有项拼成一次批量调用**
+（先按 shape 分桶——Δ₂ 的核是 `2·head_dim` 宽、Δ₃ 是 `head_dim`，只有同形状能共享一次批量求解；
+再按 `_MAX_BATCH_BYTES` 分块，`hidden=1024` 时每批 64 个）。
+
+实测（H 系列单卡，`hidden=1024`、`head_dim=128`、18 层 × 1 head）：
+
+- 逐层 `svd` 2054 ms → 逐层 Gram+`eigvalsh` 420 ms → 批量 Gram+`eigvalsh` 277 ms
+- 只算 Δ₂ 138 ms；只算 Δ₃ 72 ms（Δ₂ 的 0.52×）；两项分桶合算 211 ms
+- 即**加上 Δ₃ 是 ~1.5×，不是 ~1.1×** —— thin-QR 是 `O(d·r²)`，在这个尺寸上盖过了 `O(r³)` 的特征分解，
+  所以核宽减半并不等于成本降到 1/8
+- 端到端一个采样步 ~0.7 s，δ=10 摊到 4.0 s 的训练步上约 **1.8%**（只有 Δ₂ 时约 1.2%）
+
+绝对值会随 GPU 争用浮动约 2×，看比例即可。
+
+> Gram 平方会损失 `σ < sqrt(eps)·σ_max` 那部分奇异值的精度，但 α=2 下这些分量权重为 ~0；
+> 单元测试把三个指标都对着 float64 稠密 SVD 钉住，相对误差 ≤ 3e-5。若把 `spectrum_alpha` 调小到 1，
+> 小奇异值权重变大，这条论证不再成立。
+
+本 monitor **不注册 forward hook**：它在 `step()` 边界直接读 QK 权重，把上一次读数作为基准点，
+因此采样间隔 δ = 本 monitor 自己的间隔（`sample_interval`，未设置时回退到 `monitor_interval`），
+且**第一个采样步只建立基准点、不产出指标**。
+
+| # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
+|---|------|--------|------|------|----------|
+| 1 | `delta2_norm` | `attn_update/layer_{i}/delta2_norm` | `‖Δ₂‖_F` | 每层+全局 | 一阶增量的整体幅度 |
+| 2 | `delta2_stable_rank` | `attn_update/layer_{i}/delta2_stable_rank` | `‖Δ₂‖_F² / ‖Δ₂‖₂²` | 每层+全局 | top-1 奇异值主导程度的倒数 |
+| 3 | `delta2_singular_spectrum` | `attn_update/layer_{i}/delta2_singular_spectrum` | `S₂ = exp(−Σ pᵢ log pᵢ), pᵢ = σᵢ²/Σσⱼ²` | 每层+全局 | 全谱有效秩，论文中最灵敏的坍缩前兆 |
+| 4 | `delta3_norm` | `attn_update/layer_{i}/delta3_norm` | `‖Δ₃‖_F` | 每层+全局 | 二阶耦合项幅度，正常时应远小于 `delta2_norm` |
+| 5 | `delta3_stable_rank` | `attn_update/layer_{i}/delta3_stable_rank` | `‖Δ₃‖_F² / ‖Δ₃‖₂²` | 每层+全局 | Q/K 更新耦合的 top-1 主导程度 |
+| 6 | `delta3_singular_spectrum` | `attn_update/layer_{i}/delta3_singular_spectrum` | 同上，作用在 Δ₃ 的谱上 | 每层+全局 | Q/K 更新耦合变得 coherent 时下降 |
+
+`resolve_qk_factors` 只从权重重建每个 head 的 QK 电路，支持四种布局，按从特殊到通用的顺序匹配：
+
+- **DSv4-hybrid**：`linear_q_down_proj → q_layernorm → linear_q_up_proj`，`linear_kv_proj → kv_layernorm`，
+  单个共享 KV head。
+- **MLA**：`q_proj` 或 `q_a_proj → q_a_layernorm → q_b_proj`；K 只经由
+  `kv_a_proj_with_mqa → kv_a_layernorm → kv_b_proj` 依赖 hidden。只有 NoPE 半边参与内容项，
+  所以这里的电路宽度是 `qk_nope_head_dim` 而非 `q_head_dim`。切片先做、再与 latent 相乘，
+  否则完整乘积是 `[hidden, num_heads × q_head_dim]`，在 128 head 上会是数百 MB。
+- **融合 `qkv_proj` / `linear_qkv`**：输出按 KV head 分组为 `Q|(gate)|K|V`，分组算术会先与真实权重宽度
+  对账，不符就整层跳过而不是错切。
+- **独立 `q_proj` / `k_proj`**（含 GQA/MQA、VHA）：head 数从权重宽度推出，因此 TP 分片下每卡报自己实际持有的 head。
+
+RMSNorm / QK-norm 的可学习 scale 在 QK 电路内部，故折进 `W_q` / `W_k`（per-head 与 per-layer 两种形状都认，
+形状对不上时宁可不折也不猜）；输入相关的 `1/rms` 不是权重、不参与。不匹配任何布局的层直接跳过，不声明指标。
+同一模型里混用布局时电路宽度可能不同，`_spectrum_metrics_over_pairs` 会先按 shape 分桶再各自批量求解。
+
+配置参数：
+
+- `sample_interval` (默认 `None`)：本 monitor 的采样间隔 δ，单位训练步；`None` 时用全局 `monitor_interval`。
+  单独设置的意义在于这里的成本是每层每次采样一次特征分解，与 forward 无关，可以比 hook 类 monitor 采得更稀。
+  另外 δ 不宜太小：论文 Observation 1 靠的是窗口内累积（coherent 分量按 `n` 线性增长、残差按 `√n`），
+  δ=1 时 n=1，信号会被噪声压住。
+- `num_heads_monitored` (默认 `1`)：每层取前若干 head，逐层指标为这些 head 的均值。每个 head 需要两次
+  对称特征分解（Δ₂ 的 `2·head_dim` 核 + Δ₃ 的 `head_dim` 核），成本随该值线性增长。
+- `spectrum_alpha` (默认 `2.0`)：`S_α` 的权重指数，论文推荐 2（即 "singular spectrum"）。
+
+> 判读方式：**故障凭证是曲线相对健康基线的偏移，而不是低秩本身**——健康训练的更新本就带低秩结构
+> （LoRA / GaLore / Muon 正是利用这一点），所以需要与 baseline run 对比，而非单看绝对值。
+
+> **论文的绝对提前量不可直接搬用。** 论文报的「Δ₂ 比 loss 发散早 ~17,000 步、比 ΔW 谱早 ~8,000 步」
+> 是在 plain MHA 上测的。§6 Limitations 明确说 MLA/GQA/MQA/DSA 的 QK 算子被压缩投影和共享 head 中介，
+> `Δ₂ 代理需要为每个变体重新推导`，检测阈值是 variant-specific 的。本实现的代数对任意 `W_q`/`W_k`
+> 都精确（`A_tB_tᵀ − ABᵀ = ΔA·Bᵀ + A·ΔBᵀ + ΔA·ΔBᵀ` 是恒等式，不要求它们是原始参数），
+> 但 Observation 1 的机制是在**参数级** ΔW 上陈述的；MLA/DSv4-hybrid 下 `W_q^eff` 是多个参数的复合，
+> 低精度 FA 打进各参数更新的 coherent 结构穿过 latent 之后还剩多少，论文没有回答。
+> 结论：只与同架构的 baseline run 对比，不要拿论文数字当阈值。
+
+> 尚未实现：§3.2 的 raw ΔW 谱指标（`ΔW_q` / `ΔW_k` 各自的 norm / stable rank / singular spectrum）。
+> 它是比 Δ₂ 晚约 8,000 步的**第二级确认信号**，缺了它时 Δ₂ 单独波动无法交叉验证。
+
+---
+
 ## 基础设施
 
 ### TrainingLogs
@@ -516,7 +607,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 
 ## 附录: 完整指标速查表
 
-共 82 个指标键 (26 MoE + 10 QK + 21 MassiveAct + 7 PLE + 15 VHA + 3 Optim)。
+共 88 个指标键 (26 MoE + 10 QK + 21 MassiveAct + 7 PLE + 15 VHA + 6 AttnUpdate + 3 Optim)。mHC 的指标随 hc 模块数量而变，见上文单独章节。
 
 | Monitor | 指标 | 公式 | SmoothedValue 模式 | 健康信号 |
 |---------|------|------|--------------------|----------|
@@ -599,6 +690,12 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **VHA** | `premix_group_div_ratio` | `mean‖W_g−W_g'‖²/mean‖W_g−I‖²` | mean | 0=各组同一变换, 2=完全独立 |
 | **VHA** | `premix_sigma_max` | `σ_max(W)` | max | premix 谱范数 (需 use_vha_premix) |
 | **VHA** | `premix_orth_dev` | `‖WᵀW − I‖_F` | mean | 仅非方阵 premix (正交初始化) |
+| **AttnUpdate** | `delta2_norm` | `‖Δ₂‖_F` | mean | 一阶 QK 增量幅度 |
+| **AttnUpdate** | `delta2_stable_rank` | `‖Δ₂‖_F²/‖Δ₂‖₂²` | mean | 偏离健康基线 = 谱坍缩前兆 |
+| **AttnUpdate** | `delta2_singular_spectrum` | `S₂ = exp(-Σ p log p), p=σ²/Σσ²` | mean | 同上，全谱、更灵敏 |
+| **AttnUpdate** | `delta3_norm` | `‖Δ₃‖_F` | mean | 二阶耦合项幅度，应远小于 `delta2_norm` |
+| **AttnUpdate** | `delta3_stable_rank` | `‖Δ₃‖_F²/‖Δ₃‖₂²` | mean | Q/K 更新耦合的 top-1 主导程度 |
+| **AttnUpdate** | `delta3_singular_spectrum` | 同上，作用在 Δ₃ 的谱上 | mean | Q/K 更新耦合变 coherent 时下降 |
 | **Optim** | `update_rms` | `sqrt(mean((θ_new−θ_old)²))` | 已全局归约 | 本 step 参数更新幅度 (始终装上, 受 monitor_interval 门控) |
 | **Optim** | `param_rms` | `sqrt(mean(θ_new²))` | 已全局归约 | 更新后参数尺度 (始终装上, 受 monitor_interval 门控) |
 | **Optim** | `update_param_ratio` | `update_rms / param_rms` | 已全局归约 | trust ratio, ~1e-3 健康 (始终装上, 受 monitor_interval 门控) |

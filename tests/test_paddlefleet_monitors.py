@@ -22,6 +22,8 @@ PaddleMassiveActivationMonitor = importlib.import_module(
 ).PaddleMassiveActivationMonitor
 PaddleMoEMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor").PaddleMoEMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
+attn_update_module = importlib.import_module("internal_medicine.backends.paddlefleet.attn_update_monitor")
+PaddleAttnUpdateMonitor = attn_update_module.PaddleAttnUpdateMonitor
 qk_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor")
 PaddleQKStatsMonitor = qk_monitor_module.PaddleQKStatsMonitor
 paddlefleet_backend = importlib.import_module("internal_medicine.backends.paddlefleet")
@@ -1558,6 +1560,457 @@ class SparseQKKernelComputeTest(unittest.TestCase):
         )
         # The sink is not a real key, so logit max/mean must be unchanged.
         self.assertTrue(paddle.allclose(with_sink["max_per_head"], no_sink["max_per_head"], atol=1e-6).item())
+
+
+class PaddleAttnUpdateMonitorTest(unittest.TestCase):
+    """delta2/delta3 = QK-product increment terms (arXiv:2606.28116 eq. 4)."""
+
+    def setUp(self):
+        training_logs.reset()
+        paddle.seed(0)
+
+    def tearDown(self):
+        training_logs.reset()
+
+    @staticmethod
+    def _dense_reference(a, b, alpha=2.0):
+        """Metrics straight off a full float64 SVD of the materialised product."""
+        sigma = paddle.linalg.svd((a @ b.T).astype("float64"), full_matrices=False)[1]
+        squared = sigma * sigma
+        total = squared.sum()
+        weights = squared if alpha == 2.0 else squared ** (alpha / 2.0)
+        p = (weights / weights.sum()).clip(min=1e-300)
+        return {
+            "norm": float(paddle.sqrt(total)),
+            "stable_rank": float(total / squared.max()),
+            "singular_spectrum": float(paddle.exp(-(p * p.log()).sum())),
+        }
+
+    def _assert_matches_dense(self, a, b, alpha=2.0, places=3):
+        got = attn_update_module._spectrum_metrics(attn_update_module._squared_singular_values(a, b), alpha)
+        reference = self._dense_reference(a, b, alpha)
+        for name, expected in reference.items():
+            self.assertAlmostEqual(
+                float(got[name]) / expected, 1.0, places=places, msg=f"{name}: {got[name]} vs {expected}"
+            )
+
+    def test_squared_singular_values_core_branch_matches_dense_svd(self):
+        """2*head_dim < hidden takes the thin-QR core path; spectrum must be identical."""
+        a = paddle.randn([64, 16])
+        b = paddle.randn([64, 16])
+        self.assertLess(a.shape[-1], a.shape[-2])
+        self._assert_matches_dense(a, b, alpha=2.0)
+        self._assert_matches_dense(a, b, alpha=1.0)
+
+    def test_squared_singular_values_direct_branch_matches_dense_svd(self):
+        """2*head_dim >= hidden makes the core no smaller than the product."""
+        a = paddle.randn([32, 32])
+        b = paddle.randn([32, 32])
+        self._assert_matches_dense(a, b, alpha=2.0)
+        self._assert_matches_dense(a, b, alpha=1.0)
+
+    def test_spectrum_metrics_on_flat_spectrum_equals_rank(self):
+        """k equal singular values: stable rank = S_alpha = k, norm = sqrt(sum of squares)."""
+        metrics = attn_update_module._spectrum_metrics(paddle.full([8], 4.0))
+        self.assertAlmostEqual(float(metrics["stable_rank"]), 8.0, places=4)
+        self.assertAlmostEqual(float(metrics["singular_spectrum"]), 8.0, places=4)
+        self.assertAlmostEqual(float(metrics["norm"]), math.sqrt(32.0), places=4)
+
+    def test_spectrum_metrics_on_collapsed_spectrum_is_one(self):
+        """All energy in one direction: both rank measures bottom out at 1."""
+        metrics = attn_update_module._spectrum_metrics(paddle.to_tensor([9.0, 0.0, 0.0, 0.0]))
+        self.assertAlmostEqual(float(metrics["stable_rank"]), 1.0, places=4)
+        self.assertAlmostEqual(float(metrics["singular_spectrum"]), 1.0, places=3)
+        self.assertAlmostEqual(float(metrics["norm"]), 3.0, places=4)
+
+    def test_singular_spectrum_uses_alpha_two_weighting(self):
+        """S_2 weights by sigma^2, so it differs from the sigma-weighted S_1."""
+        squared = paddle.to_tensor([16.0, 4.0, 1.0])
+        s2 = float(attn_update_module._spectrum_metrics(squared, 2.0)["singular_spectrum"])
+        s1 = float(attn_update_module._spectrum_metrics(squared, 1.0)["singular_spectrum"])
+
+        def entropy_rank(weights):
+            total = sum(weights)
+            return math.exp(-sum((w / total) * math.log(w / total) for w in weights))
+
+        self.assertAlmostEqual(s2, entropy_rank([16.0, 4.0, 1.0]), places=4)
+        self.assertAlmostEqual(s1, entropy_rank([4.0, 2.0, 1.0]), places=4)
+        self.assertLess(s2, s1)
+
+    def test_batched_driver_matches_pair_by_pair_metrics(self):
+        """Batching layers into one eigvalsh must not move any value."""
+        pairs = [(paddle.randn([32, 12]), paddle.randn([32, 12])) for _ in range(5)]
+        batched = attn_update_module._spectrum_metrics_over_pairs(pairs)
+        for index, (a, b) in enumerate(pairs):
+            single = attn_update_module._spectrum_metrics(attn_update_module._squared_singular_values(a, b))
+            for key in attn_update_module._SPECTRUM_KEYS:
+                self.assertAlmostEqual(float(batched[key][index]) / float(single[key]), 1.0, places=5, msg=key)
+
+    def test_batched_driver_chunks_without_changing_results(self):
+        """More pairs than fit in one chunk still line up with the flat order."""
+        original = attn_update_module._MAX_BATCH_BYTES
+        pairs = [(paddle.randn([16, 8]), paddle.randn([16, 8])) for _ in range(7)]
+        try:
+            attn_update_module._MAX_BATCH_BYTES = 16 * 16 * 4 * 2  # 2 pairs per chunk
+            chunked = attn_update_module._spectrum_metrics_over_pairs(pairs)
+        finally:
+            attn_update_module._MAX_BATCH_BYTES = original
+        flat = attn_update_module._spectrum_metrics_over_pairs(pairs)
+        for key in attn_update_module._SPECTRUM_KEYS:
+            self.assertEqual(chunked[key].shape, [7])
+            self.assertTrue(paddle.allclose(chunked[key], flat[key], atol=1e-5).item(), key)
+
+    @staticmethod
+    def _attn(hidden=24, q_lora=12, head_dim=8, num_heads=2, with_norms=True):
+        """Minimal DSv4-hybrid QK layout: q_down -> q_layernorm -> q_up, kv -> kv_layernorm."""
+        attn = SimpleNamespace(
+            linear_q_down_proj=SimpleNamespace(weight=paddle.randn([hidden, q_lora])),
+            linear_q_up_proj=SimpleNamespace(weight=paddle.randn([q_lora, head_dim * num_heads])),
+            linear_kv_proj=SimpleNamespace(weight=paddle.randn([hidden, head_dim])),
+        )
+        if with_norms:
+            attn.q_layernorm = SimpleNamespace(weight=paddle.rand([q_lora]) + 0.5)
+            attn.kv_layernorm = SimpleNamespace(weight=paddle.rand([head_dim]) + 0.5)
+        return attn
+
+    @staticmethod
+    def _perturb(attn, scale=0.05):
+        """In-place parameter update, the way an optimizer step mutates weights."""
+        for module in (attn.linear_q_down_proj, attn.linear_q_up_proj, attn.linear_kv_proj):
+            paddle.assign(module.weight + scale * paddle.randn(module.weight.shape), module.weight)
+
+    def test_resolve_qk_factors_reads_head_layout(self):
+        factors = attn_update_module.resolve_qk_factors(self._attn(head_dim=8, num_heads=2))
+        self.assertEqual(factors["head_dim"], 8)
+        self.assertEqual(factors["num_heads"], 2)
+
+    def test_resolve_qk_factors_returns_none_for_other_layouts(self):
+        self.assertIsNone(attn_update_module.resolve_qk_factors(SimpleNamespace()))
+        # q_up width not divisible by the kv head_dim -> not this circuit
+        bad = self._attn(head_dim=8, num_heads=2)
+        bad.linear_q_up_proj = SimpleNamespace(weight=paddle.randn([12, 13]))
+        self.assertIsNone(attn_update_module.resolve_qk_factors(bad))
+
+    def test_effective_wk_snapshot_does_not_alias_the_live_parameter(self):
+        """Without a kv_layernorm the fp32 read is a no-op, so it must clone."""
+        attn = self._attn(with_norms=False)
+        factors = attn_update_module.resolve_qk_factors(attn)
+        snapshot = attn_update_module.effective_wk(factors)
+        before = snapshot.clone()
+        self._perturb(attn, scale=1.0)
+        self.assertTrue(paddle.allclose(snapshot, before).item())
+
+    def test_effective_wq_folds_the_q_layernorm_scale(self):
+        attn = self._attn(head_dim=8, num_heads=2)
+        factors = attn_update_module.resolve_qk_factors(attn)
+        expected = (
+            attn.linear_q_down_proj.weight * attn.q_layernorm.weight.reshape([1, -1])
+        ) @ attn.linear_q_up_proj.weight[:, 8:16]
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected, atol=1e-5).item())
+
+    def _monitor_on(self, layers, **kwargs):
+        monitor = PaddleAttnUpdateMonitor(monitor_interval=1, **kwargs)
+        monitor.register_hooks(SimpleNamespace(layers=layers))
+        return monitor
+
+    def test_first_monitored_step_only_establishes_the_base_point(self):
+        """delta2 needs two samples; the first step must emit nothing."""
+        attn = self._attn()
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn)])
+        monitor.step()
+
+        self.assertEqual(training_logs.get_latest(prefix="attn_update"), {})
+        self._perturb(attn)
+        monitor.step()
+        self.assertIn("attn_update/layer_0/delta2_norm", training_logs.get_latest(prefix="attn_update"))
+
+    def test_delta2_and_delta3_match_the_dense_increment_terms(self):
+        """End-to-end: recorded metrics equal those of eq. (4)'s dense products."""
+        attn = self._attn(hidden=24, q_lora=12, head_dim=8, num_heads=2)
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn)], num_heads_monitored=1)
+        factors = attn_update_module.resolve_qk_factors(attn)
+        wq_base = attn_update_module.effective_wq(factors, 0)
+        wk_base = attn_update_module.effective_wk(factors)
+
+        monitor.step()  # base point
+        self._perturb(attn)
+        monitor.step()  # increments against the base point
+
+        wq_now = attn_update_module.effective_wq(factors, 0)
+        wk_now = attn_update_module.effective_wk(factors)
+        dq, dk = wq_now - wq_base, wk_now - wk_base
+        dense = {
+            "delta2": dq @ wk_base.T + wq_base @ dk.T,
+            "delta3": dq @ dk.T,
+        }
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        for term, product in dense.items():
+            reference = self._dense_reference(product, paddle.eye(product.shape[-1]))
+            for key, expected in reference.items():
+                got = latest[f"attn_update/layer_0/{term}_{key}"]
+                self.assertAlmostEqual(got / expected, 1.0, places=3, msg=f"{term}_{key}")
+
+    def test_delta3_is_second_order_and_far_smaller_than_delta2(self):
+        """eq. (5): ||delta2||_F = O(||W|| ||dW||) vs ||delta3||_F = O(||dW||^2)."""
+        attn = self._attn(hidden=24, q_lora=12, head_dim=8, num_heads=2)
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn)])
+        monitor.step()
+        self._perturb(attn, scale=0.01)  # ||dW|| << ||W||
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        self.assertLess(latest["attn_update/layer_0/delta3_norm"], latest["attn_update/layer_0/delta2_norm"])
+
+    def test_delta3_core_is_half_as_wide_as_delta2(self):
+        """delta3's factors are [d, head_dim]; delta2 concatenates two of them."""
+        attn = self._attn(head_dim=8, num_heads=2)
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn)])
+        monitor.step()
+        self._perturb(attn)
+        per_term = monitor._prepare_layer(0, monitor._layers[0][2])
+
+        self.assertEqual(sorted(per_term), ["delta2", "delta3"])
+        self.assertEqual([list(m.shape) for m in per_term["delta2"][0]], [[24, 16], [24, 16]])
+        self.assertEqual([list(m.shape) for m in per_term["delta3"][0]], [[24, 8], [24, 8]])
+
+    def test_delta2_is_per_layer_with_global_mean_over_layers(self):
+        attn_a, attn_b = self._attn(), self._attn()
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn_a), SimpleNamespace(self_attn=attn_b)])
+        monitor.step()
+        self._perturb(attn_a)
+        self._perturb(attn_b, scale=0.5)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        for name in attn_update_module.METRIC_NAMES:
+            per_layer = [latest[f"attn_update/layer_{i}/{name}"] for i in (0, 1)]
+            self.assertAlmostEqual(latest[f"attn_update/global_{name}"], sum(per_layer) / 2.0, places=4, msg=name)
+        # A 10x larger update must show a larger increment norm.
+        self.assertLess(latest["attn_update/layer_0/delta2_norm"], latest["attn_update/layer_1/delta2_norm"])
+
+    def test_per_layer_value_is_the_mean_over_monitored_heads(self):
+        attn = self._attn(head_dim=8, num_heads=2)
+        two_heads = self._monitor_on([SimpleNamespace(self_attn=attn)], num_heads_monitored=2)
+        one_head = self._monitor_on([SimpleNamespace(self_attn=attn)], num_heads_monitored=1)
+        for monitor in (two_heads, one_head):
+            monitor.step()
+        self._perturb(attn)
+
+        one_head.step()
+        head0 = training_logs.get_latest(prefix="attn_update")["attn_update/layer_0/delta2_norm"]
+        training_logs.reset()
+        two_heads.step()
+        both = training_logs.get_latest(prefix="attn_update")["attn_update/layer_0/delta2_norm"]
+
+        # Distinct heads give distinct increments, so the 2-head mean must move.
+        self.assertNotAlmostEqual(head0, both, places=4)
+
+    def test_mtp_layer_gets_its_own_suffixed_keys(self):
+        main = SimpleNamespace(self_attn=self._attn())
+        mtp_inner = SimpleNamespace(self_attn=self._attn())
+        # An MTP id is num_hidden_layers + its local index, so the config has to be
+        # reachable from the wrapper; without it the layer is skipped rather than
+        # given an id derived from whatever main layers this rank happens to hold.
+        wrapper = SimpleNamespace(transformer_layer=mtp_inner, config=SimpleNamespace(num_hidden_layers=1))
+        monitor = self._monitor_on([main, wrapper])
+        monitor.step()
+        self._perturb(main.self_attn)
+        self._perturb(mtp_inner.self_attn)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        self.assertIn("attn_update/layer_0/delta2_norm", latest)
+        self.assertIn("attn_update/layer_1_mtp/delta2_norm", latest)
+
+    def test_unsupported_layers_are_skipped_without_declaring_metrics(self):
+        monitor = PaddleAttnUpdateMonitor(monitor_interval=1)
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace())]))
+        monitor.step()
+
+        self.assertEqual(monitor._layers, [])
+        self.assertFalse(monitor._buffers_allocated)
+        self.assertEqual(training_logs.get_latest(prefix="attn_update"), {})
+
+    def test_monitor_interval_sets_the_sampling_distance(self):
+        """Metrics only appear on steps that are multiples of monitor_interval."""
+        attn = self._attn()
+        monitor = PaddleAttnUpdateMonitor(monitor_interval=3)
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)]))
+
+        monitor.step()  # step_count 0 -> base point
+        for _ in range(2):
+            self._perturb(attn)
+            monitor.step()
+            self.assertEqual(training_logs.get_latest(prefix="attn_update"), {})
+        self._perturb(attn)
+        monitor.step()  # step_count 3 -> first delta2, sampled 3 steps apart
+        self.assertIn("attn_update/layer_0/delta2_norm", training_logs.get_latest(prefix="attn_update"))
+
+    def test_registered_in_the_paddlefleet_monitor_map(self):
+        self.assertIn("attn_update", paddlefleet_backend._MONITOR_MAP)
+        registry = importlib.import_module("internal_medicine.core.registry")
+        self.assertIn("attn_update", registry.AVAILABLE_MONITORS["paddlefleet"])
+
+    # ── sampling interval ────────────────────────────────────────────────
+
+    def test_sample_interval_defaults_to_monitor_interval(self):
+        self.assertEqual(PaddleAttnUpdateMonitor(monitor_interval=7).monitor_interval, 7)
+
+    def test_sample_interval_overrides_monitor_interval(self):
+        """delta2 costs one eigensolve per sample, so it may sample more sparsely."""
+        monitor = PaddleAttnUpdateMonitor(monitor_interval=1, sample_interval=4)
+        self.assertEqual(monitor.monitor_interval, 4)
+
+        attn = self._attn()
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)]))
+        monitor.step()  # step_count 0 -> base point
+        for _ in range(3):
+            self._perturb(attn)
+            monitor.step()
+            self.assertEqual(training_logs.get_latest(prefix="attn_update"), {})
+        self._perturb(attn)
+        monitor.step()  # step_count 4 -> first delta2
+        self.assertIn("attn_update/layer_0/delta2_norm", training_logs.get_latest(prefix="attn_update"))
+
+    def test_sample_interval_rejects_non_positive_values(self):
+        with self.assertRaises(ValueError):
+            PaddleAttnUpdateMonitor(sample_interval=0)
+
+    # ── attention layouts beyond DSv4-hybrid ─────────────────────────────
+
+    @staticmethod
+    def _mla_attn(hidden=16, q_lora=8, kv_lora=6, nope=4, rope=2, v_head_dim=5, heads=2):
+        """MLA: q_a -> q_a_layernorm -> q_b, kv_a -> kv_a_layernorm -> kv_b."""
+        return SimpleNamespace(
+            q_a_proj=SimpleNamespace(weight=paddle.randn([hidden, q_lora])),
+            q_a_layernorm=SimpleNamespace(weight=paddle.rand([q_lora]) + 0.5),
+            q_b_proj=SimpleNamespace(weight=paddle.randn([q_lora, heads * (nope + rope)])),
+            kv_a_proj_with_mqa=SimpleNamespace(weight=paddle.randn([hidden, kv_lora + rope])),
+            kv_a_layernorm=SimpleNamespace(weight=paddle.rand([kv_lora]) + 0.5),
+            kv_b_proj=SimpleNamespace(weight=paddle.randn([kv_lora, heads * (nope + v_head_dim)])),
+            num_attention_heads_per_partition=heads,
+            qk_nope_head_dim=nope,
+            qk_rope_head_dim=rope,
+        )
+
+    def test_mla_layout_uses_only_the_nope_half_of_each_head(self):
+        attn = self._mla_attn()
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertEqual(factors["kind"], "mla")
+        self.assertEqual(factors["head_dim"], 4)  # qk_nope_head_dim, not q_head_dim
+        self.assertEqual(factors["num_heads"], 2)
+
+        # Head 1's content circuit composes through both latents.
+        q_latent = attn.q_a_proj.weight * attn.q_a_layernorm.weight.reshape([1, -1])
+        expected_q = q_latent @ attn.q_b_proj.weight[:, 6:10]  # head 1, first nope=4 of q_head_dim=6
+        kv_latent = attn.kv_a_proj_with_mqa.weight[:, :6] * attn.kv_a_layernorm.weight.reshape([1, -1])
+        expected_k = kv_latent @ attn.kv_b_proj.weight[:, 9:13]  # head 1, first nope=4 of width=9
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected_q, atol=1e-5).item())
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wk(factors, 1), expected_k, atol=1e-5).item())
+
+    def test_mla_without_q_lora_reads_q_proj_directly(self):
+        attn = self._mla_attn()
+        del attn.q_a_proj, attn.q_a_layernorm, attn.q_b_proj
+        attn.q_proj = SimpleNamespace(weight=paddle.randn([16, 12]))
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertEqual(factors["kind"], "mla")
+        self.assertIsNone(factors["q_a"])
+        expected = attn.q_proj.weight[:, 6:10]
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected, atol=1e-5).item())
+
+    @staticmethod
+    def _fused_qkv_attn(hidden=16, head_dim=4, heads=4, kv_heads=2):
+        """Standard attention: one qkv_proj grouped per KV head as Q|K|V."""
+        group_dim = (heads // kv_heads) * head_dim + 2 * head_dim
+        return SimpleNamespace(
+            qkv_proj=SimpleNamespace(weight=paddle.randn([hidden, kv_heads * group_dim])),
+            num_attention_heads_per_partition=heads,
+            num_query_groups_per_partition=kv_heads,
+            hidden_size_per_attention_head=head_dim,
+        )
+
+    def test_fused_qkv_layout_slices_the_interleaved_group(self):
+        attn = self._fused_qkv_attn()
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertEqual(factors["kind"], "fused_qkv")
+        self.assertEqual((factors["num_heads"], factors["num_kv_heads"]), (4, 2))
+        self.assertEqual(factors["group_dim"], 16)
+
+        # Head 3 is the second query head of group 1: q at 16+4, k at 16+8.
+        weight = attn.qkv_proj.weight
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 3), weight[:, 20:24]).item())
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wk(factors, 3), weight[:, 24:28]).item())
+        # Heads 2 and 3 share group 1's single key matrix.
+        self.assertTrue(
+            paddle.allclose(
+                attn_update_module.effective_wk(factors, 2), attn_update_module.effective_wk(factors, 3)
+            ).item()
+        )
+
+    def test_fused_qkv_layout_rejects_a_width_that_contradicts_the_grouping(self):
+        """The group arithmetic is checked against the real weight, not assumed."""
+        attn = self._fused_qkv_attn()
+        attn.qkv_proj = SimpleNamespace(weight=paddle.randn([16, 30]))
+        self.assertIsNone(attn_update_module.resolve_qk_factors(attn))
+
+    def test_split_qk_layout_maps_query_heads_onto_kv_groups(self):
+        attn = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 16])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            hidden_size_per_attention_head=4,
+        )
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertEqual(factors["kind"], "split_qk")
+        self.assertEqual((factors["num_heads"], factors["num_kv_heads"]), (4, 2))
+        self.assertTrue(
+            paddle.allclose(attn_update_module.effective_wq(factors, 2), attn.q_proj.weight[:, 8:12]).item()
+        )
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wk(factors, 2), attn.k_proj.weight[:, 4:8]).item())
+
+    def test_split_qk_folds_a_per_head_qk_norm(self):
+        attn = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            q_norm=SimpleNamespace(weight=paddle.rand([4]) + 0.5),
+            hidden_size_per_attention_head=4,
+        )
+        factors = attn_update_module.resolve_qk_factors(attn)
+        expected = attn.q_proj.weight[:, 4:8] * attn.q_norm.weight.reshape([1, -1])
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected, atol=1e-5).item())
+
+    def test_mixed_layouts_in_one_model_are_bucketed_by_shape(self):
+        """Different circuit widths cannot share a batched eigensolve."""
+        dsv4 = self._attn(hidden=16, q_lora=8, head_dim=8, num_heads=2)
+        split = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 16])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 16])),
+            hidden_size_per_attention_head=4,
+        )
+        monitor = self._monitor_on([SimpleNamespace(self_attn=dsv4), SimpleNamespace(self_attn=split)])
+        self.assertEqual([f["kind"] for _i, _t, f in monitor._layers], ["dsv4_hybrid", "split_qk"])
+
+        monitor.step()
+        self._perturb(dsv4)
+        paddle.assign(split.q_proj.weight + 0.05 * paddle.randn([16, 16]), split.q_proj.weight)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        for name in attn_update_module.METRIC_NAMES:
+            self.assertIn(f"attn_update/layer_0/{name}", latest)
+            self.assertIn(f"attn_update/layer_1/{name}", latest)
+
+    def test_bucketed_pairs_match_per_pair_results_in_caller_order(self):
+        pairs = [
+            (paddle.randn([12, 4]), paddle.randn([12, 4])),
+            (paddle.randn([12, 6]), paddle.randn([12, 6])),
+            (paddle.randn([12, 4]), paddle.randn([12, 4])),
+        ]
+        bucketed = attn_update_module._spectrum_metrics_over_pairs(pairs)
+        for index, (a, b) in enumerate(pairs):
+            single = attn_update_module._spectrum_metrics(attn_update_module._squared_singular_values(a, b))
+            for key in attn_update_module._SPECTRUM_KEYS:
+                self.assertAlmostEqual(float(bucketed[key][index]), float(single[key]), places=4, msg=f"{key}[{index}]")
 
 
 if __name__ == "__main__":

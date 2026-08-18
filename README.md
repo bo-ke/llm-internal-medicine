@@ -9,6 +9,7 @@
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 14 指标；仅在开启 mHC 层时生效)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
+- **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
 - **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
@@ -28,7 +29,7 @@ monitor_dict = {}
 # 启用全部监控 (默认)
 model = setup_internal_medicine(
     model,
-    monitors=['all'],              # 或指定 ['moe_health', 'qk_stats', 'massive_act', 'ple_health']
+    monitors=['all'],              # 或指定 ['ape_health', 'moe_health', 'qk_stats', 'massive_act']
     monitor_dict=monitor_dict,
     monitor_interval=1,
     verbose=False,
@@ -115,6 +116,7 @@ setup_internal_medicine()
     ├── setup_moe_monitor()   → MoESpecialistMonitor → forward hooks on MoE layers
     ├── setup_qk_monitor()    → QKStatsMonitor     → forward pre-hooks on core_attention
     ├── setup_massive_activation_monitor() → MassiveActivationMonitor → forward pre-hooks on transformer layers
+    ├── setup_ape_monitor() → APEHealthMonitor → forward pre-hooks on APE compressors
     └── setup_ple_monitor()   → PLEHealthMonitor   → forward hooks on PLE modules
                                         │
                                         ▼
@@ -136,7 +138,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health`
+- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health`
 - `global_idx`: 全局层索引。优先取模块自带的 `layer.layer_number`（0-based 全局编号）；取不到时回退到
   `pp_rank × local_layers + local_idx`。`num_empty_layers_add_in_head > 0` 时所有层号整体偏移该值，看板对号要减掉
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路

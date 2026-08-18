@@ -3,6 +3,7 @@
 import logging
 
 from .base import PaddleProbe
+from .ape_monitor import PaddleAPEHealthMonitor, setup_ape_monitor
 from .gather import install_gather_fn
 from .massive_activation_monitor import PaddleMassiveActivationMonitor, setup_massive_activation_monitor
 from .mhc_monitor import PaddleMHCHealthMonitor, setup_mhc_monitor
@@ -13,6 +14,7 @@ from .vha_monitor import PaddleVHAHealthMonitor, setup_vha_monitor
 logger = logging.getLogger(__name__)
 
 _MONITOR_MAP = {
+    "ape_health": setup_ape_monitor,
     "qk_stats": setup_qk_monitor,
     "moe_health": setup_moe_monitor,
     "massive_act": setup_massive_activation_monitor,
@@ -117,6 +119,8 @@ __all__ = [
     "PaddleProbe",
     "PaddleQKStatsMonitor",
     "setup_qk_monitor",
+    "PaddleAPEHealthMonitor",
+    "setup_ape_monitor",
     "PaddleMoEMonitor",
     "setup_moe_monitor",
     "PaddleMassiveActivationMonitor",

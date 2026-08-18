@@ -193,12 +193,14 @@ def _gram(weight):
     eigensolver needs at least fp32.
 
     Returns a GPU tensor, or None when ``weight`` is missing, has fewer than two
-    dims, or is empty.
+    dims, or is empty. Emptiness is read off the static shape rather than from
+    ``numel()``, which returns a 0-dim GPU tensor here and would turn the guard
+    into a host sync on every call.
     """
     if weight is None:
         return None
     w = weight.detach().astype("float32")
-    if len(w.shape) < 2 or w.numel() == 0:
+    if len(w.shape) < 2 or 0 in w.shape:
         return None
     m, n = w.shape[-2], w.shape[-1]
     return paddle.matmul(w, w, transpose_y=True) if m <= n else paddle.matmul(w, w, transpose_x=True)

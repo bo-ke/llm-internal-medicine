@@ -109,6 +109,48 @@ class PaddleFleetSetupTest(unittest.TestCase):
         self.assertTrue(first["dummy"].removed)
         self.assertIs(second["dummy"], created[1])
 
+    def test_setup_monitors_accepts_comma_separated_names(self):
+        enabled = []
+
+        def setup_dummy(_model, monitor_dict=None, monitor_name=None, **_kwargs):
+            enabled.append(monitor_name)
+            monitor_dict[monitor_name] = DummyMonitor()
+
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP.update(
+            {
+                "first": lambda model, **kwargs: setup_dummy(model, monitor_name="first", **kwargs),
+                "second": lambda model, **kwargs: setup_dummy(model, monitor_name="second", **kwargs),
+            }
+        )
+
+        paddlefleet_backend.setup_monitors(
+            SimpleNamespace(),
+            monitors=" first, second, first ",
+            monitor_dict={},
+        )
+
+        self.assertEqual(enabled, ["first", "second"])
+
+    def test_setup_monitors_propagates_and_cleans_setup_failure(self):
+        partial = DummyMonitor()
+
+        def setup_broken(_model, monitor_dict=None, **_kwargs):
+            monitor_dict["broken"] = partial
+            raise RuntimeError("setup failed")
+
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP["broken"] = setup_broken
+        model = SimpleNamespace()
+        monitors = {}
+
+        with self.assertRaisesRegex(RuntimeError, "setup failed"):
+            paddlefleet_backend.setup_monitors(model, monitors=["broken"], monitor_dict=monitors)
+
+        self.assertTrue(partial.removed)
+        self.assertNotIn("broken", monitors)
+        self.assertNotIn("broken", getattr(model, paddlefleet_backend._MODEL_MONITOR_ATTR))
+
 
 class PaddleLayerDiscoveryTest(unittest.TestCase):
     def test_get_decoder_layers_flattens_virtual_pipeline_chunks(self):

@@ -44,12 +44,26 @@ def _monitor_has_active_hooks(monitor):
     return bool(wrapped)
 
 
+def _normalize_monitor_names(monitors):
+    """Normalize list- or comma-separated monitor selections."""
+    if monitors is None:
+        return ["all"]
+    if isinstance(monitors, str):
+        monitors = [monitors]
+
+    names = []
+    for value in monitors:
+        if not isinstance(value, str):
+            raise TypeError("monitor names must be strings")
+        names.extend(name.strip() for name in value.split(",") if name.strip())
+    return list(dict.fromkeys(names))
+
+
 def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
     """Setup all requested monitors on a PaddleFleet model."""
     install_gather_fn()
 
-    if monitors is None:
-        monitors = ["all"]
+    monitors = _normalize_monitor_names(monitors)
     if "all" in monitors:
         monitors = list(_MONITOR_MAP.keys())
     if monitor_dict is None:
@@ -89,8 +103,13 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
                 setattr(monitor, _MONITOR_CONFIG_ATTR, expected_config)
                 model_monitor_dict[name] = monitor
             logger.info(f"[InternalMedicine/paddlefleet] Enabled monitor: {name}")
-        except Exception as e:
-            logger.error(f"[InternalMedicine/paddlefleet] Failed to setup {name}: {e}")
+        except Exception:
+            partial_monitor = monitor_dict.pop(name, None)
+            if partial_monitor is not None:
+                partial_monitor.remove_hooks()
+            model_monitor_dict.pop(name, None)
+            logger.exception(f"[InternalMedicine/paddlefleet] Failed to setup {name}")
+            raise
 
     return model
 

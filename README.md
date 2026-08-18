@@ -2,13 +2,15 @@
 
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
-包含五大监控模块：
+包含八大监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 14 指标；仅在开启 mHC 层时生效)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
+- **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
+- **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 33 指标；仅权重)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
 - **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
@@ -136,7 +138,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update`
+- `monitor_name`: `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update`
 - `global_idx`: 全局层索引。优先取模块自带的 `layer.layer_number`（0-based 全局编号）；取不到时回退到
   `pp_rank × local_layers + local_idx`。`num_empty_layers_add_in_head > 0` 时所有层号整体偏移该值，看板对号要减掉
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
@@ -573,6 +575,91 @@ RMSNorm / QK-norm 的可学习 scale 在 QK 电路内部，故折进 `W_q` / `W_
 
 ---
 
+## 八、MLP Update Monitor (mlp_update)
+
+监控 MoE 专家 MLP 的参数增量。记采样间隔 δ 内
+
+```
+ΔW_m^(l,e) = W_m,t^(l,e) − W_m,t−δ^(l,e),     m ∈ {gate, up, down}
+```
+
+`attn_update` 的 MoE 对应物：同样只读权重、不挂 forward hook，基准点是上一次被监控的读数。
+
+**三块矩阵分开算，绝不拼在一起。** 因为它们在 `f_e(x) = W_down[SiLU(W_gate x) ⊙ (W_up x)]` 里
+职能、维度、梯度尺度都不同——gate 控制哪些中间通道被激活，up 生成中间特征，down 把中间特征映射回模型维度。
+拼起来算谱会让尺度大的那块主导结果，也无法定位异常来自哪一块。PaddleFleet 把 gate/up 融合存在
+`weight1 [E, in, 2·inter]` 里，本实现沿**中间维**（最后一维）切成两半，前一半是过 SiLU 的 gate
+（依据 `moe_expert.py` 的 `glu(x): hidden_act(x[0]) * x[1]`）；down 是 `weight2`，单独算。
+
+**归约顺序**：每个 (层, 专家, 矩阵) 三元组各自算完，再在层内对专家汇总，永不跨专家拼矩阵。
+
+| # | 指标 | 键 | 公式 | 粒度 | 含义 |
+|---|------|-----|------|------|------|
+| 1 | `{m}_rel_update_mean` | `mlp_update/layer_{i}/{m}_rel_update_mean` | `mean_e(r_m)`, `r_m = ‖ΔW_m‖_F/(‖W_m‖_F+ε)` | 每层+全局 | 该投影的整体更新水平 |
+| 2 | `{m}_rel_update_median` | 同上 | `median_e(r_m)` | 每层+全局 | 抗异常专家干扰的中心值 |
+| 3 | `{m}_rel_update_p10` / `_p90` | 同上 | `quantile_e(r_m, .1/.9)` | 每层+全局 | 专家间离散程度，`p90−p10` 拉大 = 学习速度不均衡 |
+| 4 | `{m}_rel_update_max` | 同上 | `max_e(r_m)` | 每层+全局 | 捕捉更新突然异常增大的专家 |
+| 5 | `{m}_rel_update_min` | 同上 | `min_e(r_m)` | 每层+全局 | 捕捉几乎不更新的「沉睡专家」 |
+| 6 | `{m}_delta_norm_mean` | 同上 | `mean_e(‖ΔW_m‖_F)` | 每层+全局 | 绝对幅度，看全局尺度漂移（LR / grad scale） |
+| 7 | `{m}_stable_rank_{mean,min,max}` | 同上 | `‖ΔW_m‖_F²/‖ΔW_m‖₂²` | 每层+全局 | 更新是否集中到少数奇异方向 |
+| 8 | `{m}_singular_entropy_{mean,min,max}` | 同上 | `−Σ pᵢ log pᵢ, pᵢ = σᵢ²/Σσⱼ²` | 每层+全局 | 全谱利用率，需 `log_spectrum=True` |
+| 9 | `update_zmax_{max,p90,min}` | `mlp_update/layer_{i}/update_zmax_max` | `S^(l,e) = max_m z(r_m^(l,e))` | 每层+全局 | 专家级汇总分数 |
+| 10 | `shared_{m}_rel_update` | 同上 | `r_m` of shared expert | 每层+全局 | 共享专家，作路由专家的对照组 |
+
+`{m}` 取 `gate` / `up` / `down`。每层 33 个键（开 `log_spectrum` 后 42）。
+
+**专家级汇总分数**用 `max_m z(r_m)` 而不是平均：平均会让某一块矩阵的异常被另两块健康的摊薄，
+而平均原始范数会让尺度最大的那块矩阵决定结论。先在**同层专家间**做标准化把三块拉到同一尺度，
+再对 m 取 max，任意一个投影出问题都不会被吃掉。`_max` 是该层最异常的专家；`_min` 是在三块投影上
+**同时**都低于同侪的专家，是这里能给出的最锐利的沉睡专家读数。
+
+> `update_zmax` 有上界 `(E−1)/√E`（每 rank 32 个本地专家时是 5.48），会饱和——它是异常探测器，不是幅值计。
+> 另外若某块矩阵在专家间完全没有差异（如整块零更新），其 z 恒为 0，而 S 取 max 会被 0 托住，
+> 此时 `update_zmax_min` 失效；真实训练中三块都有离散度，不会触发，但看到它长期恰好为 0 要想到这个退化情况。
+
+**`σ₁/‖ΔW‖_F` 没有单独记**：它恒等于 `1/√stable_rank`，是纯派生量。
+
+配置参数：
+
+- `sample_interval` (默认 `None`)：采样间隔 δ，`None` 时用全局 `monitor_interval`。
+- `log_spectrum` (默认 `False`)：是否算奇异值熵。这是唯一需要完整特征分解的指标。
+- `spectrum_interval` (默认 `1`)：谱走的更粗的时钟——相对更新量每个采样点都算，谱每
+  `spectrum_interval` 个采样点算一次。
+
+成本（实测，4B-A500M 形状，每 EP rank 32 专家，`weight1 [32,512,1024]` + `weight2 [32,512,512]`，单卡 H800）：
+
+```
+范数 + 幂迭代 σ₁          11.3 ms/层  →  0.20 s / 18 层     ← 默认档
+完整 Gram + eigvalsh      500.9 ms/层 →  9.02 s / 18 层     ← log_spectrum=True
+基准快照显存              48 MB/层    →  0.84 GB / 18 层    （fp32 会翻倍到 1.69 GB）
+```
+
+`σ₁` 走幂迭代而非特征分解，因为 stable rank 只需要 `σ₁`。收敛速度是 `(σ₂/σ₁)^(2k)`，30 次迭代下
+`σ₂/σ₁ = 0.25` 的秩主导更新精确到 5e-8，`σ₂/σ₁ = 0.99` 的平谱更新 `σ₁` 差约 1.2%、stable rank 差约 2.4%。
+不准的恰好是 stable rank 很大、精确值不改变判读的那一档；准的恰好是要检测的坍缩。误差单向偏低，
+因此 stable rank 偏高。
+
+两个必须知道的局限：
+
+- 基准快照按参数原 dtype 克隆，bf16 权重下 ΔW 相对「可读到的东西」是精确的，但被量化在 bf16 网格上：
+  **小于权重量级约 2⁻⁹ 的更新看不见，读出来就是 `r = 0`**。所以「沉睡专家」的准确含义是
+  「在 δ 步内、在可表示权重上没动」，δ 越大越可靠。要突破需读优化器的 fp32 master weight。
+- `_mean` / `_min` / `_max` 跨 EP rank 归约精确（每 rank 专家数整除），但 **`_median` / `_p10` / `_p90`
+  以及 `update_zmax_*` 落到日志里的是各 rank 的值再平均，不是全局分位数**；标准化也是相对本 rank 的分片。
+
+> **ΔW 小不等于功能没变。** 专家收到的 token 数不同，更新小可能只是路由给它的 token 少。
+> 请对着 `moe_health` 已有的路由负载分布一起读：`assignment_load_cv`、`assignment_load_min_frac`、
+> `assignment_load_max_min_ratio`、`gate_mass_*`，本 monitor 不重复实现这些。
+> 真正的功能漂移度量（固定 probe batch 上的专家输出位移 `D_e`）需要把旧权重留在显存里再跑一次
+> expert forward，超出纯权重探针的范围，未实现。
+
+> 时序约束：快照必须在 **step begin** 读。开启 `offline_quant_expert_weight` 时
+> `FP8QuantWeightCallback.on_step_begin` 会清掉 bf16 专家权重，所以本 monitor 的采集入口是
+> `collect_expert_norms()`——那是 `InternalMedicineCallback.on_step_begin` 的契约方法名（不是描述），
+> 且该 callback 注册在 FP8 callback 之前。放到 step end 会读到已清空的存储。
+
+---
+
 ## 基础设施
 
 ### TrainingLogs
@@ -714,6 +801,13 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **AttnUpdate** | `delta3_norm` | `‖Δ₃‖_F` | mean | 二阶耦合项幅度，应远小于 `delta2_norm` |
 | **AttnUpdate** | `delta3_stable_rank` | `‖Δ₃‖_F²/‖Δ₃‖₂²` | mean | Q/K 更新耦合的 top-1 主导程度 |
 | **AttnUpdate** | `delta3_singular_spectrum` | 同上，作用在 Δ₃ 的谱上 | mean | Q/K 更新耦合变 coherent 时下降 |
+| **MLPUpdate** | `{m}_rel_update_mean` | `mean_e(‖ΔW_m‖_F/‖W_m‖_F)` | mean | 该投影整体更新水平，`m`=gate/up/down |
+| **MLPUpdate** | `{m}_rel_update_max` | `max_e(...)` | max | 更新突然异常增大的专家 |
+| **MLPUpdate** | `{m}_rel_update_min` | `min_e(...)` | min | 沉睡专家（注意 bf16 网格下限） |
+| **MLPUpdate** | `{m}_rel_update_p10` / `_p90` | `quantile_e(...)` | mean | 专家间离散度；跨 rank 是近似 |
+| **MLPUpdate** | `{m}_stable_rank_mean` | `‖ΔW_m‖_F²/‖ΔW_m‖₂²` | mean | 更新是否集中到少数方向 |
+| **MLPUpdate** | `update_zmax_max` | `max_e max_m z(r_m)` | max | 层内最异常专家，上界 `(E−1)/√E` |
+| **MLPUpdate** | `shared_{m}_rel_update` | `r_m` of shared expert | mean | 路由专家的对照组 |
 | **Optim** | `update_rms` | `sqrt(mean((θ_new−θ_old)²))` | 已全局归约 | 本 step 参数更新幅度 (始终装上, 受 monitor_interval 门控) |
 | **Optim** | `param_rms` | `sqrt(mean(θ_new²))` | 已全局归约 | 更新后参数尺度 (始终装上, 受 monitor_interval 门控) |
 | **Optim** | `update_param_ratio` | `update_rms / param_rms` | 已全局归约 | trust ratio, ~1e-3 健康 (始终装上, 受 monitor_interval 门控) |

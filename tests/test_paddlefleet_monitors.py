@@ -24,6 +24,8 @@ PaddleMoEMonitor = importlib.import_module("internal_medicine.backends.paddlefle
 moe_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
 attn_update_module = importlib.import_module("internal_medicine.backends.paddlefleet.attn_update_monitor")
 PaddleAttnUpdateMonitor = attn_update_module.PaddleAttnUpdateMonitor
+mlp_update_module = importlib.import_module("internal_medicine.backends.paddlefleet.mlp_update_monitor")
+PaddleMLPUpdateMonitor = mlp_update_module.PaddleMLPUpdateMonitor
 qk_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor")
 PaddleQKStatsMonitor = qk_monitor_module.PaddleQKStatsMonitor
 paddlefleet_backend = importlib.import_module("internal_medicine.backends.paddlefleet")
@@ -2269,3 +2271,212 @@ class PaddleAttnUpdateMonitorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaddleMLPUpdateMonitorTest(unittest.TestCase):
+    """dW of the expert MLP, split per (layer, expert, gate/up/down)."""
+
+    EXPERTS = 6
+    LATENT = 32
+    INTER = 16
+
+    def setUp(self):
+        training_logs.reset()
+        paddle.seed(0)
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def _moe_layer(self):
+        return SimpleNamespace(
+            gate=SimpleNamespace(),
+            experts=None,
+            grouped_gemm_experts=SimpleNamespace(
+                weight1=paddle.randn([self.EXPERTS, self.LATENT, 2 * self.INTER]),
+                weight2=paddle.randn([self.EXPERTS, self.INTER, self.LATENT]),
+            ),
+            shared_experts=SimpleNamespace(
+                up_gate_proj=SimpleNamespace(weight=paddle.randn([self.LATENT, 2 * self.INTER])),
+                down_proj=SimpleNamespace(weight=paddle.randn([self.INTER, self.LATENT])),
+            ),
+        )
+
+    def _monitor(self, moe_layer, **kwargs):
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1, **kwargs)
+        monitor._layers = [(0, moe_layer)]
+        for name in mlp_update_module.metric_names(monitor.log_spectrum, with_shared=True):
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers()
+        return monitor
+
+    @staticmethod
+    def _bump(weight, scale=0.01):
+        return weight + paddle.randn(weight.shape) * scale
+
+    def _latest(self):
+        return {key.split("/")[-1]: value for key, value in training_logs.get_latest(prefix="mlp_update").items()}
+
+    def test_gate_and_up_split_the_fused_fc1_along_the_intermediate_axis(self):
+        """gate | up must partition fc1's output width exactly, gate first."""
+        fc1 = paddle.arange(self.EXPERTS * self.LATENT * 2 * self.INTER, dtype="float32").reshape(
+            [self.EXPERTS, self.LATENT, 2 * self.INTER]
+        )
+        gate = moe_monitor_module._swiglu_gate_half(fc1)
+        up = mlp_update_module._swiglu_up_half(fc1)
+        self.assertEqual(list(gate.shape), [self.EXPERTS, self.LATENT, self.INTER])
+        self.assertTrue(bool(paddle.all(gate == fc1[..., : self.INTER])))
+        self.assertTrue(bool(paddle.all(up == fc1[..., self.INTER :])))
+        self.assertTrue(bool(paddle.all(paddle.concat([gate, up], axis=-1) == fc1)))
+
+    def test_first_collect_only_establishes_the_base_point(self):
+        """One reading cannot give an increment, so nothing may be logged."""
+        monitor = self._monitor(self._moe_layer())
+        monitor.collect_expert_norms()
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="mlp_update"), {})
+
+    def test_relative_update_matches_the_frobenius_ratio_per_expert(self):
+        """r = ||dW||_F / ||W||_F, measured on each expert's own gate matrix."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        base = moe_layer.grouped_gemm_experts.weight1
+        delta = paddle.randn(base.shape) * 0.02
+        moe_layer.grouped_gemm_experts.weight1 = base + delta
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        now_gate = (base + delta)[..., : self.INTER].astype("float64")
+        delta_gate = delta[..., : self.INTER].astype("float64")
+        reference = paddle.sqrt((delta_gate**2).sum(axis=[-2, -1])) / paddle.sqrt((now_gate**2).sum(axis=[-2, -1]))
+        latest = self._latest()
+        self.assertAlmostEqual(latest["gate_rel_update_mean"], float(reference.mean()), places=6)
+        self.assertAlmostEqual(latest["gate_rel_update_max"], float(reference.max()), places=6)
+        self.assertAlmostEqual(latest["gate_rel_update_min"], float(reference.min()), places=6)
+
+    def _stable_rank_against_dense(self, delta):
+        """``(monitor value, dense float64 SVD value)`` for the gate half of ``delta``."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+        moe_layer.grouped_gemm_experts.weight1 = moe_layer.grouped_gemm_experts.weight1 + delta
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        ranks = []
+        for expert in range(self.EXPERTS):
+            sigma = paddle.linalg.svd(delta[expert, :, : self.INTER].astype("float64"), full_matrices=False)[1]
+            ranks.append(float((sigma**2).sum() / sigma.max() ** 2))
+        return self._latest()["gate_stable_rank_mean"], sum(ranks) / len(ranks)
+
+    def test_stable_rank_is_exact_when_the_update_concentrates(self):
+        """A dominant direction makes the power iteration converge immediately.
+
+        This is the case the metric exists for, so it has to be tight here.
+        """
+        base = paddle.randn([self.EXPERTS, self.LATENT, 2 * self.INTER]) * 0.02
+        left = paddle.randn([self.EXPERTS, self.LATENT, 1])
+        right = paddle.randn([self.EXPERTS, 1, 2 * self.INTER])
+        delta = base + 20.0 * paddle.matmul(left, right)
+        got, reference = self._stable_rank_against_dense(delta)
+        self.assertAlmostEqual(got / reference, 1.0, places=5)
+
+    def test_stable_rank_bias_on_a_flat_update_is_small_and_one_sided(self):
+        """A near-flat spectrum converges slowly, and only ever understates sigma_1.
+
+        An understated sigma_1 inflates the stable rank, so the deviation must be
+        upward and within a few percent -- the regime where the exact value does
+        not change the reading anyway.
+        """
+        delta = paddle.randn([self.EXPERTS, self.LATENT, 2 * self.INTER]) * 0.02
+        got, reference = self._stable_rank_against_dense(delta)
+        self.assertGreaterEqual(got, reference - 1e-6)
+        self.assertLess(got / reference, 1.05)
+
+    def test_each_projection_is_measured_on_its_own_scale(self):
+        """A large down update must not leak into the gate / up readings."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        experts = moe_layer.grouped_gemm_experts
+        experts.weight1 = self._bump(experts.weight1, 0.01)
+        experts.weight2 = self._bump(experts.weight2, 0.20)
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = self._latest()
+        self.assertGreater(latest["down_rel_update_mean"], 5 * latest["gate_rel_update_mean"])
+        self.assertAlmostEqual(latest["gate_rel_update_mean"], latest["up_rel_update_mean"], places=2)
+
+    def test_a_frozen_expert_reads_zero_update_and_unit_stable_rank(self):
+        """dW = 0 is 0/0 for the stable rank; it must land on the lower bound 1."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        delta = paddle.randn(moe_layer.grouped_gemm_experts.weight1.shape) * 0.02
+        delta[0] *= 0.0
+        moe_layer.grouped_gemm_experts.weight1 = moe_layer.grouped_gemm_experts.weight1 + delta
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = self._latest()
+        self.assertAlmostEqual(latest["gate_rel_update_min"], 0.0, places=9)
+        self.assertAlmostEqual(latest["gate_stable_rank_min"], 1.0, places=6)
+        self.assertGreater(latest["gate_stable_rank_max"], 1.0)
+
+    def test_expert_score_keeps_a_single_anomalous_projection_visible(self):
+        """S[e] = max_m z(r_m[e]); an up-only outlier must not be averaged away."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        experts = moe_layer.grouped_gemm_experts
+        delta = paddle.randn(experts.weight1.shape) * 0.01
+        delta[2, :, self.INTER :] *= 25.0
+        experts.weight1 = experts.weight1 + delta
+        experts.weight2 = self._bump(experts.weight2, 0.01)
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = self._latest()
+        # A z-score over n samples cannot exceed (n - 1) / sqrt(n), so the metric
+        # saturates: it is an outlier detector, not a magnitude.
+        ceiling = (self.EXPERTS - 1) / math.sqrt(self.EXPERTS)
+        self.assertGreater(latest["update_zmax_max"], 1.5)
+        self.assertLessEqual(latest["update_zmax_max"], ceiling + 1e-4)
+        self.assertGreater(latest["update_zmax_max"], latest["update_zmax_p90"])
+
+    def test_spectrum_rides_a_coarser_clock_than_the_relative_updates(self):
+        """log_spectrum with spectrum_interval=3: entropy on every third sample."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer, log_spectrum=True, spectrum_interval=3)
+        seen = []
+        for _ in range(7):
+            experts = moe_layer.grouped_gemm_experts
+            experts.weight1 = self._bump(experts.weight1)
+            training_logs.reset()
+            monitor.collect_expert_norms()
+            monitor.step()
+            keys = training_logs.get_latest(prefix="mlp_update")
+            seen.append((bool(keys), any("singular_entropy" in key for key in keys)))
+
+        self.assertEqual([measured for measured, _ in seen], [False] + [True] * 6)
+        self.assertEqual([spectrum for _, spectrum in seen], [False, True, False, False, True, False, False])
+
+    def test_registered_in_the_paddlefleet_monitor_map(self):
+        """The yaml switch resolves through _MONITOR_MAP."""
+        self.assertIn("mlp_update", paddlefleet_backend._MONITOR_MAP)
+        self.assertIs(paddlefleet_backend._MONITOR_MAP["mlp_update"], mlp_update_module.setup_mlp_update_monitor)

@@ -172,11 +172,11 @@ setup_internal_medicine()
 | 19 | `expert_gate_stable_rank_mean` | `moe_health/.../expert_gate_stable_rank_mean` | `mean_e(‖W_g‖_F² / ‖W_g‖_2²)` | 每层+全局 | 路由专家 SwiGLU 门控矩阵谱宽度均值 |
 | 20 | `expert_gate_stable_rank_min` | `moe_health/.../expert_gate_stable_rank_min` | `min_e(...)` | 每层+全局 | 最先塌缩的专家 (秩退化预警) |
 | 21 | `expert_gate_stable_rank_max` | `moe_health/.../expert_gate_stable_rank_max` | `max_e(...)` | 每层+全局 | 谱最宽的专家 (专家分化程度) |
-| 22 | `expert_gate_singular_entropy_mean` | `moe_health/.../expert_gate_singular_entropy_mean` | `mean_e(-Σ pᵢ log pᵢ), pᵢ = σᵢ/Σσⱼ` | 每层+全局 | 门控矩阵整谱利用率均值 |
+| 22 | `expert_gate_singular_entropy_mean` | `moe_health/.../expert_gate_singular_entropy_mean` | `mean_e(-Σ pᵢ log pᵢ), pᵢ = σᵢ²/Σσⱼ²` | 每层+全局 | 门控矩阵整谱利用率均值 |
 | 23 | `expert_gate_singular_entropy_min` | `moe_health/.../expert_gate_singular_entropy_min` | `min_e(...)` | 每层+全局 | 全谱枯竭最严重的专家 |
 | 24 | `expert_gate_singular_entropy_max` | `moe_health/.../expert_gate_singular_entropy_max` | `max_e(...)` | 每层+全局 | 全谱最均匀的专家 |
 | 25 | `shared_gate_stable_rank` | `moe_health/.../shared_gate_stable_rank` | `‖W_g‖_F² / ‖W_g‖_2²` | 每层+全局 | 共享专家门控矩阵谱宽度 |
-| 26 | `shared_gate_singular_entropy` | `moe_health/.../shared_gate_singular_entropy` | `-Σ pᵢ log pᵢ` | 每层+全局 | 共享专家门控矩阵全谱利用率 |
+| 26 | `shared_gate_singular_entropy` | `moe_health/.../shared_gate_singular_entropy` | `-Σ pᵢ log pᵢ, pᵢ = σᵢ²/Σσⱼ²` | 每层+全局 | 共享专家门控矩阵全谱利用率 |
 
 > 19-26 针对的是**专家 MLP 的 SwiGLU 门控投影** (`fc1` 前一半输出，即经过 SiLU 的那一半)，不是 router 的 `gate.weight`。
 > 奇异值经 Gram 矩阵特征分解得到 (`W Wᵀ` 或 `WᵀW` 取较小方阵)，比 `svdvals` 快约 40 倍；路由专家与共享专家的 Gram 拼成一个批次求解，避免 cuSOLVER 因批次形状变化重建 workspace。
@@ -650,11 +650,11 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MoE** | `expert_gate_stable_rank_mean` | `mean_e(srank(W_g))` | mean | 稳定，不应持续下滑 |
 | **MoE** | `expert_gate_stable_rank_min` | `min_e(srank(W_g))` | min | 不应萎缩 (秩塌缩预警) |
 | **MoE** | `expert_gate_stable_rank_max` | `max_e(srank(W_g))` | max | 上升 = 专家分化 |
-| **MoE** | `expert_gate_singular_entropy_mean` | `mean_e(H(σ))` | mean | 接近 `log k` |
-| **MoE** | `expert_gate_singular_entropy_min` | `min_e(H(σ))` | min | 不应显著低于均值 |
-| **MoE** | `expert_gate_singular_entropy_max` | `max_e(H(σ))` | max | 接近 `log k` |
+| **MoE** | `expert_gate_singular_entropy_mean` | `mean_e(H(σ²))` | mean | 初始约 `0.92·log k`，不应持续下滑 |
+| **MoE** | `expert_gate_singular_entropy_min` | `min_e(H(σ²))` | min | 不应显著低于均值 |
+| **MoE** | `expert_gate_singular_entropy_max` | `max_e(H(σ²))` | max | 上限 `log k`，平谱时取等 |
 | **MoE** | `shared_gate_stable_rank` | `srank(W_g)` | mean | 稳定 |
-| **MoE** | `shared_gate_singular_entropy` | `H(σ)` | mean | 接近 `log k` |
+| **MoE** | `shared_gate_singular_entropy` | `H(σ²)` | mean | 初始约 `0.96·log k`，不应持续下滑 |
 | **QK** | `max` | `max(QK^T/√d)` | max | 不应暴增 |
 | **QK** | `mean` | `mean(logits)` | mean | 稳定 |
 | **QK** | `entropy_avg` | `-Σ(p log p)` avg | mean | 适中 |

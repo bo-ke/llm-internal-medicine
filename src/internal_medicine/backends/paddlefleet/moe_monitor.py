@@ -266,18 +266,24 @@ def _stable_rank(sigma):
 
 
 def _singular_value_entropy(sigma):
-    """Shannon entropy of the normalized singular-value distribution.
+    """Shannon entropy of the squared-singular-value distribution (alpha = 2).
 
-    ``H = -sum_i(p_i log p_i)`` with ``p_i = sigma_i / sum_j(sigma_j)``, in nats,
-    over ``[0, log(k)]``: 0 means the spectrum collapsed onto one direction,
-    ``log(k)`` means a flat spectrum (all directions used equally).
+    ``H = -sum_i(p_i log p_i)`` with ``p_i = sigma_i^2 / sum_j(sigma_j^2)``, in
+    nats, over ``[0, log(k)]``: 0 means the spectrum collapsed onto one
+    direction, ``log(k)`` means a flat spectrum (all directions used equally).
     ``[..., k]`` in, ``[...]`` out.
 
-    Note the sigma (not sigma^2) weighting: the megatron-side
-    ``hidden_spectral_entropy`` normalizes by sigma^2, so the two are not
-    numerically comparable.
+    ``sigma^2`` is the energy each direction carries, so this shares its
+    distribution with :func:`_stable_rank` and the pair is read on one scale
+    (``exp(H) >= srank`` always). The megatron-side ``hidden_spectral_entropy``
+    uses the same normalization, but it reads the post-norm hidden states rather
+    than a weight matrix, so matching units do not make them one quantity.
+
+    The sum guard is ``1e-24`` rather than ``1e-12`` because squaring halves the
+    exponent range that reaches it.
     """
-    p = (sigma / sigma.sum(axis=-1, keepdim=True).clip(min=1e-12)).clip(min=1e-12)
+    sq = sigma * sigma
+    p = (sq / sq.sum(axis=-1, keepdim=True).clip(min=1e-24)).clip(min=1e-12)
     return -(p * p.log()).sum(axis=-1)
 
 

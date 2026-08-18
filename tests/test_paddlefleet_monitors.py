@@ -491,14 +491,24 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertLess(float(moe_monitor_module._singular_value_entropy(sigma)), 0.5)
 
     def test_singular_value_entropy_matches_svd_definition(self):
-        """H == -sum(p log p) with p = sigma / sum(sigma) from the SVD."""
+        """H == -sum(p log p) with p = sigma^2 / sum(sigma^2) from the SVD."""
         paddle.seed(0)
         w = paddle.randn([32, 80])
         sigma = paddle.linalg.svd(w, full_matrices=False)[1]
-        p = sigma / sigma.sum()
+        p = sigma**2 / (sigma**2).sum()
         reference = float(-(p * p.log()).sum())
         got = float(moe_monitor_module._singular_value_entropy(moe_monitor_module._singular_values(w)))
         self.assertAlmostEqual(got, reference, places=3)
+
+    def test_singular_value_entropy_uses_alpha_two_weighting(self):
+        """A skewed spectrum separates sigma^2 from sigma^1 weighting."""
+        sigma = paddle.to_tensor([4.0, 2.0, 1.0])
+        sq = [16.0, 4.0, 1.0]
+        alpha2 = -sum(v / sum(sq) * math.log(v / sum(sq)) for v in sq)
+        alpha1 = -sum(v / 7.0 * math.log(v / 7.0) for v in (4.0, 2.0, 1.0))
+        got = float(moe_monitor_module._singular_value_entropy(sigma))
+        self.assertAlmostEqual(got, alpha2, places=5)
+        self.assertNotAlmostEqual(got, alpha1, places=2)
 
     def test_swiglu_gate_half_takes_first_half_of_output_dim(self):
         """glu() applies SiLU to the first chunk, so the gate is w[..., :out // 2]."""

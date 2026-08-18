@@ -2473,6 +2473,206 @@ class PaddleMLPUpdateMonitorTest(unittest.TestCase):
         self.assertEqual([measured for measured, _ in seen], [False] + [True] * 6)
         self.assertEqual([spectrum for _, spectrum in seen], [False, True, False, False, True, False, False])
 
+    # ── discovery and wiring ─────────────────────────────────────────────
+
+    def test_discovery_accepts_the_three_expert_block_layouts(self):
+        """The expert block hangs off ``layer.mlp`` on this model family, off
+        ``layer.moe`` elsewhere, and a bare ``MoELayer`` is its own module.
+        """
+        by_mlp = SimpleNamespace(mlp=self._moe_layer())
+        by_moe = SimpleNamespace(moe=self._moe_layer())
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1)
+
+        found = mlp_update_module._find_moe_layers(SimpleNamespace(layers=[by_mlp, by_moe]), 0, monitor.mark_mtp_layers)
+
+        self.assertEqual([idx for idx, _module in found], [0, 1])
+        self.assertIs(found[0][1], by_mlp.mlp)
+        self.assertIs(found[1][1], by_moe.moe)
+
+    def test_discovery_falls_back_to_named_sublayers_for_a_bare_moe_layer(self):
+        """A stack exposing no decoder-layer list is searched by class name."""
+        latent, experts = self.LATENT, self.EXPERTS
+
+        class MoELayer(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.gate = nn.Linear(latent, experts)
+
+        class Block(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.block = MoELayer()
+
+        model = Block()
+        self.assertIsNone(layer_discovery.get_decoder_layers(model))
+
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1)
+        found = mlp_update_module._find_moe_layers(model, 0, monitor.mark_mtp_layers)
+
+        self.assertEqual([idx for idx, _module in found], [0])
+        self.assertIs(found[0][1], model.block)
+
+        class Dense(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(latent, experts)
+
+        self.assertEqual(mlp_update_module._find_moe_layers(Dense(), 0, monitor.mark_mtp_layers), [])
+
+    def test_down_weight_reads_every_expert_layout(self):
+        """Mirrors ``_expert_fc1_weight``: grouped-gemm ``weight2``, a fused
+        ``down_proj``, or a per-expert list that has to be stacked.
+        """
+        shape = [self.INTER, self.LATENT]
+        fused = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=SimpleNamespace(down_proj=SimpleNamespace(weight=paddle.randn([self.EXPERTS, *shape]))),
+        )
+        listed = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=[SimpleNamespace(down_proj=SimpleNamespace(weight=paddle.randn(shape))) for _ in range(3)],
+        )
+
+        self.assertEqual(list(mlp_update_module._expert_fc2_weight(fused).shape), [self.EXPERTS, *shape])
+        self.assertEqual(list(mlp_update_module._expert_fc2_weight(listed).shape), [3, *shape])
+        for empty in (None, []):
+            layer = SimpleNamespace(grouped_gemm_experts=None, experts=empty)
+            self.assertIsNone(mlp_update_module._expert_fc2_weight(layer))
+
+    def test_setup_entry_point_registers_a_working_monitor(self):
+        """``_MONITOR_MAP`` holds ``setup_mlp_update_monitor``, so that is what
+        production calls. It has to hand the monitor back through ``monitor_dict``
+        -- nothing else keeps a reference, so ``collect_expert_norms`` would never
+        be reached -- thread its keyword arguments through, and return the model
+        untouched.
+        """
+        moe_layer = self._moe_layer()
+        model = SimpleNamespace(layers=[SimpleNamespace(mlp=moe_layer)])
+        monitors = {}
+
+        returned = mlp_update_module.setup_mlp_update_monitor(
+            model, monitor_dict=monitors, monitor_interval=1, log_spectrum=True, spectrum_interval=4
+        )
+
+        self.assertIs(returned, model)
+        monitor = monitors["mlp_update"]
+        self.assertIsInstance(monitor, PaddleMLPUpdateMonitor)
+        self.assertTrue(monitor.log_spectrum)
+        self.assertEqual(monitor.spectrum_interval, 4)
+        self.assertEqual([idx for idx, _module in monitor._layers], [0])
+
+        monitor.collect_expert_norms()  # base point only
+        monitor.step()
+        experts = moe_layer.grouped_gemm_experts
+        experts.weight1 = self._bump(experts.weight1)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        self.assertIn("mlp_update/layer_0/gate_rel_update_mean", training_logs.get_latest(prefix="mlp_update"))
+
+        # monitor_dict is optional; without one the model still comes back unchanged.
+        self.assertIs(mlp_update_module.setup_mlp_update_monitor(model), model)
+
+    def test_a_layer_without_a_shared_expert_declares_no_shared_keys(self):
+        """Declaring a key the layer can never record would publish a series that
+        stays permanently absent from the log.
+        """
+        moe_layer = self._moe_layer()
+        moe_layer.shared_experts = None
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1)
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(mlp=moe_layer)]))
+
+        declared = {key for key in monitor._gpu_cnt if "/layer_0/" in key}
+        self.assertIn("mlp_update/layer_0/gate_rel_update_mean", declared)
+        self.assertNotIn("mlp_update/layer_0/shared_gate_rel_update", declared)
+        self.assertEqual(len(declared), 33)  # 36 minus one shared key per projection
+
+    def test_a_model_without_moe_layers_allocates_nothing(self):
+        """A dense stack must leave the monitor inert, not half-initialised."""
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1)
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace())]))
+
+        self.assertEqual(monitor._layers, [])
+        self.assertFalse(monitor._buffers_allocated)
+        monitor.collect_expert_norms()
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="mlp_update"), {})
+
+    def test_remove_hooks_releases_the_base_snapshots(self):
+        """The snapshots are the monitor's entire resident cost, so teardown has to
+        drop them rather than merely stop measuring.
+        """
+        monitor = self._monitor(self._moe_layer())
+        monitor.collect_expert_norms()
+        self.assertEqual(list(monitor._snapshots), [0])
+
+        monitor.remove_hooks()
+
+        self.assertEqual(monitor._snapshots, {})
+        self.assertEqual(monitor._layers, [])
+
+    def test_sample_interval_overrides_monitor_interval(self):
+        """The snapshot pair is the resident cost, so it may sample more sparsely
+        than the shared monitor clock.
+        """
+        self.assertEqual(PaddleMLPUpdateMonitor(monitor_interval=7).monitor_interval, 7)
+        self.assertEqual(PaddleMLPUpdateMonitor(monitor_interval=1, sample_interval=4).monitor_interval, 4)
+
+    def test_both_clocks_reject_non_positive_values(self):
+        """``spectrum_interval`` is a modulus; 0 would raise mid-training instead."""
+        with self.assertRaises(ValueError):
+            PaddleMLPUpdateMonitor(sample_interval=0)
+        with self.assertRaises(ValueError):
+            PaddleMLPUpdateMonitor(spectrum_interval=0)
+
+    def test_a_layer_that_raises_does_not_stop_the_later_layers(self):
+        """One unreadable expert block must cost its own layer's metrics, no more."""
+        good = self._moe_layer()
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1, verbose=True)
+        monitor._layers = [(0, BrokenPaddleMoELayer()), (1, good)]
+        for layer_idx in (0, 1):
+            for name in mlp_update_module.metric_names(False, with_shared=True):
+                monitor.declare_layer_metric(layer_idx, name)
+        monitor.allocate_buffers()
+
+        monitor.collect_expert_norms()
+        monitor.step()
+        experts = good.grouped_gemm_experts
+        experts.weight1 = self._bump(experts.weight1)
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mlp_update")
+        self.assertIn("mlp_update/layer_1/gate_rel_update_mean", latest)
+        self.assertNotIn("mlp_update/layer_0/gate_rel_update_mean", latest)
+
+    def test_a_weight_that_changes_shape_rebases_instead_of_differencing(self):
+        """After a resume or reshard the two readings describe different storage, so
+        the pair is skipped and the fresh snapshot becomes the new base point.
+        """
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        experts = moe_layer.grouped_gemm_experts
+        experts.weight1 = paddle.randn([self.EXPERTS + 2, self.LATENT, 2 * self.INTER])
+        experts.weight2 = paddle.randn([self.EXPERTS + 2, self.INTER, self.LATENT])
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mlp_update")
+        self.assertNotIn("mlp_update/layer_0/gate_rel_update_mean", latest)
+        self.assertNotIn("mlp_update/layer_0/update_zmax_max", latest)
+
+        experts.weight1 = self._bump(experts.weight1)
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+        self.assertIn("mlp_update/layer_0/gate_rel_update_mean", training_logs.get_latest(prefix="mlp_update"))
+
     def test_registered_in_the_paddlefleet_monitor_map(self):
         """The yaml switch resolves through _MONITOR_MAP."""
         self.assertIn("mlp_update", paddlefleet_backend._MONITOR_MAP)

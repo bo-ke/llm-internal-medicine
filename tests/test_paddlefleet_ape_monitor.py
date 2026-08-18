@@ -73,9 +73,7 @@ class PaddleAPEHealthMonitorTest(unittest.TestCase):
             compressor=core_compressor,
             indexer=SimpleNamespace(compressor=indexer_compressor),
         )
-        model = SimpleNamespace(
-            layers=[SimpleNamespace(self_attn=SimpleNamespace(core_attention=core_attention))]
-        )
+        model = SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace(core_attention=core_attention))])
         monitor_dict = {}
 
         ape_monitor.setup_ape_monitor(model, monitor_dict=monitor_dict)

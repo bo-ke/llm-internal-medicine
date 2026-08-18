@@ -22,6 +22,10 @@ PaddleMassiveActivationMonitor = importlib.import_module(
 ).PaddleMassiveActivationMonitor
 PaddleMoEMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor").PaddleMoEMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
+attn_update_module = importlib.import_module("internal_medicine.backends.paddlefleet.attn_update_monitor")
+PaddleAttnUpdateMonitor = attn_update_module.PaddleAttnUpdateMonitor
+mlp_update_module = importlib.import_module("internal_medicine.backends.paddlefleet.mlp_update_monitor")
+PaddleMLPUpdateMonitor = mlp_update_module.PaddleMLPUpdateMonitor
 qk_monitor_module = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor")
 PaddleQKStatsMonitor = qk_monitor_module.PaddleQKStatsMonitor
 paddlefleet_backend = importlib.import_module("internal_medicine.backends.paddlefleet")
@@ -466,6 +470,227 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 3.0, places=4)
         self.assertAlmostEqual(latest["moe_health/global_score_sum_max"], 0.9, places=4)
 
+    def test_singular_values_match_svd_reference(self):
+        """The Gram spectrum equals the SVD spectrum (order is unspecified)."""
+        paddle.seed(0)
+        w = paddle.randn([32, 80])
+        got = paddle.sort(moe_monitor_module._singular_values(w), descending=True)
+        reference = paddle.linalg.svd(w, full_matrices=False)[1]
+        self.assertEqual(list(got.shape), [32])
+        self.assertTrue(bool(paddle.allclose(got, reference, atol=1e-3)))
+
+    def test_singular_values_batched_matches_per_matrix(self):
+        """A batched [E, m, n] input yields one spectrum per matrix."""
+        paddle.seed(0)
+        w = paddle.randn([3, 16, 8])
+        batched = moe_monitor_module._singular_values(w)
+        self.assertEqual(list(batched.shape), [3, 8])
+        for e in range(3):
+            single = moe_monitor_module._singular_values(w[e])
+            self.assertTrue(bool(paddle.allclose(batched[e], single, atol=1e-4)))
+
+    def test_singular_values_return_none_for_unsupported_input(self):
+        self.assertIsNone(moe_monitor_module._singular_values(None))
+        self.assertIsNone(moe_monitor_module._singular_values(paddle.randn([10])))
+
+    def test_spectrum_metrics_reduce_over_trailing_axis(self):
+        """Batched sigma [E, k] reduces to one value per matrix."""
+        sigma = paddle.to_tensor([[1.0, 1.0, 1.0, 1.0], [1.0, 0.0, 0.0, 0.0]])
+        srank = moe_monitor_module._stable_rank(sigma)
+        entropy = moe_monitor_module._singular_value_entropy(sigma)
+        self.assertEqual(list(srank.shape), [2])
+        self.assertAlmostEqual(float(srank[0]), 4.0, places=4)
+        self.assertAlmostEqual(float(srank[1]), 1.0, places=4)
+        self.assertAlmostEqual(float(entropy[0]), math.log(4.0), places=4)
+        self.assertAlmostEqual(float(entropy[1]), 0.0, places=4)
+
+    def test_stable_rank_of_orthogonal_matrix_equals_full_rank(self):
+        """Flat spectrum => srank == min(m, n), the stable-rank upper bound."""
+        q, _ = paddle.linalg.qr(paddle.randn([32, 32]))
+        sigma = moe_monitor_module._singular_values(q)
+        self.assertAlmostEqual(float(moe_monitor_module._stable_rank(sigma)), 32.0, places=3)
+
+    def test_stable_rank_of_rank_one_matrix_is_one(self):
+        """One nonzero singular value => srank == 1, its lower bound."""
+        w = paddle.randn([64, 1]) @ paddle.randn([1, 128])
+        sigma = moe_monitor_module._singular_values(w)
+        self.assertAlmostEqual(float(moe_monitor_module._stable_rank(sigma)), 1.0, places=3)
+
+    def test_stable_rank_matches_frobenius_over_spectral_norm(self):
+        """srank == ||W||_F^2 / ||W||_2^2 computed straight from the SVD."""
+        paddle.seed(0)
+        w = paddle.randn([32, 80])
+        sigma = paddle.linalg.svd(w, full_matrices=False)[1]
+        reference = float((sigma**2).sum() / sigma.max() ** 2)
+        got = float(moe_monitor_module._stable_rank(moe_monitor_module._singular_values(w)))
+        self.assertAlmostEqual(got, reference, places=3)
+
+    def test_singular_value_entropy_of_orthogonal_matrix_equals_log_full_rank(self):
+        """Flat spectrum => H == log(min(m, n)), the entropy upper bound."""
+        q, _ = paddle.linalg.qr(paddle.randn([32, 32]))
+        sigma = moe_monitor_module._singular_values(q)
+        self.assertAlmostEqual(float(moe_monitor_module._singular_value_entropy(sigma)), math.log(32.0), places=3)
+
+    def test_singular_value_entropy_of_rank_one_matrix_is_near_zero(self):
+        """A single dominant singular value collapses H towards 0."""
+        w = paddle.randn([64, 1]) @ paddle.randn([1, 128])
+        sigma = moe_monitor_module._singular_values(w)
+        self.assertLess(float(moe_monitor_module._singular_value_entropy(sigma)), 0.5)
+
+    def test_singular_value_entropy_matches_svd_definition(self):
+        """H == -sum(p log p) with p = sigma^2 / sum(sigma^2) from the SVD."""
+        paddle.seed(0)
+        w = paddle.randn([32, 80])
+        sigma = paddle.linalg.svd(w, full_matrices=False)[1]
+        p = sigma**2 / (sigma**2).sum()
+        reference = float(-(p * p.log()).sum())
+        got = float(moe_monitor_module._singular_value_entropy(moe_monitor_module._singular_values(w)))
+        self.assertAlmostEqual(got, reference, places=3)
+
+    def test_singular_value_entropy_uses_alpha_two_weighting(self):
+        """A skewed spectrum separates sigma^2 from sigma^1 weighting."""
+        sigma = paddle.to_tensor([4.0, 2.0, 1.0])
+        sq = [16.0, 4.0, 1.0]
+        alpha2 = -sum(v / sum(sq) * math.log(v / sum(sq)) for v in sq)
+        alpha1 = -sum(v / 7.0 * math.log(v / 7.0) for v in (4.0, 2.0, 1.0))
+        got = float(moe_monitor_module._singular_value_entropy(sigma))
+        self.assertAlmostEqual(got, alpha2, places=5)
+        self.assertNotAlmostEqual(got, alpha1, places=2)
+
+    def test_swiglu_gate_half_takes_first_half_of_output_dim(self):
+        """glu() applies SiLU to the first chunk, so the gate is w[..., :out // 2]."""
+        w = paddle.randn([2, 8, 16])
+        gate = moe_monitor_module._swiglu_gate_half(w)
+        self.assertEqual(list(gate.shape), [2, 8, 8])
+        self.assertTrue(bool(paddle.allclose(gate, w[..., :8])))
+
+    def test_expert_fc1_weight_resolves_supported_layouts(self):
+        """grouped-gemm weight1, fused up_gate_proj and LayerList all resolve."""
+        ggm_w = paddle.randn([2, 4, 8])
+        ggm_layer = SimpleNamespace(grouped_gemm_experts=SimpleNamespace(weight1=ggm_w))
+        self.assertTrue(bool(paddle.allclose(moe_monitor_module._expert_fc1_weight(ggm_layer), ggm_w)))
+
+        fused_w = paddle.randn([3, 4, 8])
+        fused_layer = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=fused_w)),
+        )
+        self.assertTrue(bool(paddle.allclose(moe_monitor_module._expert_fc1_weight(fused_layer), fused_w)))
+
+        per_expert = [SimpleNamespace(up_gate_proj=SimpleNamespace(weight=paddle.randn([4, 8]))) for _ in range(2)]
+        list_layer = SimpleNamespace(grouped_gemm_experts=None, experts=per_expert)
+        self.assertEqual(list(moe_monitor_module._expert_fc1_weight(list_layer).shape), [2, 4, 8])
+
+        self.assertIsNone(moe_monitor_module._expert_fc1_weight(SimpleNamespace()))
+
+    def test_compute_gate_spectrum_metrics_records_expert_and_shared_gate(self):
+        """Per-expert gate spectra reduce to mean/min/max; shared gate is scalar."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        for m in (
+            "expert_gate_stable_rank_mean",
+            "expert_gate_stable_rank_min",
+            "expert_gate_stable_rank_max",
+            "expert_gate_singular_entropy_mean",
+            "expert_gate_singular_entropy_min",
+            "expert_gate_singular_entropy_max",
+            "shared_gate_stable_rank",
+            "shared_gate_singular_entropy",
+        ):
+            monitor.declare_layer_metric(0, m)
+        monitor.allocate_buffers()
+
+        full_rank, _ = paddle.linalg.qr(paddle.randn([8, 8]))  # srank 8, H = log 8
+        collapsed = paddle.randn([8, 1]) @ paddle.randn([1, 8])  # srank 1, H ~ 0
+        gate = paddle.stack([full_rank, collapsed])  # [2, 8, 8]
+        fc1 = paddle.concat([gate, paddle.randn([2, 8, 8])], axis=-1)  # gate | up
+        shared_fc1 = paddle.concat([full_rank, paddle.randn([8, 8])], axis=-1)
+        moe_layer = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=fc1)),
+            shared_experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=shared_fc1)),
+        )
+
+        monitor._compute_gate_spectrum_metrics(0, moe_layer)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_max"], 8.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_min"], 1.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_mean"], 4.5, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_singular_entropy_max"], math.log(8.0), places=3)
+        self.assertLess(latest["moe_health/layer_0/expert_gate_singular_entropy_min"], 0.5)
+        self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_stable_rank"], 8.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_singular_entropy"], math.log(8.0), places=3)
+        self.assertNotIn("moe_health/layer_0/gate_weight_stable_rank", latest)
+
+    def test_compute_gate_spectrum_metrics_batches_shared_gate_of_different_shape(self):
+        """Shared and routed gate matrices of different shape still share one eigensolve.
+
+        This is the production layout: with ``moe_split_feature_routing`` the routed
+        experts run on half the hidden features, so their gate is ``[512, 512]`` while
+        the shared expert's is ``[1024, 512]``. Batching the gate matrices is
+        impossible, but their Grams are both ``k x k``, so exactly one
+        ``_gram_singular_values`` call must cover both -- alternating batch shapes
+        makes cuSOLVER re-initialize its workspace and costs ~8x.
+        """
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        for m in (
+            "expert_gate_stable_rank_mean",
+            "expert_gate_stable_rank_min",
+            "expert_gate_stable_rank_max",
+            "expert_gate_singular_entropy_mean",
+            "expert_gate_singular_entropy_min",
+            "expert_gate_singular_entropy_max",
+            "shared_gate_stable_rank",
+            "shared_gate_singular_entropy",
+        ):
+            monitor.declare_layer_metric(0, m)
+        monitor.allocate_buffers()
+
+        full_rank, _ = paddle.linalg.qr(paddle.randn([8, 8]))  # srank 8, H = log 8
+        collapsed = paddle.randn([8, 1]) @ paddle.randn([1, 8])  # srank 1, H ~ 0
+        fc1 = paddle.concat([paddle.stack([full_rank, collapsed]), paddle.randn([2, 8, 8])], axis=-1)
+        # Shared expert sees twice as many input features: gate half is [16, 8], and
+        # orthonormal columns again put every singular value at 1 -> srank 8, H = log 8.
+        tall_gate, _ = paddle.linalg.qr(paddle.randn([16, 8]))
+        shared_fc1 = paddle.concat([tall_gate, paddle.randn([16, 8])], axis=-1)
+        self.assertNotEqual(tall_gate.shape, fc1.shape[1:])
+        moe_layer = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=fc1)),
+            shared_experts=SimpleNamespace(up_gate_proj=SimpleNamespace(weight=shared_fc1)),
+        )
+
+        real_solve = moe_monitor_module._gram_singular_values
+        calls = []
+
+        def counting_solve(gram):
+            calls.append(None if gram is None else tuple(gram.shape))
+            return real_solve(gram)
+
+        moe_monitor_module._gram_singular_values = counting_solve
+        try:
+            monitor._compute_gate_spectrum_metrics(0, moe_layer)
+        finally:
+            moe_monitor_module._gram_singular_values = real_solve
+        monitor.step()
+
+        self.assertEqual(calls, [(3, 8, 8)], "routed and shared Grams must batch into one solve")
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_max"], 8.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_gate_stable_rank_min"], 1.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_stable_rank"], 8.0, places=3)
+        self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_singular_entropy"], math.log(8.0), places=3)
+
+    def test_compute_gate_spectrum_metrics_skips_layer_without_experts(self):
+        """A layer with no expert weights must not raise and records nothing."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        monitor.declare_layer_metric(0, "expert_gate_stable_rank_mean")
+        monitor.allocate_buffers()
+
+        monitor._compute_gate_spectrum_metrics(0, SimpleNamespace())
+        self.assertEqual(monitor._gpu_cnt["moe_health/layer_0/expert_gate_stable_rank_mean"], 0)
+
     def test_attn_type_tag_produces_typed_keys_and_split_global_aggregation(self):
         """When declare/record_layer_metric receives attn_type, keys are
         ``{prefix}/layer_N/{type}_{metric}`` and ``{prefix}/global_{type}_{metric}``.
@@ -531,7 +756,7 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertIsNone(moe_monitor_mod._intermediate_shard_group(None))
 
     def test_collect_expert_norms_fused_layout_records_metrics(self):
-        """collect_expert_norms records expert + shared norms for a fused-expert MoE layer."""
+        """collect_expert_norms records expert norms + gate spectra for a fused-expert MoE layer."""
         monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, verbose=False)
         for m in [
             "expert_norm_mean",
@@ -540,6 +765,12 @@ class PaddleMoEMonitorTest(unittest.TestCase):
             "expert_norm_max",
             "shared_expert_norm",
             "shared_routed_ratio",
+            "expert_gate_stable_rank_mean",
+            "expert_gate_stable_rank_min",
+            "expert_gate_stable_rank_max",
+            "expert_gate_singular_entropy_mean",
+            "expert_gate_singular_entropy_min",
+            "expert_gate_singular_entropy_max",
         ]:
             monitor.declare_layer_metric(0, m)
         monitor.allocate_buffers()
@@ -561,6 +792,11 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertIn("moe_health/layer_0/expert_norm_mean", latest)
         self.assertIn("moe_health/layer_0/shared_expert_norm", latest)
         self.assertGreater(latest["moe_health/layer_0/expert_norm_mean"], 0.0)
+        # Same step-begin pass also collects the SwiGLU gate spectrum: the gate
+        # half of a [3, 8, 6] fc1 is [3, 8, 3], so srank is in [1, 3].
+        self.assertIn("moe_health/layer_0/expert_gate_stable_rank_mean", latest)
+        self.assertGreaterEqual(latest["moe_health/layer_0/expert_gate_stable_rank_min"], 1.0)
+        self.assertLessEqual(latest["moe_health/layer_0/expert_gate_stable_rank_max"], 3.0)
 
     def test_collect_expert_norms_respects_monitor_interval(self):
         """Expert-norm collection is gated by the global monitor_interval."""
@@ -1519,5 +1755,925 @@ class SparseQKKernelComputeTest(unittest.TestCase):
         self.assertTrue(paddle.allclose(with_sink["max_per_head"], no_sink["max_per_head"], atol=1e-6).item())
 
 
+class PaddleAttnUpdateMonitorTest(unittest.TestCase):
+    """delta2/delta3 = QK-product increment terms (arXiv:2606.28116 eq. 4)."""
+
+    def setUp(self):
+        training_logs.reset()
+        paddle.seed(0)
+
+    def tearDown(self):
+        training_logs.reset()
+
+    @staticmethod
+    def _dense_reference(a, b, alpha=2.0):
+        """Metrics straight off a full float64 SVD of the materialised product."""
+        sigma = paddle.linalg.svd((a @ b.T).astype("float64"), full_matrices=False)[1]
+        squared = sigma * sigma
+        total = squared.sum()
+        weights = squared if alpha == 2.0 else squared ** (alpha / 2.0)
+        p = (weights / weights.sum()).clip(min=1e-300)
+        return {
+            "norm": float(paddle.sqrt(total)),
+            "stable_rank": float(total / squared.max()),
+            "singular_spectrum": float(paddle.exp(-(p * p.log()).sum())),
+        }
+
+    def _assert_matches_dense(self, a, b, alpha=2.0, places=3):
+        got = attn_update_module._spectrum_metrics(attn_update_module._squared_singular_values(a, b), alpha)
+        reference = self._dense_reference(a, b, alpha)
+        for name, expected in reference.items():
+            self.assertAlmostEqual(
+                float(got[name]) / expected, 1.0, places=places, msg=f"{name}: {got[name]} vs {expected}"
+            )
+
+    def test_squared_singular_values_core_branch_matches_dense_svd(self):
+        """2*head_dim < hidden takes the thin-QR core path; spectrum must be identical."""
+        a = paddle.randn([64, 16])
+        b = paddle.randn([64, 16])
+        self.assertLess(a.shape[-1], a.shape[-2])
+        self._assert_matches_dense(a, b, alpha=2.0)
+        self._assert_matches_dense(a, b, alpha=1.0)
+
+    def test_squared_singular_values_direct_branch_matches_dense_svd(self):
+        """2*head_dim >= hidden makes the core no smaller than the product."""
+        a = paddle.randn([32, 32])
+        b = paddle.randn([32, 32])
+        self._assert_matches_dense(a, b, alpha=2.0)
+        self._assert_matches_dense(a, b, alpha=1.0)
+
+    def test_spectrum_metrics_on_flat_spectrum_equals_rank(self):
+        """k equal singular values: stable rank = S_alpha = k, norm = sqrt(sum of squares)."""
+        metrics = attn_update_module._spectrum_metrics(paddle.full([8], 4.0))
+        self.assertAlmostEqual(float(metrics["stable_rank"]), 8.0, places=4)
+        self.assertAlmostEqual(float(metrics["singular_spectrum"]), 8.0, places=4)
+        self.assertAlmostEqual(float(metrics["norm"]), math.sqrt(32.0), places=4)
+
+    def test_spectrum_metrics_on_collapsed_spectrum_is_one(self):
+        """All energy in one direction: both rank measures bottom out at 1."""
+        metrics = attn_update_module._spectrum_metrics(paddle.to_tensor([9.0, 0.0, 0.0, 0.0]))
+        self.assertAlmostEqual(float(metrics["stable_rank"]), 1.0, places=4)
+        self.assertAlmostEqual(float(metrics["singular_spectrum"]), 1.0, places=3)
+        self.assertAlmostEqual(float(metrics["norm"]), 3.0, places=4)
+
+    def test_singular_spectrum_uses_alpha_two_weighting(self):
+        """S_2 weights by sigma^2, so it differs from the sigma-weighted S_1."""
+        squared = paddle.to_tensor([16.0, 4.0, 1.0])
+        s2 = float(attn_update_module._spectrum_metrics(squared, 2.0)["singular_spectrum"])
+        s1 = float(attn_update_module._spectrum_metrics(squared, 1.0)["singular_spectrum"])
+
+        def entropy_rank(weights):
+            total = sum(weights)
+            return math.exp(-sum((w / total) * math.log(w / total) for w in weights))
+
+        self.assertAlmostEqual(s2, entropy_rank([16.0, 4.0, 1.0]), places=4)
+        self.assertAlmostEqual(s1, entropy_rank([4.0, 2.0, 1.0]), places=4)
+        self.assertLess(s2, s1)
+
+    def test_batched_driver_matches_pair_by_pair_metrics(self):
+        """Batching layers into one eigvalsh must not move any value."""
+        pairs = [(paddle.randn([32, 12]), paddle.randn([32, 12])) for _ in range(5)]
+        batched = attn_update_module._spectrum_metrics_over_pairs(pairs)
+        for index, (a, b) in enumerate(pairs):
+            single = attn_update_module._spectrum_metrics(attn_update_module._squared_singular_values(a, b))
+            for key in attn_update_module._SPECTRUM_KEYS:
+                self.assertAlmostEqual(float(batched[key][index]) / float(single[key]), 1.0, places=5, msg=key)
+
+    def test_batched_driver_chunks_without_changing_results(self):
+        """More pairs than fit in one chunk still line up with the flat order."""
+        original = attn_update_module._MAX_BATCH_BYTES
+        pairs = [(paddle.randn([16, 8]), paddle.randn([16, 8])) for _ in range(7)]
+        try:
+            attn_update_module._MAX_BATCH_BYTES = 16 * 16 * 4 * 2  # 2 pairs per chunk
+            chunked = attn_update_module._spectrum_metrics_over_pairs(pairs)
+        finally:
+            attn_update_module._MAX_BATCH_BYTES = original
+        flat = attn_update_module._spectrum_metrics_over_pairs(pairs)
+        for key in attn_update_module._SPECTRUM_KEYS:
+            self.assertEqual(chunked[key].shape, [7])
+            self.assertTrue(paddle.allclose(chunked[key], flat[key], atol=1e-5).item(), key)
+
+    @staticmethod
+    def _attn(hidden=24, q_lora=12, head_dim=8, num_heads=2, with_norms=True):
+        """Minimal DSv4-hybrid QK layout: q_down -> q_layernorm -> q_up, kv -> kv_layernorm."""
+        attn = SimpleNamespace(
+            linear_q_down_proj=SimpleNamespace(weight=paddle.randn([hidden, q_lora])),
+            linear_q_up_proj=SimpleNamespace(weight=paddle.randn([q_lora, head_dim * num_heads])),
+            linear_kv_proj=SimpleNamespace(weight=paddle.randn([hidden, head_dim])),
+        )
+        if with_norms:
+            attn.q_layernorm = SimpleNamespace(weight=paddle.rand([q_lora]) + 0.5)
+            attn.kv_layernorm = SimpleNamespace(weight=paddle.rand([head_dim]) + 0.5)
+        return attn
+
+    @staticmethod
+    def _perturb(attn, scale=0.05):
+        """In-place parameter update, the way an optimizer step mutates weights."""
+        for module in (attn.linear_q_down_proj, attn.linear_q_up_proj, attn.linear_kv_proj):
+            paddle.assign(module.weight + scale * paddle.randn(module.weight.shape), module.weight)
+
+    def test_resolve_qk_factors_reads_head_layout(self):
+        factors = attn_update_module.resolve_qk_factors(self._attn(head_dim=8, num_heads=2))
+        self.assertEqual(factors["head_dim"], 8)
+        self.assertEqual(factors["num_heads"], 2)
+
+    def test_resolve_qk_factors_returns_none_for_other_layouts(self):
+        self.assertIsNone(attn_update_module.resolve_qk_factors(SimpleNamespace()))
+        # q_up width not divisible by the kv head_dim -> not this circuit
+        bad = self._attn(head_dim=8, num_heads=2)
+        bad.linear_q_up_proj = SimpleNamespace(weight=paddle.randn([12, 13]))
+        self.assertIsNone(attn_update_module.resolve_qk_factors(bad))
+
+    def test_effective_wk_snapshot_does_not_alias_the_live_parameter(self):
+        """Without a kv_layernorm the fp32 read is a no-op, so it must clone."""
+        attn = self._attn(with_norms=False)
+        factors = attn_update_module.resolve_qk_factors(attn)
+        snapshot = attn_update_module.effective_wk(factors)
+        before = snapshot.clone()
+        self._perturb(attn, scale=1.0)
+        self.assertTrue(paddle.allclose(snapshot, before).item())
+
+    def test_effective_wq_folds_the_q_layernorm_scale(self):
+        attn = self._attn(head_dim=8, num_heads=2)
+        factors = attn_update_module.resolve_qk_factors(attn)
+        expected = (
+            attn.linear_q_down_proj.weight * attn.q_layernorm.weight.reshape([1, -1])
+        ) @ attn.linear_q_up_proj.weight[:, 8:16]
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected, atol=1e-5).item())
+
+    def _monitor_on(self, layers, **kwargs):
+        monitor = PaddleAttnUpdateMonitor(monitor_interval=1, **kwargs)
+        monitor.register_hooks(SimpleNamespace(layers=layers))
+        return monitor
+
+    def test_first_monitored_step_only_establishes_the_base_point(self):
+        """delta2 needs two samples; the first step must emit nothing."""
+        attn = self._attn()
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn)])
+        monitor.step()
+
+        self.assertEqual(training_logs.get_latest(prefix="attn_update"), {})
+        self._perturb(attn)
+        monitor.step()
+        self.assertIn("attn_update/layer_0/delta2_norm", training_logs.get_latest(prefix="attn_update"))
+
+    def test_delta2_and_delta3_match_the_dense_increment_terms(self):
+        """End-to-end: recorded metrics equal those of eq. (4)'s dense products."""
+        attn = self._attn(hidden=24, q_lora=12, head_dim=8, num_heads=2)
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn)], num_heads_monitored=1)
+        factors = attn_update_module.resolve_qk_factors(attn)
+        wq_base = attn_update_module.effective_wq(factors, 0)
+        wk_base = attn_update_module.effective_wk(factors)
+
+        monitor.step()  # base point
+        self._perturb(attn)
+        monitor.step()  # increments against the base point
+
+        wq_now = attn_update_module.effective_wq(factors, 0)
+        wk_now = attn_update_module.effective_wk(factors)
+        dq, dk = wq_now - wq_base, wk_now - wk_base
+        dense = {
+            "delta2": dq @ wk_base.T + wq_base @ dk.T,
+            "delta3": dq @ dk.T,
+        }
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        for term, product in dense.items():
+            reference = self._dense_reference(product, paddle.eye(product.shape[-1]))
+            for key, expected in reference.items():
+                got = latest[f"attn_update/layer_0/{term}_{key}"]
+                self.assertAlmostEqual(got / expected, 1.0, places=3, msg=f"{term}_{key}")
+
+    def test_delta3_is_second_order_and_far_smaller_than_delta2(self):
+        """eq. (5): ||delta2||_F = O(||W|| ||dW||) vs ||delta3||_F = O(||dW||^2)."""
+        attn = self._attn(hidden=24, q_lora=12, head_dim=8, num_heads=2)
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn)])
+        monitor.step()
+        self._perturb(attn, scale=0.01)  # ||dW|| << ||W||
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        self.assertLess(latest["attn_update/layer_0/delta3_norm"], latest["attn_update/layer_0/delta2_norm"])
+
+    def test_delta3_core_is_half_as_wide_as_delta2(self):
+        """delta3's factors are [d, head_dim]; delta2 concatenates two of them."""
+        attn = self._attn(head_dim=8, num_heads=2)
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn)])
+        monitor.step()
+        self._perturb(attn)
+        per_term = monitor._prepare_layer(0, monitor._layers[0][2])
+
+        self.assertEqual(sorted(per_term), ["delta2", "delta3"])
+        self.assertEqual([list(m.shape) for m in per_term["delta2"][0]], [[24, 16], [24, 16]])
+        self.assertEqual([list(m.shape) for m in per_term["delta3"][0]], [[24, 8], [24, 8]])
+
+    def test_delta2_is_per_layer_with_global_mean_over_layers(self):
+        attn_a, attn_b = self._attn(), self._attn()
+        monitor = self._monitor_on([SimpleNamespace(self_attn=attn_a), SimpleNamespace(self_attn=attn_b)])
+        monitor.step()
+        self._perturb(attn_a)
+        self._perturb(attn_b, scale=0.5)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        for name in attn_update_module.METRIC_NAMES:
+            per_layer = [latest[f"attn_update/layer_{i}/{name}"] for i in (0, 1)]
+            self.assertAlmostEqual(latest[f"attn_update/global_{name}"], sum(per_layer) / 2.0, places=4, msg=name)
+        # A 10x larger update must show a larger increment norm.
+        self.assertLess(latest["attn_update/layer_0/delta2_norm"], latest["attn_update/layer_1/delta2_norm"])
+
+    def test_per_layer_value_is_the_mean_over_monitored_heads(self):
+        attn = self._attn(head_dim=8, num_heads=2)
+        two_heads = self._monitor_on([SimpleNamespace(self_attn=attn)], num_heads_monitored=2)
+        one_head = self._monitor_on([SimpleNamespace(self_attn=attn)], num_heads_monitored=1)
+        for monitor in (two_heads, one_head):
+            monitor.step()
+        self._perturb(attn)
+
+        one_head.step()
+        head0 = training_logs.get_latest(prefix="attn_update")["attn_update/layer_0/delta2_norm"]
+        training_logs.reset()
+        two_heads.step()
+        both = training_logs.get_latest(prefix="attn_update")["attn_update/layer_0/delta2_norm"]
+
+        # Distinct heads give distinct increments, so the 2-head mean must move.
+        self.assertNotAlmostEqual(head0, both, places=4)
+
+    def test_mtp_layer_gets_its_own_suffixed_keys(self):
+        main = SimpleNamespace(self_attn=self._attn())
+        mtp_inner = SimpleNamespace(self_attn=self._attn())
+        # An MTP id is num_hidden_layers + its local index, so the config has to be
+        # reachable from the wrapper; without it the layer is skipped rather than
+        # given an id derived from whatever main layers this rank happens to hold.
+        wrapper = SimpleNamespace(transformer_layer=mtp_inner, config=SimpleNamespace(num_hidden_layers=1))
+        monitor = self._monitor_on([main, wrapper])
+        monitor.step()
+        self._perturb(main.self_attn)
+        self._perturb(mtp_inner.self_attn)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        self.assertIn("attn_update/layer_0/delta2_norm", latest)
+        self.assertIn("attn_update/layer_1_mtp/delta2_norm", latest)
+
+    def test_unsupported_layers_are_skipped_without_declaring_metrics(self):
+        monitor = PaddleAttnUpdateMonitor(monitor_interval=1)
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace())]))
+        monitor.step()
+
+        self.assertEqual(monitor._layers, [])
+        self.assertFalse(monitor._buffers_allocated)
+        self.assertEqual(training_logs.get_latest(prefix="attn_update"), {})
+
+    def test_monitor_interval_sets_the_sampling_distance(self):
+        """Metrics only appear on steps that are multiples of monitor_interval."""
+        attn = self._attn()
+        monitor = PaddleAttnUpdateMonitor(monitor_interval=3)
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)]))
+
+        monitor.step()  # step_count 0 -> base point
+        for _ in range(2):
+            self._perturb(attn)
+            monitor.step()
+            self.assertEqual(training_logs.get_latest(prefix="attn_update"), {})
+        self._perturb(attn)
+        monitor.step()  # step_count 3 -> first delta2, sampled 3 steps apart
+        self.assertIn("attn_update/layer_0/delta2_norm", training_logs.get_latest(prefix="attn_update"))
+
+    def test_registered_in_the_paddlefleet_monitor_map(self):
+        self.assertIn("attn_update", paddlefleet_backend._MONITOR_MAP)
+        registry = importlib.import_module("internal_medicine.core.registry")
+        self.assertIn("attn_update", registry.AVAILABLE_MONITORS["paddlefleet"])
+
+    def test_setup_entry_point_registers_a_working_monitor(self):
+        """The map holds ``setup_attn_update_monitor``, so that is what production calls.
+
+        It has to hand the monitor back through ``monitor_dict`` -- nothing else
+        keeps a reference, so ``step()`` would never be reached -- thread its
+        keyword arguments into the monitor, and return the model untouched.
+        """
+        attn = self._attn()
+        model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
+        monitors = {}
+
+        returned = attn_update_module.setup_attn_update_monitor(
+            model, monitor_dict=monitors, monitor_interval=1, num_heads_monitored=2
+        )
+
+        self.assertIs(returned, model)
+        monitor = monitors["attn_update"]
+        self.assertIsInstance(monitor, PaddleAttnUpdateMonitor)
+        self.assertEqual(monitor.num_heads_monitored, 2)
+        self.assertEqual([idx for idx, _t, _f in monitor._layers], [0])
+
+        monitor.step()  # base point
+        self._perturb(attn)
+        monitor.step()
+        self.assertIn("attn_update/layer_0/delta2_norm", training_logs.get_latest(prefix="attn_update"))
+
+    # ── sampling interval ────────────────────────────────────────────────
+
+    def test_sample_interval_defaults_to_monitor_interval(self):
+        self.assertEqual(PaddleAttnUpdateMonitor(monitor_interval=7).monitor_interval, 7)
+
+    def test_sample_interval_overrides_monitor_interval(self):
+        """delta2 costs one eigensolve per sample, so it may sample more sparsely."""
+        monitor = PaddleAttnUpdateMonitor(monitor_interval=1, sample_interval=4)
+        self.assertEqual(monitor.monitor_interval, 4)
+
+        attn = self._attn()
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)]))
+        monitor.step()  # step_count 0 -> base point
+        for _ in range(3):
+            self._perturb(attn)
+            monitor.step()
+            self.assertEqual(training_logs.get_latest(prefix="attn_update"), {})
+        self._perturb(attn)
+        monitor.step()  # step_count 4 -> first delta2
+        self.assertIn("attn_update/layer_0/delta2_norm", training_logs.get_latest(prefix="attn_update"))
+
+    def test_sample_interval_rejects_non_positive_values(self):
+        with self.assertRaises(ValueError):
+            PaddleAttnUpdateMonitor(sample_interval=0)
+
+    # ── attention layouts beyond DSv4-hybrid ─────────────────────────────
+
+    @staticmethod
+    def _mla_attn(hidden=16, q_lora=8, kv_lora=6, nope=4, rope=2, v_head_dim=5, heads=2):
+        """MLA: q_a -> q_a_layernorm -> q_b, kv_a -> kv_a_layernorm -> kv_b."""
+        return SimpleNamespace(
+            q_a_proj=SimpleNamespace(weight=paddle.randn([hidden, q_lora])),
+            q_a_layernorm=SimpleNamespace(weight=paddle.rand([q_lora]) + 0.5),
+            q_b_proj=SimpleNamespace(weight=paddle.randn([q_lora, heads * (nope + rope)])),
+            kv_a_proj_with_mqa=SimpleNamespace(weight=paddle.randn([hidden, kv_lora + rope])),
+            kv_a_layernorm=SimpleNamespace(weight=paddle.rand([kv_lora]) + 0.5),
+            kv_b_proj=SimpleNamespace(weight=paddle.randn([kv_lora, heads * (nope + v_head_dim)])),
+            num_attention_heads_per_partition=heads,
+            qk_nope_head_dim=nope,
+            qk_rope_head_dim=rope,
+        )
+
+    def test_mla_layout_uses_only_the_nope_half_of_each_head(self):
+        attn = self._mla_attn()
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertEqual(factors["kind"], "mla")
+        self.assertEqual(factors["head_dim"], 4)  # qk_nope_head_dim, not q_head_dim
+        self.assertEqual(factors["num_heads"], 2)
+
+        # Head 1's content circuit composes through both latents.
+        q_latent = attn.q_a_proj.weight * attn.q_a_layernorm.weight.reshape([1, -1])
+        expected_q = q_latent @ attn.q_b_proj.weight[:, 6:10]  # head 1, first nope=4 of q_head_dim=6
+        kv_latent = attn.kv_a_proj_with_mqa.weight[:, :6] * attn.kv_a_layernorm.weight.reshape([1, -1])
+        expected_k = kv_latent @ attn.kv_b_proj.weight[:, 9:13]  # head 1, first nope=4 of width=9
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected_q, atol=1e-5).item())
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wk(factors, 1), expected_k, atol=1e-5).item())
+
+    def test_mla_without_q_lora_reads_q_proj_directly(self):
+        attn = self._mla_attn()
+        del attn.q_a_proj, attn.q_a_layernorm, attn.q_b_proj
+        attn.q_proj = SimpleNamespace(weight=paddle.randn([16, 12]))
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertEqual(factors["kind"], "mla")
+        self.assertIsNone(factors["q_a"])
+        expected = attn.q_proj.weight[:, 6:10]
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected, atol=1e-5).item())
+
+    @staticmethod
+    def _fused_qkv_attn(hidden=16, head_dim=4, heads=4, kv_heads=2):
+        """Standard attention: one qkv_proj grouped per KV head as Q|K|V."""
+        group_dim = (heads // kv_heads) * head_dim + 2 * head_dim
+        return SimpleNamespace(
+            qkv_proj=SimpleNamespace(weight=paddle.randn([hidden, kv_heads * group_dim])),
+            num_attention_heads_per_partition=heads,
+            num_query_groups_per_partition=kv_heads,
+            hidden_size_per_attention_head=head_dim,
+        )
+
+    def test_fused_qkv_layout_slices_the_interleaved_group(self):
+        attn = self._fused_qkv_attn()
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertEqual(factors["kind"], "fused_qkv")
+        self.assertEqual((factors["num_heads"], factors["num_kv_heads"]), (4, 2))
+        self.assertEqual(factors["group_dim"], 16)
+
+        # Head 3 is the second query head of group 1: q at 16+4, k at 16+8.
+        weight = attn.qkv_proj.weight
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 3), weight[:, 20:24]).item())
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wk(factors, 3), weight[:, 24:28]).item())
+        # Heads 2 and 3 share group 1's single key matrix.
+        self.assertTrue(
+            paddle.allclose(
+                attn_update_module.effective_wk(factors, 2), attn_update_module.effective_wk(factors, 3)
+            ).item()
+        )
+
+    def test_fused_qkv_layout_rejects_a_width_that_contradicts_the_grouping(self):
+        """The group arithmetic is checked against the real weight, not assumed."""
+        attn = self._fused_qkv_attn()
+        attn.qkv_proj = SimpleNamespace(weight=paddle.randn([16, 30]))
+        self.assertIsNone(attn_update_module.resolve_qk_factors(attn))
+
+    def test_split_qk_layout_maps_query_heads_onto_kv_groups(self):
+        attn = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 16])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            hidden_size_per_attention_head=4,
+        )
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertEqual(factors["kind"], "split_qk")
+        self.assertEqual((factors["num_heads"], factors["num_kv_heads"]), (4, 2))
+        self.assertTrue(
+            paddle.allclose(attn_update_module.effective_wq(factors, 2), attn.q_proj.weight[:, 8:12]).item()
+        )
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wk(factors, 2), attn.k_proj.weight[:, 4:8]).item())
+
+    def test_split_qk_folds_a_per_head_qk_norm(self):
+        attn = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            q_norm=SimpleNamespace(weight=paddle.rand([4]) + 0.5),
+            hidden_size_per_attention_head=4,
+        )
+        factors = attn_update_module.resolve_qk_factors(attn)
+        expected = attn.q_proj.weight[:, 4:8] * attn.q_norm.weight.reshape([1, -1])
+        self.assertTrue(paddle.allclose(attn_update_module.effective_wq(factors, 1), expected, atol=1e-5).item())
+
+    def test_split_qk_slices_a_per_layer_qk_norm_by_head(self):
+        """A norm covering all heads at once must be sliced, not broadcast.
+
+        Folding head 1's columns with head 0's scale would silently corrupt the
+        QK circuit, so the head offset is checked on both heads.
+        """
+        attn = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            q_norm=SimpleNamespace(weight=paddle.rand([8]) + 0.5),
+            hidden_size_per_attention_head=4,
+        )
+        factors = attn_update_module.resolve_qk_factors(attn)
+        self.assertNotEqual(attn.q_norm.weight.shape[0], factors["head_dim"])
+
+        for head in (0, 1):
+            start = head * 4
+            scale = attn.q_norm.weight[start : start + 4].reshape([1, -1])
+            expected = attn.q_proj.weight[:, start : start + 4] * scale
+            got = attn_update_module.effective_wq(factors, head)
+            self.assertTrue(paddle.allclose(got, expected, atol=1e-5).item(), f"head {head}")
+
+    def test_qk_norm_of_an_unreadable_width_is_dropped_rather_than_guessed(self):
+        """Neither per-head nor per-layer: fold nothing instead of the wrong slice."""
+        attn = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 8])),
+            q_norm=SimpleNamespace(weight=paddle.rand([5]) + 0.5),
+            hidden_size_per_attention_head=4,
+        )
+        factors = attn_update_module.resolve_qk_factors(attn)
+        got = attn_update_module.effective_wq(factors, 1)
+        self.assertTrue(paddle.allclose(got, attn.q_proj.weight[:, 4:8], atol=1e-5).item())
+
+    def test_mixed_layouts_in_one_model_are_bucketed_by_shape(self):
+        """Different circuit widths cannot share a batched eigensolve."""
+        dsv4 = self._attn(hidden=16, q_lora=8, head_dim=8, num_heads=2)
+        split = SimpleNamespace(
+            q_proj=SimpleNamespace(weight=paddle.randn([16, 16])),
+            k_proj=SimpleNamespace(weight=paddle.randn([16, 16])),
+            hidden_size_per_attention_head=4,
+        )
+        monitor = self._monitor_on([SimpleNamespace(self_attn=dsv4), SimpleNamespace(self_attn=split)])
+        self.assertEqual([f["kind"] for _i, _t, f in monitor._layers], ["dsv4_hybrid", "split_qk"])
+
+        monitor.step()
+        self._perturb(dsv4)
+        paddle.assign(split.q_proj.weight + 0.05 * paddle.randn([16, 16]), split.q_proj.weight)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="attn_update")
+        for name in attn_update_module.METRIC_NAMES:
+            self.assertIn(f"attn_update/layer_0/{name}", latest)
+            self.assertIn(f"attn_update/layer_1/{name}", latest)
+
+    def test_bucketed_pairs_match_per_pair_results_in_caller_order(self):
+        pairs = [
+            (paddle.randn([12, 4]), paddle.randn([12, 4])),
+            (paddle.randn([12, 6]), paddle.randn([12, 6])),
+            (paddle.randn([12, 4]), paddle.randn([12, 4])),
+        ]
+        bucketed = attn_update_module._spectrum_metrics_over_pairs(pairs)
+        for index, (a, b) in enumerate(pairs):
+            single = attn_update_module._spectrum_metrics(attn_update_module._squared_singular_values(a, b))
+            for key in attn_update_module._SPECTRUM_KEYS:
+                self.assertAlmostEqual(float(bucketed[key][index]), float(single[key]), places=4, msg=f"{key}[{index}]")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaddleMLPUpdateMonitorTest(unittest.TestCase):
+    """dW of the expert MLP, split per (layer, expert, gate/up/down)."""
+
+    EXPERTS = 6
+    LATENT = 32
+    INTER = 16
+
+    def setUp(self):
+        training_logs.reset()
+        paddle.seed(0)
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def _moe_layer(self):
+        return SimpleNamespace(
+            gate=SimpleNamespace(),
+            experts=None,
+            grouped_gemm_experts=SimpleNamespace(
+                weight1=paddle.randn([self.EXPERTS, self.LATENT, 2 * self.INTER]),
+                weight2=paddle.randn([self.EXPERTS, self.INTER, self.LATENT]),
+            ),
+            shared_experts=SimpleNamespace(
+                up_gate_proj=SimpleNamespace(weight=paddle.randn([self.LATENT, 2 * self.INTER])),
+                down_proj=SimpleNamespace(weight=paddle.randn([self.INTER, self.LATENT])),
+            ),
+        )
+
+    def _monitor(self, moe_layer, **kwargs):
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1, **kwargs)
+        monitor._layers = [(0, moe_layer)]
+        for name in mlp_update_module.metric_names(monitor.log_spectrum, with_shared=True):
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers()
+        return monitor
+
+    @staticmethod
+    def _bump(weight, scale=0.01):
+        return weight + paddle.randn(weight.shape) * scale
+
+    def _latest(self):
+        return {key.split("/")[-1]: value for key, value in training_logs.get_latest(prefix="mlp_update").items()}
+
+    def test_gate_and_up_split_the_fused_fc1_along_the_intermediate_axis(self):
+        """gate | up must partition fc1's output width exactly, gate first."""
+        fc1 = paddle.arange(self.EXPERTS * self.LATENT * 2 * self.INTER, dtype="float32").reshape(
+            [self.EXPERTS, self.LATENT, 2 * self.INTER]
+        )
+        gate = moe_monitor_module._swiglu_gate_half(fc1)
+        up = mlp_update_module._swiglu_up_half(fc1)
+        self.assertEqual(list(gate.shape), [self.EXPERTS, self.LATENT, self.INTER])
+        self.assertTrue(bool(paddle.all(gate == fc1[..., : self.INTER])))
+        self.assertTrue(bool(paddle.all(up == fc1[..., self.INTER :])))
+        self.assertTrue(bool(paddle.all(paddle.concat([gate, up], axis=-1) == fc1)))
+
+    def test_first_collect_only_establishes_the_base_point(self):
+        """One reading cannot give an increment, so nothing may be logged."""
+        monitor = self._monitor(self._moe_layer())
+        monitor.collect_expert_norms()
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="mlp_update"), {})
+
+    def test_relative_update_matches_the_frobenius_ratio_per_expert(self):
+        """r = ||dW||_F / ||W||_F, measured on each expert's own gate matrix."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        base = moe_layer.grouped_gemm_experts.weight1
+        delta = paddle.randn(base.shape) * 0.02
+        moe_layer.grouped_gemm_experts.weight1 = base + delta
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        now_gate = (base + delta)[..., : self.INTER].astype("float64")
+        delta_gate = delta[..., : self.INTER].astype("float64")
+        reference = paddle.sqrt((delta_gate**2).sum(axis=[-2, -1])) / paddle.sqrt((now_gate**2).sum(axis=[-2, -1]))
+        latest = self._latest()
+        self.assertAlmostEqual(latest["gate_rel_update_mean"], float(reference.mean()), places=6)
+        self.assertAlmostEqual(latest["gate_rel_update_max"], float(reference.max()), places=6)
+        self.assertAlmostEqual(latest["gate_rel_update_min"], float(reference.min()), places=6)
+
+    def _stable_rank_against_dense(self, delta):
+        """``(monitor value, dense float64 SVD value)`` for the gate half of ``delta``."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+        moe_layer.grouped_gemm_experts.weight1 = moe_layer.grouped_gemm_experts.weight1 + delta
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        ranks = []
+        for expert in range(self.EXPERTS):
+            sigma = paddle.linalg.svd(delta[expert, :, : self.INTER].astype("float64"), full_matrices=False)[1]
+            ranks.append(float((sigma**2).sum() / sigma.max() ** 2))
+        return self._latest()["gate_stable_rank_mean"], sum(ranks) / len(ranks)
+
+    def test_stable_rank_is_exact_when_the_update_concentrates(self):
+        """A dominant direction makes the power iteration converge immediately.
+
+        This is the case the metric exists for, so it has to be tight here.
+        """
+        base = paddle.randn([self.EXPERTS, self.LATENT, 2 * self.INTER]) * 0.02
+        left = paddle.randn([self.EXPERTS, self.LATENT, 1])
+        right = paddle.randn([self.EXPERTS, 1, 2 * self.INTER])
+        delta = base + 20.0 * paddle.matmul(left, right)
+        got, reference = self._stable_rank_against_dense(delta)
+        self.assertAlmostEqual(got / reference, 1.0, places=5)
+
+    def test_stable_rank_bias_on_a_flat_update_is_small_and_one_sided(self):
+        """A near-flat spectrum converges slowly, and only ever understates sigma_1.
+
+        An understated sigma_1 inflates the stable rank, so the deviation must be
+        upward and within a few percent -- the regime where the exact value does
+        not change the reading anyway.
+        """
+        delta = paddle.randn([self.EXPERTS, self.LATENT, 2 * self.INTER]) * 0.02
+        got, reference = self._stable_rank_against_dense(delta)
+        self.assertGreaterEqual(got, reference - 1e-6)
+        self.assertLess(got / reference, 1.05)
+
+    def test_each_projection_is_measured_on_its_own_scale(self):
+        """A large down update must not leak into the gate / up readings."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        experts = moe_layer.grouped_gemm_experts
+        experts.weight1 = self._bump(experts.weight1, 0.01)
+        experts.weight2 = self._bump(experts.weight2, 0.20)
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = self._latest()
+        self.assertGreater(latest["down_rel_update_mean"], 5 * latest["gate_rel_update_mean"])
+        self.assertAlmostEqual(latest["gate_rel_update_mean"], latest["up_rel_update_mean"], places=2)
+
+    def test_a_frozen_expert_reads_zero_update_and_unit_stable_rank(self):
+        """dW = 0 is 0/0 for the stable rank; it must land on the lower bound 1."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        delta = paddle.randn(moe_layer.grouped_gemm_experts.weight1.shape) * 0.02
+        delta[0] *= 0.0
+        moe_layer.grouped_gemm_experts.weight1 = moe_layer.grouped_gemm_experts.weight1 + delta
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = self._latest()
+        self.assertAlmostEqual(latest["gate_rel_update_min"], 0.0, places=9)
+        self.assertAlmostEqual(latest["gate_stable_rank_min"], 1.0, places=6)
+        self.assertGreater(latest["gate_stable_rank_max"], 1.0)
+
+    def test_expert_score_keeps_a_single_anomalous_projection_visible(self):
+        """S[e] = max_m z(r_m[e]); an up-only outlier must not be averaged away."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        experts = moe_layer.grouped_gemm_experts
+        delta = paddle.randn(experts.weight1.shape) * 0.01
+        delta[2, :, self.INTER :] *= 25.0
+        experts.weight1 = experts.weight1 + delta
+        experts.weight2 = self._bump(experts.weight2, 0.01)
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = self._latest()
+        # A z-score over n samples cannot exceed (n - 1) / sqrt(n), so the metric
+        # saturates: it is an outlier detector, not a magnitude.
+        ceiling = (self.EXPERTS - 1) / math.sqrt(self.EXPERTS)
+        self.assertGreater(latest["update_zmax_max"], 1.5)
+        self.assertLessEqual(latest["update_zmax_max"], ceiling + 1e-4)
+        self.assertGreater(latest["update_zmax_max"], latest["update_zmax_p90"])
+
+    def test_spectrum_rides_a_coarser_clock_than_the_relative_updates(self):
+        """log_spectrum with spectrum_interval=3: entropy on every third sample."""
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer, log_spectrum=True, spectrum_interval=3)
+        seen = []
+        for _ in range(7):
+            experts = moe_layer.grouped_gemm_experts
+            experts.weight1 = self._bump(experts.weight1)
+            training_logs.reset()
+            monitor.collect_expert_norms()
+            monitor.step()
+            keys = training_logs.get_latest(prefix="mlp_update")
+            seen.append((bool(keys), any("singular_entropy" in key for key in keys)))
+
+        self.assertEqual([measured for measured, _ in seen], [False] + [True] * 6)
+        self.assertEqual([spectrum for _, spectrum in seen], [False, True, False, False, True, False, False])
+
+    # ── discovery and wiring ─────────────────────────────────────────────
+
+    def test_discovery_accepts_the_three_expert_block_layouts(self):
+        """The expert block hangs off ``layer.mlp`` on this model family, off
+        ``layer.moe`` elsewhere, and a bare ``MoELayer`` is its own module.
+        """
+        by_mlp = SimpleNamespace(mlp=self._moe_layer())
+        by_moe = SimpleNamespace(moe=self._moe_layer())
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1)
+
+        found = mlp_update_module._find_moe_layers(SimpleNamespace(layers=[by_mlp, by_moe]), 0, monitor.mark_mtp_layers)
+
+        self.assertEqual([idx for idx, _module in found], [0, 1])
+        self.assertIs(found[0][1], by_mlp.mlp)
+        self.assertIs(found[1][1], by_moe.moe)
+
+    def test_discovery_falls_back_to_named_sublayers_for_a_bare_moe_layer(self):
+        """A stack exposing no decoder-layer list is searched by class name."""
+        latent, experts = self.LATENT, self.EXPERTS
+
+        class MoELayer(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.gate = nn.Linear(latent, experts)
+
+        class Block(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.block = MoELayer()
+
+        model = Block()
+        self.assertIsNone(layer_discovery.get_decoder_layers(model))
+
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1)
+        found = mlp_update_module._find_moe_layers(model, 0, monitor.mark_mtp_layers)
+
+        self.assertEqual([idx for idx, _module in found], [0])
+        self.assertIs(found[0][1], model.block)
+
+        class Dense(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(latent, experts)
+
+        self.assertEqual(mlp_update_module._find_moe_layers(Dense(), 0, monitor.mark_mtp_layers), [])
+
+    def test_down_weight_reads_every_expert_layout(self):
+        """Mirrors ``_expert_fc1_weight``: grouped-gemm ``weight2``, a fused
+        ``down_proj``, or a per-expert list that has to be stacked.
+        """
+        shape = [self.INTER, self.LATENT]
+        fused = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=SimpleNamespace(down_proj=SimpleNamespace(weight=paddle.randn([self.EXPERTS, *shape]))),
+        )
+        listed = SimpleNamespace(
+            grouped_gemm_experts=None,
+            experts=[SimpleNamespace(down_proj=SimpleNamespace(weight=paddle.randn(shape))) for _ in range(3)],
+        )
+
+        self.assertEqual(list(mlp_update_module._expert_fc2_weight(fused).shape), [self.EXPERTS, *shape])
+        self.assertEqual(list(mlp_update_module._expert_fc2_weight(listed).shape), [3, *shape])
+        for empty in (None, []):
+            layer = SimpleNamespace(grouped_gemm_experts=None, experts=empty)
+            self.assertIsNone(mlp_update_module._expert_fc2_weight(layer))
+
+    def test_setup_entry_point_registers_a_working_monitor(self):
+        """``_MONITOR_MAP`` holds ``setup_mlp_update_monitor``, so that is what
+        production calls. It has to hand the monitor back through ``monitor_dict``
+        -- nothing else keeps a reference, so ``collect_expert_norms`` would never
+        be reached -- thread its keyword arguments through, and return the model
+        untouched.
+        """
+        moe_layer = self._moe_layer()
+        model = SimpleNamespace(layers=[SimpleNamespace(mlp=moe_layer)])
+        monitors = {}
+
+        returned = mlp_update_module.setup_mlp_update_monitor(
+            model, monitor_dict=monitors, monitor_interval=1, log_spectrum=True, spectrum_interval=4
+        )
+
+        self.assertIs(returned, model)
+        monitor = monitors["mlp_update"]
+        self.assertIsInstance(monitor, PaddleMLPUpdateMonitor)
+        self.assertTrue(monitor.log_spectrum)
+        self.assertEqual(monitor.spectrum_interval, 4)
+        self.assertEqual([idx for idx, _module in monitor._layers], [0])
+
+        monitor.collect_expert_norms()  # base point only
+        monitor.step()
+        experts = moe_layer.grouped_gemm_experts
+        experts.weight1 = self._bump(experts.weight1)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        self.assertIn("mlp_update/layer_0/gate_rel_update_mean", training_logs.get_latest(prefix="mlp_update"))
+
+        # monitor_dict is optional; without one the model still comes back unchanged.
+        self.assertIs(mlp_update_module.setup_mlp_update_monitor(model), model)
+
+    def test_a_layer_without_a_shared_expert_declares_no_shared_keys(self):
+        """Declaring a key the layer can never record would publish a series that
+        stays permanently absent from the log.
+        """
+        moe_layer = self._moe_layer()
+        moe_layer.shared_experts = None
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1)
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(mlp=moe_layer)]))
+
+        declared = {key for key in monitor._gpu_cnt if "/layer_0/" in key}
+        self.assertIn("mlp_update/layer_0/gate_rel_update_mean", declared)
+        self.assertNotIn("mlp_update/layer_0/shared_gate_rel_update", declared)
+        self.assertEqual(len(declared), 33)  # 36 minus one shared key per projection
+
+    def test_a_model_without_moe_layers_allocates_nothing(self):
+        """A dense stack must leave the monitor inert, not half-initialised."""
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1)
+        monitor.register_hooks(SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace())]))
+
+        self.assertEqual(monitor._layers, [])
+        self.assertFalse(monitor._buffers_allocated)
+        monitor.collect_expert_norms()
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="mlp_update"), {})
+
+    def test_remove_hooks_releases_the_base_snapshots(self):
+        """The snapshots are the monitor's entire resident cost, so teardown has to
+        drop them rather than merely stop measuring.
+        """
+        monitor = self._monitor(self._moe_layer())
+        monitor.collect_expert_norms()
+        self.assertEqual(list(monitor._snapshots), [0])
+
+        monitor.remove_hooks()
+
+        self.assertEqual(monitor._snapshots, {})
+        self.assertEqual(monitor._layers, [])
+
+    def test_sample_interval_overrides_monitor_interval(self):
+        """The snapshot pair is the resident cost, so it may sample more sparsely
+        than the shared monitor clock.
+        """
+        self.assertEqual(PaddleMLPUpdateMonitor(monitor_interval=7).monitor_interval, 7)
+        self.assertEqual(PaddleMLPUpdateMonitor(monitor_interval=1, sample_interval=4).monitor_interval, 4)
+
+    def test_both_clocks_reject_non_positive_values(self):
+        """``spectrum_interval`` is a modulus; 0 would raise mid-training instead."""
+        with self.assertRaises(ValueError):
+            PaddleMLPUpdateMonitor(sample_interval=0)
+        with self.assertRaises(ValueError):
+            PaddleMLPUpdateMonitor(spectrum_interval=0)
+
+    def test_a_layer_that_raises_does_not_stop_the_later_layers(self):
+        """One unreadable expert block must cost its own layer's metrics, no more."""
+        good = self._moe_layer()
+        monitor = PaddleMLPUpdateMonitor(monitor_interval=1, verbose=True)
+        monitor._layers = [(0, BrokenPaddleMoELayer()), (1, good)]
+        for layer_idx in (0, 1):
+            for name in mlp_update_module.metric_names(False, with_shared=True):
+                monitor.declare_layer_metric(layer_idx, name)
+        monitor.allocate_buffers()
+
+        monitor.collect_expert_norms()
+        monitor.step()
+        experts = good.grouped_gemm_experts
+        experts.weight1 = self._bump(experts.weight1)
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mlp_update")
+        self.assertIn("mlp_update/layer_1/gate_rel_update_mean", latest)
+        self.assertNotIn("mlp_update/layer_0/gate_rel_update_mean", latest)
+
+    def test_a_weight_that_changes_shape_rebases_instead_of_differencing(self):
+        """After a resume or reshard the two readings describe different storage, so
+        the pair is skipped and the fresh snapshot becomes the new base point.
+        """
+        moe_layer = self._moe_layer()
+        monitor = self._monitor(moe_layer)
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        experts = moe_layer.grouped_gemm_experts
+        experts.weight1 = paddle.randn([self.EXPERTS + 2, self.LATENT, 2 * self.INTER])
+        experts.weight2 = paddle.randn([self.EXPERTS + 2, self.INTER, self.LATENT])
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mlp_update")
+        self.assertNotIn("mlp_update/layer_0/gate_rel_update_mean", latest)
+        self.assertNotIn("mlp_update/layer_0/update_zmax_max", latest)
+
+        experts.weight1 = self._bump(experts.weight1)
+        training_logs.reset()
+        monitor.collect_expert_norms()
+        monitor.step()
+        self.assertIn("mlp_update/layer_0/gate_rel_update_mean", training_logs.get_latest(prefix="mlp_update"))
+
+    def test_registered_in_the_paddlefleet_monitor_map(self):
+        """The yaml switch resolves through _MONITOR_MAP."""
+        self.assertIn("mlp_update", paddlefleet_backend._MONITOR_MAP)
+        self.assertIs(paddlefleet_backend._MONITOR_MAP["mlp_update"], mlp_update_module.setup_mlp_update_monitor)

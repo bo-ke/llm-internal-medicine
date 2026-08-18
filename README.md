@@ -166,6 +166,20 @@ setup_internal_medicine()
 | 17 | `load_balance_entropy_norm` | `moe_health/.../load_balance_entropy_norm` | `H(p) / log(E)` | 每层+全局 | 归一化负载熵 (均衡=1, 坍缩=0) |
 | 18 | `load_effective_experts` | `moe_health/.../load_effective_experts` | `exp(H)` | 每层+全局 | 有效专家数 (均衡=E, 坍缩=1) |
 
+PaddleFleet 后端还会直接从每次 router forward 的实际选择结果输出以下指标：
+
+| 指标组 | 公式 | 诊断意义 |
+|--------|------|----------|
+| `router_input_{rms,abs_max,abs_p99}` | Router 输入的 RMS、绝对最大值和绝对值 P99 | 区分输入整体放大与局部 outlier |
+| `router_entropy_norm` | `router_entropy / log(E)` | 跨不同专家数比较路由亲和度的尖锐程度 |
+| `router_margin_{mean,min,p10,p01}` | 最弱已选专家分数减最强未选专家分数 | 衡量 Top-K 决策边界的稳健程度 |
+| `assignment_load_*` | 对各专家实际 hard assignment 数量的分布统计 | 衡量 token 数量负载是否均衡 |
+| `gate_mass_*` | 对各专家已选正亲和度总量的分布统计 | 衡量专家获得的连续门控质量是否均衡 |
+
+`assignment_load_*` 和 `gate_mass_*` 均包含 `cv`、`entropy_norm`、
+`kl_uniform`、`max_frac`、`min_frac` 与 `max_min_ratio`。它们分别回答
+“每个专家接收多少 token”和“每个专家接收多少正门控质量”，不可互相替代。
+
 > **注**: 指标 14-18 (`load_*`) 在满足以下**任一**条件时输出, 优先使用前者:
 > 1. `global_aux_loss` 已开启 (`get_aux_loss_coeff("global_aux_loss") > 0`): 复用
 >    router 的 `global_tokens_per_expert` 缓冲区 (已跨 TPxDPxCP all-reduce 并在
@@ -504,7 +518,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 
 ## 附录: 完整指标速查表
 
-共 50 个指标键 (13 MoE + 9 QK + 21 MassiveAct + 7 PLE)。
+指标按后端和模型能力动态输出；以下列出各监控器的核心指标。
 
 | Monitor | 指标 | 公式 | SmoothedValue 模式 | 健康信号 |
 |---------|------|------|--------------------|----------|

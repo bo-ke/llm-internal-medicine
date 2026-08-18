@@ -241,8 +241,8 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
 
                 with paddle.no_grad():
                     self._position_cache[layer_idx] = {"layer_input": hidden_states.detach()}
-                    self._record_position(layer_idx, "layer_input", hidden_states, attn_type)
                     self._compute_and_log(layer_idx, hidden_states.detach(), module, attn_type=attn_type)
+                    self._record_position(layer_idx, "layer_input", hidden_states, attn_type)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MassiveActMonitor] Error at layer {layer_idx}: {e}")
@@ -278,11 +278,15 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         def hook_fn(module, _inputs, outputs):
             if not module.training or not self._should_monitor():
                 return
-            output = self._extract_output_tensor(outputs)
-            if output is None:
-                return
-            with paddle.no_grad():
-                self._record_position(layer_idx, position, output, attn_type)
+            try:
+                output = self._extract_output_tensor(outputs)
+                if output is None:
+                    return
+                with paddle.no_grad():
+                    self._record_position(layer_idx, position, output, attn_type)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MassiveActMonitor] Error at layer {layer_idx} position {position}: {e}")
 
         return hook_fn
 
@@ -290,20 +294,24 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         def hook_fn(module, inputs):
             if not module.training or not self._should_monitor():
                 return
-            post_attn = self._extract_hidden_states(inputs)
-            cache = self._position_cache.get(layer_idx)
-            if post_attn is None or cache is None:
-                return
-            with paddle.no_grad():
-                self._record_position(layer_idx, "post_attn_residual", post_attn, attn_type)
-                self._record_update_ratio(
-                    layer_idx,
-                    "attn_update_rms_ratio",
-                    cache["layer_input"],
-                    post_attn,
-                    attn_type,
-                )
-                cache["post_attn_residual"] = post_attn.detach()
+            try:
+                post_attn = self._extract_hidden_states(inputs)
+                cache = self._position_cache.get(layer_idx)
+                if post_attn is None or cache is None:
+                    return
+                with paddle.no_grad():
+                    cache["post_attn_residual"] = post_attn.detach()
+                    self._record_position(layer_idx, "post_attn_residual", post_attn, attn_type)
+                    self._record_update_ratio(
+                        layer_idx,
+                        "attn_update_rms_ratio",
+                        cache["layer_input"],
+                        post_attn,
+                        attn_type,
+                    )
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MassiveActMonitor] Error at layer {layer_idx} position post_attn_residual: {e}")
 
         return hook_fn
 
@@ -311,21 +319,25 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         def hook_fn(module, _inputs, outputs):
             if not module.training or not self._should_monitor():
                 return
-            layer_output = self._extract_output_tensor(outputs)
-            cache = self._position_cache.pop(layer_idx, None)
-            if layer_output is None or cache is None:
-                return
-            with paddle.no_grad():
-                self._record_position(layer_idx, "post_ffn_residual", layer_output, attn_type)
-                post_attn = cache.get("post_attn_residual")
-                if post_attn is not None:
-                    self._record_update_ratio(
-                        layer_idx,
-                        "ffn_update_rms_ratio",
-                        post_attn,
-                        layer_output,
-                        attn_type,
-                    )
+            try:
+                cache = self._position_cache.pop(layer_idx, None)
+                layer_output = self._extract_output_tensor(outputs)
+                if layer_output is None or cache is None:
+                    return
+                with paddle.no_grad():
+                    self._record_position(layer_idx, "post_ffn_residual", layer_output, attn_type)
+                    post_attn = cache.get("post_attn_residual")
+                    if post_attn is not None:
+                        self._record_update_ratio(
+                            layer_idx,
+                            "ffn_update_rms_ratio",
+                            post_attn,
+                            layer_output,
+                            attn_type,
+                        )
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MassiveActMonitor] Error at layer {layer_idx} position post_ffn_residual: {e}")
 
         return hook_fn
 
@@ -475,7 +487,7 @@ def setup_massive_activation_monitor(
         absolute_thresholds=absolute_thresholds,
     )
     monitor.register_hooks(model)
-    logger.info(f"[MassiveActMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")
+    logger.info(f"[MassiveActMonitor] Setup complete with {len(monitor.hooks)} hooks.")
     if monitor_dict is not None:
         monitor_dict["massive_act"] = monitor
     return model

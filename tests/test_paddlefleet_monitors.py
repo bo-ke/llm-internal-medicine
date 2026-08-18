@@ -993,6 +993,149 @@ class PaddleMassiveActivationMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["massive_act/layer_0/ffn_update_rms_ratio"], float(expected_ffn_ratio), places=6)
         monitor.remove_hooks()
 
+    def test_new_position_hooks_fail_closed(self):
+        hidden_states = paddle.randn([2, 3, 4], dtype="float32")
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("injected monitor failure")
+
+        for hook_kind in ("branch_output", "post_attn_residual", "layer_output"):
+            with self.subTest(hook_kind=hook_kind):
+                monitor = PaddleMassiveActivationMonitor()
+                monitor._record_position = fail
+                layer = nn.Identity()
+                if hook_kind == "branch_output":
+                    handle = layer.register_forward_post_hook(monitor._make_branch_output_hook(0, "attn_out", None))
+                elif hook_kind == "post_attn_residual":
+                    monitor._position_cache[0] = {"layer_input": hidden_states.detach()}
+                    handle = layer.register_forward_pre_hook(monitor._make_post_attn_residual_hook(0, None))
+                else:
+                    monitor._position_cache[0] = {"layer_input": hidden_states.detach()}
+                    handle = layer.register_forward_post_hook(monitor._make_layer_output_hook(0, None))
+
+                actual = layer(hidden_states)
+
+                self.assertTrue(paddle.allclose(actual, hidden_states).item())
+                if hook_kind == "layer_output":
+                    self.assertNotIn(0, monitor._position_cache)
+                handle.remove()
+
+    def test_update_ratio_hooks_fail_closed(self):
+        hidden_states = paddle.randn([2, 3, 4], dtype="float32")
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("injected update-ratio failure")
+
+        monitor = PaddleMassiveActivationMonitor()
+        monitor._record_position = lambda *_args, **_kwargs: None
+        monitor._record_update_ratio = fail
+        monitor._position_cache[0] = {"layer_input": hidden_states.detach()}
+        layer = nn.Identity()
+        handle = layer.register_forward_pre_hook(monitor._make_post_attn_residual_hook(0, None))
+
+        actual = layer(hidden_states)
+
+        self.assertTrue(paddle.allclose(actual, hidden_states).item())
+        self.assertIn("post_attn_residual", monitor._position_cache[0])
+        handle.remove()
+
+        monitor._position_cache[0] = {
+            "layer_input": hidden_states.detach(),
+            "post_attn_residual": hidden_states.detach(),
+        }
+        handle = layer.register_forward_post_hook(monitor._make_layer_output_hook(0, None))
+
+        actual = layer(hidden_states)
+
+        self.assertTrue(paddle.allclose(actual, hidden_states).item())
+        self.assertNotIn(0, monitor._position_cache)
+        handle.remove()
+
+    def test_output_extraction_failures_do_not_interrupt_forward(self):
+        hidden_states = paddle.randn([2, 3, 4], dtype="float32")
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("injected output extraction failure")
+
+        for hook_kind in ("branch_output", "layer_output"):
+            with self.subTest(hook_kind=hook_kind):
+                monitor = PaddleMassiveActivationMonitor()
+                monitor._extract_output_tensor = fail
+                layer = nn.Identity()
+                if hook_kind == "branch_output":
+                    handle = layer.register_forward_post_hook(monitor._make_branch_output_hook(0, "attn_out", None))
+                else:
+                    monitor._position_cache[0] = {"layer_input": hidden_states.detach()}
+                    handle = layer.register_forward_post_hook(monitor._make_layer_output_hook(0, None))
+
+                actual = layer(hidden_states)
+
+                self.assertTrue(paddle.allclose(actual, hidden_states).item())
+                if hook_kind == "layer_output":
+                    self.assertNotIn(0, monitor._position_cache)
+                handle.remove()
+
+    def test_module_position_metrics_support_mhc_residual_streams(self):
+        class Branch(nn.Layer):
+            def __init__(self, scale):
+                super().__init__()
+                self.scale = scale
+
+            def forward(self, hidden_states):
+                return hidden_states * self.scale, None
+
+        class HyperConnection(nn.Layer):
+            def __init__(self, num_streams):
+                super().__init__()
+                self.num_streams = num_streams
+
+            def forward(self, hidden_states):
+                stream_width = hidden_states.shape[-1] // self.num_streams
+                streams = hidden_states.reshape([*hidden_states.shape[:-1], self.num_streams, stream_width])
+                return streams.mean(axis=-2), None, None
+
+        class TransformerLayer(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layer_idx = 0
+                self.input_layernorm = nn.Identity()
+                self.post_attention_layernorm = nn.Identity()
+                self.self_attention_hyper_connection = HyperConnection(num_streams=2)
+                self.mlp_hyper_connection = HyperConnection(num_streams=2)
+                self.self_attn = Branch(scale=0.5)
+                self.mlp = Branch(scale=-0.25)
+
+            def forward(self, hidden_states):
+                attn_input, _, _ = self.self_attention_hyper_connection(hidden_states)
+                attn_out, _ = self.self_attn(attn_input)
+                post_attn = hidden_states + paddle.concat([attn_out, 2.0 * attn_out], axis=-1)
+                mlp_input, _, _ = self.mlp_hyper_connection(post_attn)
+                ffn_out, _ = self.mlp(mlp_input)
+                return post_attn + paddle.concat([ffn_out, 0.5 * ffn_out], axis=-1)
+
+        class Model(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.LayerList([TransformerLayer()])
+
+        hidden_states = paddle.to_tensor([[[1.0, 2.0, 3.0, 4.0], [-1.0, 0.5, 2.0, -2.0]]])
+        model = Model()
+        monitor = PaddleMassiveActivationMonitor(cosine_sample_pairs=2)
+        monitor.register_hooks(model)
+
+        expected = model.layers[0](hidden_states)
+        monitor.step()
+
+        self.assertEqual(expected.shape, hidden_states.shape)
+        metrics = training_logs.get_latest(prefix="massive_act/layer_0/")
+        self.assertIn("massive_act/layer_0/attn_out_rms", metrics)
+        self.assertIn("massive_act/layer_0/post_attn_residual_rms", metrics)
+        self.assertIn("massive_act/layer_0/ffn_or_moe_out_rms", metrics)
+        self.assertIn("massive_act/layer_0/post_ffn_residual_rms", metrics)
+        self.assertIn("massive_act/layer_0/attn_update_rms_ratio", metrics)
+        self.assertIn("massive_act/layer_0/ffn_update_rms_ratio", metrics)
+        monitor.remove_hooks()
+
 
 class PaddleQKMonitorTest(unittest.TestCase):
     def test_resolve_layer_idx_uses_shared_base_logic(self):

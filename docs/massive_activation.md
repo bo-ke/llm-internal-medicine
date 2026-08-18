@@ -172,6 +172,7 @@ update_rms_ratio = RMS(residual_after - residual_before) / RMS(residual_before)
 ```
 
 因此该比例同时覆盖 bias、dropout、BDA，以及 mHC 中 residual mixing 对实际 residual stream 的影响。
+若前后 residual 形状不一致（例如某些 MTP 打包路径），该比例不会输出，以避免比较不匹配的张量。
 
 ---
 
@@ -454,6 +455,7 @@ von Neumann）熵。`p_i` 是把奇异值平方归一化成的分布（合法，
 - **TP per-channel 聚合**：Megatron/PaddleFleet TP 切通道维时会在 hook 内对 per-channel max 做一次 `MAX all_reduce`，这是正确性所需
 - **Post-norm 指标**：需要额外一次 RMSNorm forward（无梯度），开销约等于一个 norm 层
 - **Cosine stability**：采样 256 对，O(256×H)，通常较小
+- **Module-position 指标**：每个位置执行 O(S×H) 的尺度/tail 统计，其中精确 `abs_p99` 需要 quantile；大模型建议配合 `monitor_interval` 或 `sample_layers`
 - **Logit-lens entropy + logsumexp + cross-entropy**（可选，默认关）：每监控层每监控步一次 LM-head 前向，复杂度约 O(S×H×vocab)，是本 monitor 中**最重**的指标；熵、`log Z`、CE 共用同一次投影（logsumexp 与 CE 均近零额外开销，CE 只多一次 `gather`）。按 token 分块把峰值显存限制在一个 `[chunk, vocab]` tile，但计算量仍显著，建议配合大 `monitor_interval` 与 `logit_lens_layers` 使用
 - **Hidden spectral entropy**（可选，默认关）：一次 Gram matmul（O(n·d²)）加 `eigvalsh`（O(min(n,d)³)），无 LM head、无 full SVD、无 host sync，比 logit-lens 轻很多；大 batch 下 `eigvalsh` 的立方项可观，建议配合 `monitor_interval`
 

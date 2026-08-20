@@ -1,0 +1,308 @@
+import importlib
+import math
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+try:
+    paddle = importlib.import_module("paddle")
+except Exception as exc:  # pragma: no cover - optional backend
+    raise unittest.SkipTest(f"paddle backend unavailable: {exc}") from exc
+
+mm_metrics = importlib.import_module("internal_medicine.backends.paddlefleet.multimax_metrics")
+mm_monitor = importlib.import_module("internal_medicine.backends.paddlefleet.multimax_monitor")
+training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
+
+
+def _seglu_reference(x, ranges, ts):
+    relu = paddle.nn.functional.relu
+    out = x.clone()
+    out += ts[0] * relu(ranges[0] - x)
+    out += ts[1] * relu(x - ranges[1])
+    out += ts[2] * relu(ranges[2] - x) ** 2
+    out += ts[3] * relu(x - ranges[3]) ** 2
+    return out
+
+
+class SegLUMirrorTest(unittest.TestCase):
+    def test_zero_init_is_identity(self):
+        x = paddle.to_tensor([[-2.0, 0.0, 3.5]], dtype="float32")
+        zeros = paddle.zeros([4], dtype="float32")
+        out = mm_metrics.apply_seglu(x, zeros, zeros)
+        self.assertTrue(bool(paddle.allclose(out, x)))
+
+    def test_matches_upstream_reference_for_trained_params(self):
+        x = paddle.to_tensor([[-4.0, -0.5, 0.0, 1.25, 6.0]], dtype="float32")
+        ranges = paddle.to_tensor([-1.0, 2.0, -3.0, 4.0], dtype="float32")
+        ts = paddle.to_tensor([0.3, -0.2, 0.05, 0.1], dtype="float32")
+        out = mm_metrics.apply_seglu(x, ranges, ts)
+        self.assertTrue(bool(paddle.allclose(out, _seglu_reference(x, ranges, ts), atol=1e-6)))
+
+
+class DistributionMetricsTest(unittest.TestCase):
+    def test_uniform_logits_hit_entropy_and_topk_bounds(self):
+        logits = paddle.zeros([2, 8], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, topk=2)
+
+        self.assertAlmostEqual(float(m["entropy"]), math.log(8), places=5)
+        self.assertAlmostEqual(float(m["entropy_norm"]), 1.0, places=5)
+        self.assertAlmostEqual(float(m["top1_prob"]), 1.0 / 8, places=6)
+        self.assertAlmostEqual(float(m["top2_prob"]), 2.0 / 8, places=6)
+        # Uniform rows have no entry strictly between eps and the max, so the
+        # multi-modality mean has no valid row to average.
+        self.assertAlmostEqual(float(m["relevant_count"]), 0.0, places=6)
+        # ... and none strictly below eps either, so sparsity has no valid row
+        # either: a uniform row must not be scored as maximally sparse.
+        self.assertAlmostEqual(float(m["sparse_count"]), 0.0, places=6)
+        self.assertAlmostEqual(float(m["sparsity"]), 0.0, places=6)
+
+    def test_threshold_boundary_belongs_to_neither_set(self):
+        # prob_eps == 1/V puts every entry of a uniform row exactly on eps.
+        logits = paddle.zeros([1, 4], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, prob_eps=0.25, topk=1)
+
+        self.assertAlmostEqual(float(m["relevant_count"]), 0.0, places=6)
+        self.assertAlmostEqual(float(m["sparse_count"]), 0.0, places=6)
+
+    def test_logit_eps_overrides_the_probability_threshold(self):
+        logits = paddle.to_tensor([[3.0, 1.0, -1.0, -5.0]], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, logit_eps=0.0, topk=1)
+
+        # eps == 0: relevant is {1.0} (max excluded), sparse is {-1.0, -5.0}.
+        self.assertAlmostEqual(float(m["relevant_count"]), 1.0, places=6)
+        self.assertAlmostEqual(float(m["sparse_count"]), 2.0, places=6)
+
+    def test_multi_modality_matches_hand_computed_definition(self):
+        # Two relevant modes plus one clearly irrelevant entry.
+        logits = paddle.to_tensor([[2.0, 1.0, -30.0]], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, prob_eps=1e-6, topk=1)
+
+        p = paddle.nn.functional.softmax(logits, axis=-1)[0]
+        expected = 1.0 - float(p[0] - p[1])  # N == 1: only the second entry
+        self.assertAlmostEqual(float(m["multi_modality"]), expected, places=5)
+        self.assertAlmostEqual(float(m["relevant_count"]), 1.0, places=6)
+
+    def test_multi_modality_is_higher_for_a_flatter_head(self):
+        peaked = paddle.to_tensor([[8.0, 1.0, -30.0]], dtype="float32")
+        flat = paddle.to_tensor([[1.2, 1.0, -30.0]], dtype="float32")
+        peaked_m = mm_metrics.compute_distribution_metrics(peaked, prob_eps=1e-6, topk=1)
+        flat_m = mm_metrics.compute_distribution_metrics(flat, prob_eps=1e-6, topk=1)
+
+        self.assertLess(float(peaked_m["multi_modality"]), float(flat_m["multi_modality"]))
+
+    def test_sparsity_peaks_when_irrelevant_entries_sit_at_the_minimum(self):
+        # All sub-eps entries equal the row minimum -> every term is exp(-1).
+        at_min = paddle.to_tensor([[10.0, -20.0, -20.0, -20.0]], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(at_min, prob_eps=1e-6, topk=1)
+        self.assertAlmostEqual(float(m["sparsity"]), math.exp(-1.0), places=5)
+        self.assertAlmostEqual(float(m["sparse_count"]), 3.0, places=6)
+
+        # Lifting them well above the minimum drives the score toward 0.
+        spread = paddle.to_tensor([[10.0, -20.0, -12.0, -8.0]], dtype="float32")
+        self.assertLess(
+            float(mm_metrics.compute_distribution_metrics(spread, prob_eps=1e-6, topk=1)["sparsity"]),
+            float(m["sparsity"]),
+        )
+
+    def test_metrics_are_zero_dim_and_finite(self):
+        logits = paddle.randn([4, 16], dtype="float32")
+        for name, value in mm_metrics.compute_distribution_metrics(logits).items():
+            self.assertEqual(value.shape, [], f"{name} must be a 0-dim tensor")
+            self.assertTrue(bool(paddle.isfinite(value)), f"{name} must be finite")
+
+    def test_batched_logits_are_flattened_to_rows(self):
+        flat = paddle.randn([6, 16], dtype="float32")
+        batched = flat.reshape([2, 3, 16])
+        flat_m = mm_metrics.compute_distribution_metrics(flat)
+        batched_m = mm_metrics.compute_distribution_metrics(batched)
+
+        self.assertEqual(float(batched_m["rows"]), 6.0)
+        self.assertAlmostEqual(float(batched_m["entropy"]), float(flat_m["entropy"]), places=5)
+
+    def test_param_metrics_expose_every_component(self):
+        out = mm_metrics.compute_param_metrics(
+            paddle.to_tensor([0.0, 1.0, 2.0, 3.0], dtype="float32"),
+            paddle.to_tensor([4.0, 5.0, 6.0, 7.0], dtype="float32"),
+        )
+        self.assertEqual(float(out["range_2"]), 2.0)
+        self.assertEqual(float(out["t_3"]), 7.0)
+        self.assertEqual(len(out), 8)
+
+
+class _FakeMultimaxHead(paddle.nn.Layer):
+    """Minimal stand-in for ``GPTLMHead`` with multimax enabled."""
+
+    def __init__(self, vocab=32, hidden=8, fused=False, mtp=False, as_dict=False):
+        super().__init__()
+        self.use_multimax_lmhead = True
+        self.fused = fused
+        self.mtp = mtp
+        self.as_dict = as_dict
+        self.weight = self.create_parameter(
+            shape=[vocab, hidden],
+            default_initializer=paddle.nn.initializer.Normal(std=0.05),
+        )
+        self.bias = None
+        self.multimax_ranges = self.create_parameter(shape=[4], default_initializer=paddle.nn.initializer.Constant(0.0))
+        self.multimax_ts = self.create_parameter(shape=[4], default_initializer=paddle.nn.initializer.Constant(0.0))
+
+    def forward(self, hidden_states):
+        if self.fused:
+            out = (hidden_states, self.weight, self.bias, self.multimax_ranges, self.multimax_ts)
+        else:
+            logits = paddle.matmul(hidden_states, self.weight, transpose_y=True)
+            out = mm_metrics.apply_seglu(logits, self.multimax_ranges, self.multimax_ts)
+        if self.mtp:
+            out = [out, out]
+        if self.as_dict:
+            out = {"logits": out, "mtp_loss": None}
+        return out
+
+
+class MultiMaxMonitorTest(unittest.TestCase):
+    def tearDown(self):
+        training_logs.reset()
+
+    def _run(self, head, tokens=12, hidden=8, sample_tokens=8):
+        monitor = mm_monitor.PaddleMultiMaxMonitor(sample_tokens=sample_tokens, topk=5, verbose=True)
+        monitor.register_hooks(head)
+        head.train()
+        head(paddle.randn([tokens, hidden], dtype="float32"))
+        monitor.step()
+        monitor.remove_hooks()
+        return training_logs.get_latest(prefix="multimax/")
+
+    def test_unfused_path_emits_every_declared_metric(self):
+        logs = self._run(_FakeMultimaxHead())
+
+        for name in ("entropy", "entropy_norm", "top1_prob", "top5_prob", "multi_modality", "sparsity"):
+            self.assertIn(f"multimax/global_{name}", logs)
+        self.assertIn("multimax/global_range_0", logs)
+        self.assertIn("multimax/global_t_3", logs)
+        # sample_tokens=8 with 12 tokens -> strided down to 8 rows.
+        self.assertLessEqual(logs["multimax/global_rows"], 8.0)
+
+    def test_fused_ce_path_reconstructs_the_logits_tile(self):
+        logs = self._run(_FakeMultimaxHead(fused=True))
+        self.assertIn("multimax/global_entropy", logs)
+        self.assertGreater(logs["multimax/global_entropy"], 0.0)
+
+    def test_mtp_and_dict_outputs_are_unwrapped(self):
+        for kwargs in ({"mtp": True}, {"as_dict": True}, {"mtp": True, "fused": True}):
+            training_logs.reset()
+            logs = self._run(_FakeMultimaxHead(**kwargs))
+            self.assertIn("multimax/global_entropy", logs, f"failed for {kwargs}")
+
+    def test_no_head_means_no_hooks_and_no_keys(self):
+        plain = paddle.nn.Linear(4, 4)
+        monitor = mm_monitor.PaddleMultiMaxMonitor()
+        monitor.register_hooks(plain)
+
+        self.assertEqual(monitor.hooks, [])
+        self.assertFalse(monitor._buffers_allocated)
+
+    def test_topk_is_clamped_to_the_vocab_width_at_registration(self):
+        head = _FakeMultimaxHead(vocab=4)
+        monitor = mm_monitor.PaddleMultiMaxMonitor(topk=10)
+        monitor.register_hooks(head)
+
+        self.assertEqual(monitor._topk_effective, 4)
+        self.assertIn("multimax/global_top4_prob", monitor._mean_keys)
+        monitor.remove_hooks()
+
+    def test_token_sampling_caps_the_analyzed_rows(self):
+        logs = self._run(_FakeMultimaxHead(), tokens=100, sample_tokens=8)
+        self.assertEqual(logs["multimax/global_rows"], 8.0)
+
+    def test_fewer_tokens_than_the_budget_uses_every_row(self):
+        logs = self._run(_FakeMultimaxHead(), tokens=5, sample_tokens=8)
+        self.assertEqual(logs["multimax/global_rows"], 5.0)
+
+    def test_log_global_false_disables_the_monitor_instead_of_recording_nothing(self):
+        head = _FakeMultimaxHead()
+        monitor = mm_monitor.PaddleMultiMaxMonitor(log_global=False)
+        monitor.register_hooks(head)
+
+        self.assertEqual(monitor.hooks, [])
+        self.assertFalse(monitor._buffers_allocated)
+
+    def test_fused_path_does_not_promote_the_head_weight_to_fp32(self):
+        # The [vocab, hidden] weight must never be cast (that would allocate a
+        # full-size fp32 copy at LM-head scale); only the sampled tile is.
+        head = _FakeMultimaxHead(fused=True)
+        monitor = mm_monitor.PaddleMultiMaxMonitor(sample_tokens=4, topk=2)
+        monitor.register_hooks(head)
+        original_astype = paddle.Tensor.astype
+        promoted_shapes = []
+
+        def tracking_astype(self, dtype):
+            if str(dtype).endswith("float32") and len(self.shape) == 2 and self.shape == head.weight.shape:
+                promoted_shapes.append(list(self.shape))
+            return original_astype(self, dtype)
+
+        paddle.Tensor.astype = tracking_astype
+        try:
+            head.train()
+            head(paddle.randn([6, 8], dtype="float32"))
+        finally:
+            paddle.Tensor.astype = original_astype
+            monitor.remove_hooks()
+
+        self.assertEqual(promoted_shapes, [])
+
+
+class _FakeGPTMTPLMHead(_FakeMultimaxHead):
+    """Stand-in for ``GPTMTPLMHead``: returns ``dict_args`` with ``mtp_logits``.
+
+    The dict also carries the main head's ``logits`` (the pipeline dict flows
+    through both heads), which the monitor must ignore for this head.
+    """
+
+    def forward(self, hidden_states):
+        peaked = paddle.concat(
+            [
+                paddle.full([hidden_states.shape[0], 1], 20.0, dtype="float32"),
+                paddle.zeros([hidden_states.shape[0], self.weight.shape[0] - 1], dtype="float32"),
+            ],
+            axis=-1,
+        )
+        uniform = paddle.zeros([hidden_states.shape[0], self.weight.shape[0]], dtype="float32")
+        return {"logits": uniform, "mtp_logits": [peaked], "hidden_states": hidden_states}
+
+
+class MultiMaxMTPHeadTest(unittest.TestCase):
+    def tearDown(self):
+        training_logs.reset()
+
+    def test_mtp_head_gets_its_own_namespace_and_reads_mtp_logits(self):
+        model = paddle.nn.LayerList([_FakeMultimaxHead(vocab=8), _FakeGPTMTPLMHead(vocab=8)])
+        monitor = mm_monitor.PaddleMultiMaxMonitor(sample_tokens=8, topk=2)
+        monitor.register_hooks(model)
+        self.assertEqual(len(monitor.hooks), 2)
+
+        for head in model:
+            head.train()
+            head(paddle.randn([6, 8], dtype="float32"))
+        monitor.step()
+        monitor.remove_hooks()
+        logs = training_logs.get_latest(prefix="multimax/")
+
+        self.assertIn("multimax/global_entropy", logs)
+        self.assertIn("multimax/global_mtp_entropy", logs)
+        self.assertIn("multimax/global_mtp_range_0", logs)
+        # mtp_logits is one-hot-peaked; the stale "logits" in the same dict is
+        # uniform. Reading the wrong key would give entropy == log(8).
+        self.assertLess(logs["multimax/global_mtp_entropy"], 0.01)
+        self.assertAlmostEqual(logs["multimax/global_mtp_top1_prob"], 1.0, places=5)
+
+    def test_single_main_head_declares_no_mtp_keys(self):
+        monitor = mm_monitor.PaddleMultiMaxMonitor(topk=2)
+        monitor.register_hooks(_FakeMultimaxHead(vocab=8))
+        self.assertFalse([k for k in monitor._mean_keys if "mtp_" in k])
+        monitor.remove_hooks()
+
+
+if __name__ == "__main__":
+    unittest.main()

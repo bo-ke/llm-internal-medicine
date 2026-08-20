@@ -2,7 +2,7 @@
 
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
-包含九大监控模块：
+包含十大监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
@@ -12,6 +12,7 @@
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
 - **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 36 指标；仅权重)
+- **[MultiMax](./docs/multimax.md)** — LM head SegLU 调制的输出分布监控：论文的 sparsity / multi-modality 指标 + 熵 + top-k 概率质量 (15 指标；仅 paddlefleet；仅在 `multimax_modules` 含 `lm_head` 时生效)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
 - **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
@@ -140,7 +141,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update`
+- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update` | `multimax`
 - `global_idx`: 全局层索引。优先取模块自带的 `layer.layer_number`（0-based 全局编号）；取不到时回退到
   `pp_rank × local_layers + local_idx`。`num_empty_layers_add_in_head > 0` 时所有层号整体偏移该值，看板对号要减掉
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
@@ -670,6 +671,47 @@ RMSNorm / QK-norm 的可学习 scale 在 QK 电路内部，故折进 `W_q` / `W_
 
 ---
 
+## 九、MultiMax Monitor (multimax)
+
+监控 LM head 上 SegLU（MultiMax）调制后的**输出分布**。指标出自
+[MultiMax (ICML 2024, arXiv:2406.01189)](https://arxiv.org/abs/2406.01189) 的
+Definition 3.2 / 3.3，外加预测熵与 top-k 概率质量。
+
+> 详细文档: [multimax.md](./docs/multimax.md)
+
+设 `x` 为调制后 logits，`φ = softmax(x)`，`ε` 为相关性阈值：
+
+| # | 指标 | 键 | 公式 | 粒度 | 含义 |
+|---|------|-----|------|------|------|
+| 1 | `multi_modality` | `multimax/global_multi_modality` | `1 − (1/N)Σ_{ε<xₙ<x_max}(φ_max − φₙ)` | 全局 | **上升 = 更多峰**；N=0 的行排除在均值外 |
+| 2 | `sparsity` | `multimax/global_sparsity` | `(1/L)Σ_{x_l<ε} exp(−exp(x_l − x_min))` | 全局 | **上升 = 无关项被压得更死**；上界 `e⁻¹` |
+| 3 | `entropy` | `multimax/global_entropy` | `logsumexp(x) − E_p[x]` | 全局 | 预测熵 (nats) |
+| 4 | `entropy_norm` | `multimax/global_entropy_norm` | `H / log V` | 全局 | 归一化熵，跨词表可比 |
+| 5 | `top1_prob` | `multimax/global_top1_prob` | `φ_max` | 全局 | 最大概率 |
+| 6 | `top10_prob` | `multimax/global_top10_prob` | `Σ top-10 φ` | 全局 | 前 10 项概率质量（k 可配） |
+| 7 | `relevant_count` / `sparse_count` | 同上 | `N` / `L` | 全局 | Def 3.2/3.3 的样本量，用于核对 ε |
+| 8 | `range_0..3` / `t_0..3` | 同上 | `multimax_ranges` / `multimax_ts` 分量 | 全局 | 全 0 = SegLU 仍是恒等，即没在学 |
+
+第 2 项的形式是 Def 3.3 在 `s = φ_min` 下的**精确等价变形**（`(s−p)/s−1 = −p/s`，
+`p_l/s = exp(x_l−x_min)`），只用 logits，避免 fp32 下 `φ_min` 下溢成 0。
+
+开 MTP 时 `GPTMTPLMHead` 有自己的一套 SegLU 参数，指标落在 `multimax/global_mtp_*`，
+与 main head 分开统计。
+
+**ε 的默认取法**是本实现唯一的判断：论文留作「任何合理阈值」，而 LM head 的 logit 尺度
+会随训练漂移，所以默认在概率空间给再映射回 logit——`ε = log(1/V) + logsumexp(x)`，
+含义是「概率超过均匀分布才算相关」；softmax 单调所以定义不变。传 `logit_eps` 可覆盖。
+
+两条 head 路径都支持：`fused_linear_ce_loss_chunk=0` 时直接用 head 返回的 logits；
+`>0` 时完整 logits 从不物化，monitor 用 head 自己的 `ranges`/`ts` 把采样到的一小块重算
+（`apply_seglu` 是 `lm_head.py:SegLU` 的镜像，测试逐元素对齐）。
+
+> **唯一的 hook 内集合通信**：词表切分下每 rank 只有 `V/tp` 列，而所有指标都需要全局 softmax
+> 归一化，因此对 `[sample_tokens, V/tp]` 做一次 `all_gather`。规模被 `sample_tokens`（默认 256）
+> 限住，只在被监控 step 触发，属 `monitor-hook-perf-rules` 的正确性例外。
+
+---
+
 ## 基础设施
 
 ### TrainingLogs
@@ -818,6 +860,12 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MLPUpdate** | `{m}_stable_rank_mean` | `‖ΔW_m‖_F²/‖ΔW_m‖₂²` | mean | 更新是否集中到少数方向 |
 | **MLPUpdate** | `update_zmax_max` | `max_e max_m z(r_m)` | max | 层内最异常专家，上界 `(E−1)/√E` |
 | **MLPUpdate** | `shared_{m}_rel_update` | `r_m` of shared expert | mean | 路由专家的对照组 |
+| **MultiMax** | `multi_modality` | `1 − (1/N)Σ(φ_max − φₙ)`, `ε<xₙ<x_max` | mean | 上升 = 输出分布更多峰 (Def 3.2) |
+| **MultiMax** | `sparsity` | `(1/L)Σ exp(−exp(x_l − x_min))`, `x_l<ε` | mean | 上升 = 无关项更贴近最小值 (Def 3.3)，上界 `e⁻¹` |
+| **MultiMax** | `entropy` / `entropy_norm` | `logsumexp(x) − E_p[x]` / `÷ log V` | mean | 预测熵；与 sparsity/multi_modality 一起看 |
+| **MultiMax** | `top1_prob` / `top10_prob` | `φ_max` / `Σ top-10 φ` | mean | 概率质量集中度，k 可配 |
+| **MultiMax** | `relevant_count` / `sparse_count` | `N` / `L` | mean | Def 3.2/3.3 的样本量，核对 ε 是否合理 |
+| **MultiMax** | `range_0..3` / `t_0..3` | `multimax_ranges` / `multimax_ts` | mean | 全 0 = SegLU 仍是恒等，multimax 没在学 |
 | **Optim** | `update_rms` | `sqrt(mean((θ_new−θ_old)²))` | 已全局归约 | 本 step 参数更新幅度 (始终装上, 受 monitor_interval 门控) |
 | **Optim** | `param_rms` | `sqrt(mean(θ_new²))` | 已全局归约 | 更新后参数尺度 (始终装上, 受 monitor_interval 门控) |
 | **Optim** | `update_param_ratio` | `update_rms / param_rms` | 已全局归约 | trust ratio, ~1e-3 健康 (始终装上, 受 monitor_interval 门控) |

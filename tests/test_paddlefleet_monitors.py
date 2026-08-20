@@ -452,6 +452,101 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/layer_1_mtp/router_entropy"], 4.0, places=4)
         self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 3.0, places=4)
 
+    def test_per_expert_vector_expands_to_one_key_per_expert(self):
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
+        monitor.declare_layer_vector(0, "expert_token_share", 3)
+        monitor.allocate_buffers()
+
+        monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([10.0, 20.0, 70.0]))
+        monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([30.0, 20.0, 50.0]))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        # Mean over the two records, one key per expert, and no global rollup.
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e0"], 20.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e1"], 20.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e2"], 60.0, places=4)
+        self.assertNotIn("moe_health/global_expert_token_share", latest)
+
+    def test_per_expert_vector_shares_the_single_scalar_flush(self):
+        """Vector and scalar accumulators come back through one D2H together."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        monitor.declare_layer_metric(0, "router_entropy")
+        monitor.declare_layer_vector(0, "expert_weight_share", 2)
+        monitor.allocate_buffers()
+
+        monitor.record_layer_metric(0, "router_entropy", paddle.to_tensor(2.0))
+        monitor.record_layer_vector(0, "expert_weight_share", paddle.to_tensor([40.0, 60.0]))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/router_entropy"], 2.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_weight_share_e0"], 40.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_weight_share_e1"], 60.0, places=4)
+
+    def test_per_expert_vector_resets_between_steps(self):
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        monitor.declare_layer_vector(0, "expert_token_share", 2)
+        monitor.allocate_buffers()
+
+        monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([25.0, 75.0]))
+        monitor.step()
+        monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([60.0, 40.0]))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e0"], 60.0, places=4)
+
+    def test_per_expert_vector_skipped_when_log_per_layer_off(self):
+        monitor = PaddleMoEMonitor(log_per_layer=False, log_global=True)
+        monitor.declare_layer_vector(0, "expert_token_share", 2)
+        monitor.allocate_buffers()
+
+        monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([25.0, 75.0]))
+        monitor.step()
+
+        self.assertEqual(training_logs.get_latest(prefix="moe_health"), {})
+
+    def test_expert_shares_come_from_assignment_and_probs(self):
+        """assignment -> token share, probs -> combine-weight share, both in percent."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        monitor.declare_layer_vector(0, "expert_token_share", 3)
+        monitor.declare_layer_vector(0, "expert_weight_share", 3)
+        monitor.allocate_buffers()
+
+        # 2 tokens, 3 experts, top-1: token 0 -> e0, token 1 -> e2. `assignment`
+        # is the same per-expert count the caller already summed for
+        # assignment_load_*, so the two views stay exactly consistent.
+        assignment = paddle.to_tensor([1.0, 0.0, 1.0])
+        probs = paddle.to_tensor([[0.25, 0.0, 0.0], [0.0, 0.0, 0.75]])
+        outputs = (None, None, None, probs, None, None, None, None)
+        monitor._record_expert_shares(0, assignment, outputs)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        token = [latest[f"moe_health/layer_0/expert_token_share_e{i}"] for i in range(3)]
+        self.assertAlmostEqual(token[0], 50.0, places=4)
+        self.assertAlmostEqual(token[1], 0.0, places=4)
+        self.assertAlmostEqual(token[2], 50.0, places=4)
+        self.assertAlmostEqual(sum(token), 100.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_weight_share_e0"], 25.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_weight_share_e2"], 75.0, places=4)
+
+    def test_expert_token_share_survives_missing_probs(self):
+        """A gate that returns no combine weights still yields the token share."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        monitor.declare_layer_vector(0, "expert_token_share", 2)
+        monitor.declare_layer_vector(0, "expert_weight_share", 2)
+        monitor.allocate_buffers()
+
+        monitor._record_expert_shares(0, paddle.to_tensor([3.0, 1.0]), (None, None, None))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e0"], 75.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e1"], 25.0, places=4)
+        self.assertNotIn("moe_health/layer_0/expert_weight_share_e0", latest)
+
     def test_gpu_buffer_multi_layer_global_aggregation(self):
         """Global metrics are derived from layer accumulators at flush time."""
         monitor = PaddleMoEMonitor(log_per_layer=False, log_global=True)

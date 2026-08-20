@@ -3,7 +3,7 @@
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
 包含九大监控模块：
-- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
+- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (28 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
@@ -181,6 +181,8 @@ setup_internal_medicine()
 | 24 | `expert_gate_singular_entropy_max` | `moe_health/.../expert_gate_singular_entropy_max` | `max_e(...)` | 每层+全局 | 全谱最均匀的专家 |
 | 25 | `shared_gate_stable_rank` | `moe_health/.../shared_gate_stable_rank` | `‖W_g‖_F² / ‖W_g‖_2²` | 每层+全局 | 共享专家门控矩阵谱宽度 |
 | 26 | `shared_gate_singular_entropy` | `moe_health/.../shared_gate_singular_entropy` | `-Σ pᵢ log pᵢ, pᵢ = σᵢ²/Σσⱼ²` | 每层+全局 | 共享专家门控矩阵全谱利用率 |
+| 27 | `expert_token_share` | `moe_health/layer_N/expert_token_share_eK` | `count_K / Σ count × 100%` | 每层每专家 | 专家 K 分到的 token 占本层路由量的百分比 |
+| 28 | `expert_weight_share` | `moe_health/layer_N/expert_weight_share_eK` | `Σ probs_K / ΣΣ probs × 100%` | 每层每专家 | 专家 K 占本层总 combine 权重的百分比 (激活幅度贡献) |
 
 > 19-26 针对的是**专家 MLP 的 SwiGLU 门控投影** (`fc1` 前一半输出，即经过 SiLU 的那一半)，不是 router 的 `gate.weight`。
 > 奇异值经 Gram 矩阵特征分解得到 (`W Wᵀ` 或 `WᵀW` 取较小方阵)，比 `svdvals` 快约 40 倍；路由专家与共享专家的 Gram 拼成一个批次求解，避免 cuSOLVER 因批次形状变化重建 workspace。
@@ -211,6 +213,28 @@ PaddleFleet 后端还会直接从每次 router forward 的实际选择结果输�
 > 两种来源都在 global batch 级读取 (不在 forward hook 热路径上), 且计数已跨 rank
 > reduce, 因此无需 monitor 侧 collective, 统计值已是全局正确值。load 比值本身
 > scale-invariant, 直接用累加计数即可。
+
+> **注**: 指标 27-28 (`expert_*_share`) 是**每层每专家一条曲线**的向量指标 (256 专家的
+> 18 层模型 = 9216 个键), 只在 `log_per_layer=true` 时输出, 且不派生 `global_*`。
+> 它们与 `assignment_load_*` / `gate_mass_*` 互补: 后者回答一层「有多不均衡」,
+> 前者回答「是哪个专家造成的、是否长期是同一个」。
+>
+> `expert_token_share` 直接复用 `assignment_load_*` 已经算出的 hard-assignment
+> 计数向量, 因此除归一化外不增加任何 kernel, 且与之严格一致
+> (`max(expert_token_share) == assignment_load_max_frac × 100`)。
+> `expert_weight_share` 用的是 **combine 权重** (归一化并乘 `routed_scaling_factor`
+> 之后的 `probs`), 即该专家输出以多大权重进入残差 —— 这是「激活幅度」的可观测代理量。
+> 这里刻意不复用 `gate_mass` (它不含 scaling factor, 在
+> `routed_scaling_factor_param` 可学习时两者会分叉)。开 `moe_expert_fusion` 时融合
+> MoE 算子只返回已合并的输出, 真正的专家级输出 L2 取不到。
+>
+> 两者都不出 GPU: 热路径上整条向量一次 `add_`, 而不是每个专家一个累加器, 无 D2H
+> 同步、无 hook 内 collective。跨 rank 聚合就是各 DP rank 的普通均值, 与全局占比
+> 一致 (每个 rank 路由的 token 数相同)。
+>
+> 读法: 完全均衡时两者都等于 `100 / num_experts` (256 专家 ≈ 0.39%)。按层取这组
+> 曲线的 max / 中位 / min 最好用 —— max 抬升 = 热点专家, min 贴 0 = dead expert,
+> 中位数应稳定在均衡点附近; max 与中位数拉开距离即长尾不均衡。
 
 ### 健康阈值
 
@@ -752,6 +776,8 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MoE** | `expert_gate_singular_entropy_max` | `max_e(H(σ²))` | max | 上限 `log k`，平谱时取等 |
 | **MoE** | `shared_gate_stable_rank` | `srank(W_g)` | mean | 稳定 |
 | **MoE** | `shared_gate_singular_entropy` | `H(σ²)` | mean | 初始约 `0.96·log k`，不应持续下滑 |
+| **MoE** | `expert_token_share_eK` | `count_K/Σcount × 100%` | mean | 每层每专家；均衡时 = 100/E，长期高企 = 热点，贴 0 = dead expert |
+| **MoE** | `expert_weight_share_eK` | `Σprobs_K/ΣΣprobs × 100%` | mean | 每层每专家；与 token 占比偏离越大 = 该专家单 token 权重越重 |
 | **QK** | `max` | `max(QK^T/√d)` | max | 不应暴增 |
 | **QK** | `mean` | `mean(logits)` | mean | 稳定 |
 | **QK** | `entropy_avg` | `-Σ(p log p)` avg | mean | 适中 |

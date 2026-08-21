@@ -131,6 +131,64 @@ class DistributionMetricsTest(unittest.TestCase):
         deeper_s = float(mm_metrics.compute_distribution_metrics(deeper, prob_eps=1e-6, topk=1)["sparsity"])
         self.assertAlmostEqual(deeper_s, float(m["sparsity"]), places=5)
 
+    def test_ref_logits_supply_the_baseline_softmax_minimum(self):
+        # Default reference: the smallest probability of the *unmodulated*
+        # distribution (the paper's SoftMax_{t=1} example), which sits far below
+        # 1/V, so a tail that merely matches the baseline is not scored sparse.
+        logits = paddle.to_tensor([[6.0, -1.0, -2.0]], dtype="float32")
+        ref_logits = paddle.to_tensor([[5.0, 0.0, -3.0]], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, prob_eps=0.01, topk=1, ref_logits=ref_logits)
+
+        p = paddle.nn.functional.softmax(logits, axis=-1)[0]
+        ref_p = paddle.nn.functional.softmax(ref_logits, axis=-1)[0]
+        s = float(ref_p.min())
+        expected = sum(math.exp(-float(p[i]) / s) for i in (1, 2)) / 2
+        self.assertAlmostEqual(float(m["sparsity"]), expected, places=5)
+        self.assertLess(s, 1.0 / 3)  # strictly below the uniform fallback
+
+    def test_sparsity_ref_wins_over_ref_logits(self):
+        logits = paddle.to_tensor([[6.0, -1.0, -2.0]], dtype="float32")
+        ref_logits = paddle.to_tensor([[5.0, 0.0, -3.0]], dtype="float32")
+        kwargs = {"prob_eps": 0.01, "topk": 1}
+        pinned = mm_metrics.compute_distribution_metrics(logits, sparsity_ref=0.05, ref_logits=ref_logits, **kwargs)
+        explicit = mm_metrics.compute_distribution_metrics(logits, sparsity_ref=0.05, **kwargs)
+        self.assertAlmostEqual(float(pinned["sparsity"]), float(explicit["sparsity"]), places=6)
+
+    def test_every_token_mean_metric_reports_its_std(self):
+        logits = paddle.to_tensor([[6.0, -1.0, -2.0, -8.0], [1.0, 0.9, -3.0, -9.0]], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, prob_eps=0.01, topk=2)
+
+        for name in (
+            "entropy",
+            "entropy_norm",
+            "top1_prob",
+            "top2_prob",
+            "multi_modality",
+            "sparsity",
+            "relevant_count",
+            "sparse_count",
+        ):
+            self.assertIn(f"{name}_std", m, f"{name} must report a companion std")
+        # rows is a constant, so it carries no spread.
+        self.assertNotIn("rows_std", m)
+
+        rows = [
+            float(mm_metrics.compute_distribution_metrics(logits[i : i + 1], prob_eps=0.01, topk=2)["entropy"])
+            for i in range(2)
+        ]
+        mean = sum(rows) / 2
+        expected = math.sqrt(sum((v - mean) ** 2 for v in rows) / 2)  # population std
+        self.assertAlmostEqual(float(m["entropy_std"]), expected, places=5)
+
+    def test_std_weights_match_the_mask_used_by_the_mean(self):
+        # Row 1 has no entry strictly between eps and the max, so it is excluded
+        # from multi_modality; its std must be over the surviving rows only.
+        logits = paddle.to_tensor([[2.0, 1.0, -30.0], [5.0, -30.0, -30.0]], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, prob_eps=1e-6, topk=1)
+        single = mm_metrics.compute_distribution_metrics(logits[0:1], prob_eps=1e-6, topk=1)
+        self.assertAlmostEqual(float(m["multi_modality"]), float(single["multi_modality"]), places=5)
+        self.assertAlmostEqual(float(m["multi_modality_std"]), 0.0, places=5)
+
     def test_metrics_are_zero_dim_and_finite(self):
         logits = paddle.randn([4, 16], dtype="float32")
         for name, value in mm_metrics.compute_distribution_metrics(logits).items():

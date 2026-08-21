@@ -33,8 +33,11 @@ _DIST_METRICS = (
     "sparsity",
     "relevant_count",
     "sparse_count",
-    "rows",
 )
+# Token-mean metrics also report their spread over the sampled tokens. Declared
+# here, not derived at compute time, so the schema is complete at registration
+# (Rule 3: no lazy declares on the hot path).
+_DIST_STD_METRICS = tuple(f"{name}_std" for name in _DIST_METRICS)
 
 
 class PaddleMultiMaxMonitor(PaddleProbe):
@@ -84,7 +87,7 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         # topk is clamped to the vocab width at compute time; the key must be
         # declared up front, so clamp it here too when the width is known.
         k = self.topk if vocab_width is None else min(self.topk, vocab_width)
-        return _DIST_METRICS + (f"top{k}_prob",) + _PARAM_METRICS
+        return _DIST_METRICS + _DIST_STD_METRICS + (f"top{k}_prob", f"top{k}_prob_std", "rows") + _PARAM_METRICS
 
     @staticmethod
     def _find_heads(model: nn.Layer) -> list[tuple[str, nn.Layer]]:
@@ -182,15 +185,8 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         paddle.distributed.all_gather(shards, logits, group=self.tp_group)
         return paddle.concat(shards, axis=-1)
 
-    def _fused_logits(self, module: nn.Layer, hidden: paddle.Tensor) -> paddle.Tensor:
-        """Recompute the sampled logits for the fused-CE path.
-
-        With ``fused_linear_ce_loss_chunk > 0`` the head returns
-        ``(hidden, weight, bias, ranges, ts)`` and the full logits are never
-        materialized, so the tile is projected here and modulated with the
-        head's own parameters.
-        """
-        rows = self._sample_rows(hidden)
+    def _project(self, module: nn.Layer, rows: paddle.Tensor) -> paddle.Tensor:
+        """Unmodulated logits for the sampled rows (the SegLU input)."""
         weight = module.weight
         # Project in the weight's dtype: casting the [vocab/tp, hidden] weight to
         # fp32 would allocate a full-size copy (GBs at LM-head scale). Only the
@@ -199,10 +195,45 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         bias = getattr(module, "bias", None)
         if isinstance(bias, paddle.Tensor):
             logits = logits + bias.astype("float32")
-        return apply_seglu(logits, module.multimax_ranges, module.multimax_ts)
+        return logits
 
-    def _resolve_logits(self, module: nn.Layer, outputs, mtp: bool = False) -> paddle.Tensor | None:
-        """Sampled, SegLU-modulated logits tile for this head.
+    def _hidden_reference(self, module: nn.Layer, inputs) -> paddle.Tensor | None:
+        """Unmodulated tile recovered from the head's input, for Def 3.3's ``s``.
+
+        The unfused path only hands back modulated logits, and SegLU is not
+        cheaply invertible, so the baseline tile is re-projected from the hidden
+        states the hook already receives. Same strided sample as the modulated
+        tile, so the rows line up.
+        """
+        hidden = inputs[0] if isinstance(inputs, (list, tuple)) and inputs else inputs
+        weight = getattr(module, "weight", None)
+        if not isinstance(hidden, paddle.Tensor) or not isinstance(weight, paddle.Tensor):
+            return None
+        if hidden.shape[-1] != weight.shape[-1]:
+            return None
+        return self._project(module, self._sample_rows(hidden))
+
+    def _fused_logits(self, module: nn.Layer, hidden: paddle.Tensor) -> tuple[paddle.Tensor, paddle.Tensor]:
+        """Recompute the sampled logits for the fused-CE path.
+
+        With ``fused_linear_ce_loss_chunk > 0`` the head returns
+        ``(hidden, weight, bias, ranges, ts)`` and the full logits are never
+        materialized, so the tile is projected here and modulated with the
+        head's own parameters. Returns ``(modulated, unmodulated)``; the
+        baseline is free on this path since the projection happens here.
+        """
+        raw = self._project(module, self._sample_rows(hidden))
+        return apply_seglu(raw, module.multimax_ranges, module.multimax_ts), raw
+
+    def _resolve_logits(
+        self, module: nn.Layer, outputs, mtp: bool = False
+    ) -> tuple[paddle.Tensor, paddle.Tensor | None] | None:
+        """Sampled logits tile for this head, as ``(modulated, unmodulated)``.
+
+        The second element is the SegLU input, needed for Def 3.3's reference
+        ``s``; it is ``None`` on the unfused path, where the head hands back only
+        the modulated tensor (the hook then re-projects it from the hidden
+        states).
 
         Handles every shape the head can return: a bare logits tensor, the
         ``{"logits": ...}`` dict of ``GPTMainLMHead``, the ``[main, mtp...]``
@@ -229,26 +260,35 @@ class PaddleMultiMaxMonitor(PaddleProbe):
             break
         if not isinstance(candidate, paddle.Tensor):
             return None
-        return self._sample_rows(candidate)
+        return self._sample_rows(candidate), None
 
     def _make_head_hook(self, tag: str = ""):
-        def hook_fn(module, _inputs, outputs):
+        def hook_fn(module, inputs, outputs):
             if not module.training or not self._should_monitor():
                 return
             try:
                 with paddle.no_grad():
                     for name, value in compute_param_metrics(module.multimax_ranges, module.multimax_ts).items():
                         self.record_mean(self._global_key(tag + name), value)
-                    tile = self._resolve_logits(module, outputs, mtp=bool(tag))
-                    if tile is None:
+                    resolved = self._resolve_logits(module, outputs, mtp=bool(tag))
+                    if resolved is None:
                         return
+                    tile, raw = resolved
                     tile = self._gather_vocab(tile.detach())
+                    # Def 3.3's reference is the baseline softmax of the SegLU
+                    # input; skipped rather than faked when unavailable, in which
+                    # case the metrics fall back to the uniform reference.
+                    if raw is None and self.sparsity_ref is None:
+                        raw = self._hidden_reference(module, inputs)
+                    if raw is not None:
+                        raw = self._gather_vocab(raw.detach())
                     metrics = compute_distribution_metrics(
                         tile,
                         prob_eps=self.prob_eps,
                         logit_eps=self.logit_eps,
                         topk=self._topk_effective,
                         sparsity_ref=self.sparsity_ref,
+                        ref_logits=raw,
                     )
                     for name, value in metrics.items():
                         self.record_mean(self._global_key(tag + name), value)

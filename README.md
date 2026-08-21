@@ -12,7 +12,7 @@
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
 - **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 36 指标；仅权重)
-- **[MultiMax](./docs/multimax.md)** — LM head SegLU 调制的输出分布监控：论文的 sparsity / multi-modality 指标 + 熵 + top-k 概率质量 (15 指标；仅 paddlefleet；仅在 `multimax_modules` 含 `lm_head` 时生效)
+- **[MultiMax](./docs/multimax.md)** — LM head SegLU 调制的输出分布监控：论文的 sparsity / multi-modality 指标 + 熵 + top-k 概率质量，每项另报 `_std`（viewer 画成 ±1σ 阴影） (25 指标；仅 paddlefleet；仅在 `multimax_modules` 含 `lm_head` 时生效)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
 - **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
@@ -684,16 +684,18 @@ Definition 3.2 / 3.3，外加预测熵与 top-k 概率质量。
 | # | 指标 | 键 | 公式 | 粒度 | 含义 |
 |---|------|-----|------|------|------|
 | 1 | `multi_modality` | `multimax/global_multi_modality` | `1 − (1/N)Σ_{ε<xₙ<x_max}(φ_max − φₙ)` | 全局 | **上升 = 更多峰**；N=0 的行排除在均值外 |
-| 2 | `sparsity` | `multimax/global_sparsity` | `(1/L)Σ_{x_l<ε} exp(−p_l/s)`, 默认 `s = 1/V` | 全局 | **上升 = 无关项被压得更死**；值域 `(e⁻¹, 1)`。`s` 必须与被打分的分布无关，取 `φ_min` 会让它退化成 `e⁻¹/L` |
+| 2 | `sparsity` | `multimax/global_sparsity` | `(1/L)Σ_{x_l<ε} exp(−p_l/s)`, 默认 `s = min SoftMax_{t=1}(未调制 logits)` | 全局 | **上升 = 无关项被压得更死**。`s` 必须与被打分的分布无关；取 `φ_min` 会让它退化成 `e⁻¹/L`，取 `1/V` 会把整段压在 `(e⁻¹, 1)` |
 | 3 | `entropy` | `multimax/global_entropy` | `logsumexp(x) − E_p[x]` | 全局 | 预测熵 (nats) |
 | 4 | `entropy_norm` | `multimax/global_entropy_norm` | `H / log V` | 全局 | 归一化熵，跨词表可比 |
 | 5 | `top1_prob` | `multimax/global_top1_prob` | `φ_max` | 全局 | 最大概率 |
 | 6 | `top10_prob` | `multimax/global_top10_prob` | `Σ top-10 φ` | 全局 | 前 10 项概率质量（k 可配） |
 | 7 | `relevant_count` / `sparse_count` | 同上 | `N` / `L` | 全局 | Def 3.2/3.3 的样本量，用于核对 ε |
 | 8 | `range_0..3` / `t_0..3` | 同上 | `multimax_ranges` / `multimax_ts` 分量 | 全局 | 全 0 = SegLU 仍是恒等，即没在学 |
+| 9 | `{1~7}_std` | `multimax/global_{metric}_std` | 同一批采样 token 上的（掩码加权）标准差 | 全局 | viewer 画成均值上下 ±1σ 阴影；变宽 = token 之间行为分化 |
 
-第 2 项的形式是 Def 3.3 在 `s = φ_min` 下的**精确等价变形**（`(s−p)/s−1 = −p/s`，
-`p_l/s = exp(x_l−x_min)`），只用 logits，避免 fp32 下 `φ_min` 下溢成 0。
+第 2 项按 `exp(x_l − logsumexp(x) − log s)` 在**对数空间**求值，只用 logits，
+避免 fp32 下词表规模的概率下溢成 0。参考概率 `s` 的优先级是
+`sparsity_ref`（常数）> 未调制 logits 的 softmax 最小概率 > `1/V`。
 
 开 MTP 时 `GPTMTPLMHead` 有自己的一套 SegLU 参数，指标落在 `multimax/global_mtp_*`，
 与 main head 分开统计。

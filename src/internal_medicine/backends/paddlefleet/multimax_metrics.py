@@ -87,6 +87,52 @@ def _relevance_threshold(
     return math.log(p_eps) + log_z
 
 
+def _sparsity_log_ref(
+    vocab_size: int,
+    sparsity_ref: float | None,
+    ref_logits: paddle.Tensor | None,
+    log_z: paddle.Tensor,
+) -> paddle.Tensor | float:
+    """``log s`` for Def 3.3, in priority order: explicit, baseline, uniform.
+
+    The paper's example reference is the smallest probability of the plain
+    temperature-1 SoftMax of the *input* logits, i.e. of the distribution before
+    the reweighting function is applied. ``ref_logits`` supplies exactly that
+    (the unmodulated tile), giving a per-row ``log s = x_raw_min - log_z_raw``;
+    it is typically far below ``1/V`` for a peaked head, so the score measures
+    how much sparser the modulated tail is *than the softmax baseline*.
+
+    Fallback is the uniform probability ``1/V``, which is the reference implied
+    by the default ``eps``. Either way ``s`` must not be a statistic of the
+    modulated row being scored -- see the module docstring.
+    """
+    if sparsity_ref is not None:
+        return math.log(float(sparsity_ref))
+    if ref_logits is not None:
+        ref = ref_logits.astype("float32")
+        if ref.ndim > 2:
+            ref = ref.reshape([-1, ref.shape[-1]])
+        ref_log_z = paddle.logsumexp(ref, axis=-1, keepdim=True)
+        return ref.min(axis=-1, keepdim=True) - ref_log_z
+    del log_z  # uniform reference needs no per-row term
+    return math.log(1.0 / vocab_size)
+
+
+def _mean_std(values: paddle.Tensor, weights: paddle.Tensor | None = None) -> tuple[paddle.Tensor, paddle.Tensor]:
+    """Token mean and spread of a per-row metric, both as 0-dim tensors.
+
+    ``weights`` is the 0/1 validity mask for metrics that drop rows (M with
+    N == 0, S with L == 0); the std is taken over the same rows that the mean
+    uses, so the shaded band on the chart matches the plotted line.
+    """
+    if weights is None:
+        weights = paddle.ones_like(values)
+    total = paddle.clip(weights.sum(), min=1.0)
+    mean = (values * weights).sum() / total
+    var = (((values - mean) ** 2) * weights).sum() / total
+    return mean, paddle.sqrt(paddle.clip(var, min=0.0))
+
+
 def compute_distribution_metrics(
     logits: paddle.Tensor,
     vocab_size: int | None = None,
@@ -94,6 +140,7 @@ def compute_distribution_metrics(
     logit_eps: float | None = None,
     topk: int = 10,
     sparsity_ref: float | None = None,
+    ref_logits: paddle.Tensor | None = None,
 ) -> dict[str, paddle.Tensor]:
     """Token-mean distribution metrics for one ``[rows, vocab]`` logits tile.
 
@@ -144,7 +191,7 @@ def compute_distribution_metrics(
     # maximally sparse.
     sparse = (x < eps).astype("float32")
     n_sparse = sparse.sum(axis=-1)
-    log_s = math.log(1.0 / vocab_size if sparsity_ref is None else float(sparsity_ref))
+    log_s = _sparsity_log_ref(vocab_size, sparsity_ref, ref_logits, log_z)
     ratio = paddle.clip(x - log_z - log_s, max=_EXP_CLAMP)
     sparsity_terms = paddle.exp(-paddle.exp(ratio)) * sparse
     sparsity = sparsity_terms.sum(axis=-1) / paddle.clip(n_sparse, min=1.0)
@@ -153,20 +200,25 @@ def compute_distribution_metrics(
     k = min(int(topk), width)
     topk_mass = paddle.topk(p, k=k, axis=-1)[0].sum(axis=-1)
 
-    def _masked_mean(values: paddle.Tensor, weights: paddle.Tensor) -> paddle.Tensor:
-        return (values * weights).sum() / paddle.clip(weights.sum(), min=1.0)
-
-    return {
-        "entropy": entropy.mean(),
-        "entropy_norm": entropy.mean() / math.log(vocab_size) if vocab_size > 1 else entropy.mean(),
-        "top1_prob": p_max.mean(),
-        f"top{k}_prob": topk_mass.mean(),
-        "multi_modality": _masked_mean(multi_modality, mm_valid),
-        "sparsity": _masked_mean(sparsity, sp_valid),
-        "relevant_count": n_relevant.mean(),
-        "sparse_count": n_sparse.mean(),
-        "rows": paddle.full((), float(rows), dtype="float32"),
-    }
+    # Every distribution metric is a token mean, so each also reports the spread
+    # over the sampled tokens; the viewer draws it as a band around the mean.
+    log_v = math.log(vocab_size) if vocab_size > 1 else 1.0
+    out: dict[str, paddle.Tensor] = {}
+    for name, values, weights in (
+        ("entropy", entropy, None),
+        ("entropy_norm", entropy / log_v, None),
+        ("top1_prob", p_max.squeeze(-1), None),
+        (f"top{k}_prob", topk_mass, None),
+        ("multi_modality", multi_modality, mm_valid),
+        ("sparsity", sparsity, sp_valid),
+        ("relevant_count", n_relevant, None),
+        ("sparse_count", n_sparse, None),
+    ):
+        mean, std = _mean_std(values, weights)
+        out[name] = mean
+        out[f"{name}_std"] = std
+    out["rows"] = paddle.full((), float(rows), dtype="float32")
+    return out
 
 
 def compute_param_metrics(ranges: paddle.Tensor, ts: paddle.Tensor) -> dict[str, paddle.Tensor]:

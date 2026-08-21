@@ -60,9 +60,13 @@ S(x) = (1/L) · Σ_{x_l < ε} exp(−p_l / s)
 > 而且 `L` 一旦是词表量级，`S → e⁻¹/L`（LM head 上就是 1e-6 量级）——此时它衡量的是
 > 「有几项贴在最小值上」，几乎只反映 `1/L`，而且因为参考值随分布漂移，跨 step 不可比。
 
-默认 `s = 1/V`（均匀分布概率），与默认 ε 的语义一致（「概率超过均匀分布才算相关」）：
-无关项必然满足 `p_l < s`，各项落在 `(e⁻¹, 1)`，序列跨 step 可比。`sparsity_ref` 可覆盖，
-例如取论文举例的「**未调制** temperature-1 softmax 的最小概率」。
+默认 `s` 取论文举例的那个参考值：**同一行未经 SegLU 调制的 logits** 过 temperature-1 softmax
+后的最小概率（`ref_logits` 参数，monitor 在 hook 里用 head 的权重把 baseline 重算一遍）。
+它远小于 `1/V`，对应「temperature → 0」那一侧的参考，所以无关项不再被自动压在 `e⁻¹` 之下——
+`S` 会随着尾部概率被推到 baseline 以下而上升，这才是「越大越稀疏」的可读区间。
+
+拿不到未调制 logits（例如上游只交出调制后的结果）时退化为 `s = 1/V`（均匀概率），
+语义与默认 ε 一致；`sparsity_ref=<常数>` 优先于上述两者，用来固定一个跨实验可比的参考。
 
 比值按 `exp(x_l − log_z − log s)` 在对数空间求值，因此在 LM head 的词表规模下
 （fp32 里 `φ_min` 会下溢成 0）不会有下溢问题。
@@ -96,6 +100,24 @@ softmax 单调，所以定义不变；`prob_eps = 1/V` 的含义是「概率超�
 | `range_0..3` / `t_0..3` | `multimax_ranges` / `multimax_ts` 的四个分量 | 全为 0 = SegLU 还是恒等，即 multimax 没开始学 |
 
 全部键都落在 `multimax/global_{metric}`：LM head 不是逐层结构，没有 layer 维度。
+
+### 5. `*_std`：同一 step 内 token 之间的离散度
+
+上面每个按 token 求均值的指标（`entropy`、`entropy_norm`、`top1_prob`、`top10_prob`、
+`multi_modality`、`sparsity`、`relevant_count`、`sparse_count`）都额外报一个
+`{metric}_std`，即这一批采样 token 上的（加权）标准差：
+
+```
+mean = Σ w·v / Σ w,    std = sqrt(Σ w·(v − mean)² / Σ w)
+```
+
+权重就是均值用的那份掩码，所以 `multi_modality_std` 只统计 N > 0 的行、
+`sparsity_std` 只统计 L > 0 的行，和对应均值的样本集完全一致（除数是 `Σ w`，即有偏/总体标准差）。
+viewer 把 `{metric}_std` 画成均值曲线上下各 1σ 的阴影，而不是独立曲线。
+阴影变宽 = token 之间行为分化（部分 token 已经很尖锐、部分还很平），
+与「均值本身在跨 step 抖动」是两件事，别混着读。
+
+`rows` 没有 `_std`（它是常数）。
 
 开 MTP 时上游有两个 head（`GPTMainLMHead` 和 `GPTMTPLMHead`），各自持有**独立**的
 `multimax_ranges` / `multimax_ts`，所以 MTP head 走单独的命名空间
@@ -131,6 +153,8 @@ setup_monitors(model, monitors=["multimax"], monitor_interval=100,
 - `sample_tokens`（默认 256）：参与统计的 token 数。TP all_gather 的大小与之成正比。
 - `topk`（默认 10）：概率质量的 k，会被词表宽度截断，键名跟着变（`top{k}_prob`）。
 - `prob_eps`（默认 `None` → `1/V`）/ `logit_eps`（默认 `None`）：ε 的两种给法，后者优先。
+- `sparsity_ref`（默认 `None`）：Def 3.3 的参考概率 `s` 取常数。不传时优先用未调制 logits 的
+  temperature-1 softmax 最小概率，再退化到 `1/V`（见「Sparsity」一节）。
 
 ## 判读
 

@@ -4,6 +4,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 try:
@@ -154,7 +156,7 @@ class DistributionMetricsTest(unittest.TestCase):
         explicit = mm_metrics.compute_distribution_metrics(logits, sparsity_ref=0.05, **kwargs)
         self.assertAlmostEqual(float(pinned["sparsity"]), float(explicit["sparsity"]), places=6)
 
-    def test_every_token_mean_metric_reports_its_std(self):
+    def test_every_token_mean_metric_reports_its_quantiles(self):
         logits = paddle.to_tensor([[6.0, -1.0, -2.0, -8.0], [1.0, 0.9, -3.0, -9.0]], dtype="float32")
         m = mm_metrics.compute_distribution_metrics(logits, prob_eps=0.01, topk=2)
 
@@ -168,26 +170,55 @@ class DistributionMetricsTest(unittest.TestCase):
             "relevant_count",
             "sparse_count",
         ):
-            self.assertIn(f"{name}_std", m, f"{name} must report a companion std")
-        # rows is a constant, so it carries no spread.
-        self.assertNotIn("rows_std", m)
+            for suffix in ("p50", "p95", "p98"):
+                self.assertIn(f"{name}_{suffix}", m, f"{name} must report {suffix}")
+        # rows is a constant, so it has no distribution to summarize.
+        self.assertNotIn("rows_p50", m)
+        # the old symmetric band is gone
+        self.assertNotIn("entropy_std", m)
 
-        rows = [
+        rows = sorted(
             float(mm_metrics.compute_distribution_metrics(logits[i : i + 1], prob_eps=0.01, topk=2)["entropy"])
             for i in range(2)
-        ]
-        mean = sum(rows) / 2
-        expected = math.sqrt(sum((v - mean) ** 2 for v in rows) / 2)  # population std
-        self.assertAlmostEqual(float(m["entropy_std"]), expected, places=5)
+        )
+        # 2 rows, nearest-rank: ceil(0.5*2)-1 = 0 for p50, ceil(0.95*2)-1 = 1 for
+        # the tail quantiles.
+        self.assertAlmostEqual(float(m["entropy_p50"]), rows[0], places=5)
+        self.assertAlmostEqual(float(m["entropy_p95"]), rows[1], places=5)
+        self.assertAlmostEqual(float(m["entropy_p98"]), rows[1], places=5)
 
-    def test_std_weights_match_the_mask_used_by_the_mean(self):
+    def test_quantiles_match_numpy_on_a_larger_sample(self):
+        paddle.seed(0)
+        logits = paddle.randn([64, 32], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, prob_eps=1e-6, topk=1)
+
+        per_row = np.sort(
+            np.array(
+                [
+                    float(mm_metrics.compute_distribution_metrics(logits[i : i + 1], prob_eps=1e-6, topk=1)["entropy"])
+                    for i in range(64)
+                ]
+            )
+        )
+        for q, suffix in ((0.5, "p50"), (0.95, "p95"), (0.98, "p98")):
+            expected = per_row[max(0, math.ceil(q * len(per_row)) - 1)]
+            self.assertAlmostEqual(float(m[f"entropy_{suffix}"]), expected, places=5)
+
+    def test_quantiles_ignore_rows_the_mean_drops(self):
         # Row 1 has no entry strictly between eps and the max, so it is excluded
-        # from multi_modality; its std must be over the surviving rows only.
+        # from multi_modality; the quantiles must be over the surviving row only,
+        # not over a +inf sentinel that the mask parked at the end of the sort.
         logits = paddle.to_tensor([[2.0, 1.0, -30.0], [5.0, -30.0, -30.0]], dtype="float32")
         m = mm_metrics.compute_distribution_metrics(logits, prob_eps=1e-6, topk=1)
         single = mm_metrics.compute_distribution_metrics(logits[0:1], prob_eps=1e-6, topk=1)
         self.assertAlmostEqual(float(m["multi_modality"]), float(single["multi_modality"]), places=5)
-        self.assertAlmostEqual(float(m["multi_modality_std"]), 0.0, places=5)
+        for suffix in ("p50", "p95", "p98"):
+            self.assertAlmostEqual(
+                float(m[f"multi_modality_{suffix}"]),
+                float(single["multi_modality"]),
+                places=5,
+                msg=f"{suffix} must not pick up the masked row",
+            )
 
     def test_metrics_are_zero_dim_and_finite(self):
         logits = paddle.randn([4, 16], dtype="float32")

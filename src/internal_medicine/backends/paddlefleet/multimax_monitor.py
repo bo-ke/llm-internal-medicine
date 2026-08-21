@@ -20,7 +20,13 @@ import paddle
 from paddle import nn
 
 from .base import PaddleProbe
-from .multimax_metrics import apply_seglu, compute_distribution_metrics, compute_param_metrics
+from .multimax_metrics import (
+    QUANTILES,
+    _quantile_suffix,
+    apply_seglu,
+    compute_distribution_metrics,
+    compute_param_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +40,10 @@ _DIST_METRICS = (
     "relevant_count",
     "sparse_count",
 )
-# Token-mean metrics also report their spread over the sampled tokens. Declared
+# Token-mean metrics also report p50/p95/p98 over the sampled tokens. Declared
 # here, not derived at compute time, so the schema is complete at registration
 # (Rule 3: no lazy declares on the hot path).
-_DIST_STD_METRICS = tuple(f"{name}_std" for name in _DIST_METRICS)
+_DIST_QUANTILE_METRICS = tuple(f"{name}_{_quantile_suffix(q)}" for name in _DIST_METRICS for q in QUANTILES)
 
 
 class PaddleMultiMaxMonitor(PaddleProbe):
@@ -87,7 +93,8 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         # topk is clamped to the vocab width at compute time; the key must be
         # declared up front, so clamp it here too when the width is known.
         k = self.topk if vocab_width is None else min(self.topk, vocab_width)
-        return _DIST_METRICS + _DIST_STD_METRICS + (f"top{k}_prob", f"top{k}_prob_std", "rows") + _PARAM_METRICS
+        topk_keys = (f"top{k}_prob",) + tuple(f"top{k}_prob_{_quantile_suffix(q)}" for q in QUANTILES)
+        return _DIST_METRICS + _DIST_QUANTILE_METRICS + topk_keys + ("rows",) + _PARAM_METRICS
 
     @staticmethod
     def _find_heads(model: nn.Layer) -> list[tuple[str, nn.Layer]]:

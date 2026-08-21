@@ -118,19 +118,53 @@ def _sparsity_log_ref(
     return math.log(1.0 / vocab_size)
 
 
-def _mean_std(values: paddle.Tensor, weights: paddle.Tensor | None = None) -> tuple[paddle.Tensor, paddle.Tensor]:
-    """Token mean and spread of a per-row metric, both as 0-dim tensors.
+QUANTILES: tuple[float, ...] = (0.5, 0.95, 0.98)
+
+
+def _summarize(
+    values: paddle.Tensor, weights: paddle.Tensor | None = None
+) -> tuple[paddle.Tensor, dict[str, paddle.Tensor]]:
+    """Token mean plus ``QUANTILES`` of a per-row metric, all 0-dim tensors.
+
+    Every metric here is bounded below (entropy, counts) or to ``[0, 1]``
+    (probabilities, M, S) and right-skewed, so a symmetric mean +- sigma band
+    leaves the metric's own domain: the lower edge of an entropy band goes
+    negative even though no token can have negative entropy. Quantiles describe
+    the same spread without assuming symmetry -- p50 is the typical token, p95 /
+    p98 say where the tail sits.
 
     ``weights`` is the 0/1 validity mask for metrics that drop rows (M with
-    N == 0, S with L == 0); the std is taken over the same rows that the mean
-    uses, so the shaded band on the chart matches the plotted line.
+    N == 0, S with L == 0). Invalid rows are pushed to ``+inf`` so the sort
+    parks them past the end, and the quantile index is derived from the valid
+    count as a tensor -- masking must not become a python-level filter, which
+    would need a D2H sync on the hot path.
+
+    Quantiles are not linear, so they cannot be pooled across hook calls the way
+    a mean can: ``record_mean`` averaging per-call quantiles is exact only while
+    there is one call per logged step (``gradient_accumulation_steps=1``) and an
+    approximation otherwise. Raise ``sample_tokens`` rather than relying on that
+    average if accumulation is enabled.
     """
     if weights is None:
         weights = paddle.ones_like(values)
     total = paddle.clip(weights.sum(), min=1.0)
     mean = (values * weights).sum() / total
-    var = (((values - mean) ** 2) * weights).sum() / total
-    return mean, paddle.sqrt(paddle.clip(var, min=0.0))
+
+    ordered = paddle.sort(paddle.where(weights > 0, values, paddle.full_like(values, float("inf"))))
+    quantiles: dict[str, paddle.Tensor] = {}
+    for q in QUANTILES:
+        # Nearest-rank percentile: rank ceil(q*n) among the valid rows. Unlike
+        # floor(q*(n-1)) ("lower" interpolation) this does not collapse p95/p98
+        # onto p50 when only a couple of rows survive the mask.
+        rank = paddle.clip(paddle.ceil(q * total) - 1.0, min=0.0)
+        idx = paddle.minimum(rank, total - 1.0).astype("int64").reshape([1])
+        quantiles[_quantile_suffix(q)] = paddle.take_along_axis(ordered, idx, axis=0).squeeze()
+    return mean, quantiles
+
+
+def _quantile_suffix(q: float) -> str:
+    """``0.5 -> 'p50'``, ``0.98 -> 'p98'``; the metric key suffix for quantile q."""
+    return f"p{round(q * 100)}"
 
 
 def compute_distribution_metrics(
@@ -200,8 +234,8 @@ def compute_distribution_metrics(
     k = min(int(topk), width)
     topk_mass = paddle.topk(p, k=k, axis=-1)[0].sum(axis=-1)
 
-    # Every distribution metric is a token mean, so each also reports the spread
-    # over the sampled tokens; the viewer draws it as a band around the mean.
+    # Every distribution metric is a token mean; each also reports p50/p95/p98
+    # over the sampled tokens, which the viewer draws as a band plus a tail line.
     log_v = math.log(vocab_size) if vocab_size > 1 else 1.0
     out: dict[str, paddle.Tensor] = {}
     for name, values, weights in (
@@ -214,9 +248,10 @@ def compute_distribution_metrics(
         ("relevant_count", n_relevant, None),
         ("sparse_count", n_sparse, None),
     ):
-        mean, std = _mean_std(values, weights)
+        mean, quantiles = _summarize(values, weights)
         out[name] = mean
-        out[f"{name}_std"] = std
+        for suffix, value in quantiles.items():
+            out[f"{name}_{suffix}"] = value
     out["rows"] = paddle.full((), float(rows), dtype="float32")
     return out
 

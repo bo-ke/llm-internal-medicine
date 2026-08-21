@@ -12,7 +12,7 @@
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
 - **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 36 指标；仅权重)
-- **[MultiMax](./docs/multimax.md)** — LM head SegLU 调制的输出分布监控：论文的 sparsity / multi-modality 指标 + 熵 + top-k 概率质量，每项另报 `_std`（viewer 画成 ±1σ 阴影） (25 指标；仅 paddlefleet；仅在 `multimax_modules` 含 `lm_head` 时生效)
+- **[MultiMax](./docs/multimax.md)** — LM head SegLU 调制的输出分布监控：论文的 sparsity / multi-modality 指标 + 熵 + top-k 概率质量，每项另报 `p50/p95/p98`（viewer 画成 p50~p95 阴影） (41 指标；仅 paddlefleet；仅在 `multimax_modules` 含 `lm_head` 时生效)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
 - **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
@@ -691,7 +691,7 @@ Definition 3.2 / 3.3，外加预测熵与 top-k 概率质量。
 | 6 | `top10_prob` | `multimax/global_top10_prob` | `Σ top-10 φ` | 全局 | 前 10 项概率质量（k 可配） |
 | 7 | `relevant_count` / `sparse_count` | 同上 | `N` / `L` | 全局 | Def 3.2/3.3 的样本量，用于核对 ε |
 | 8 | `range_0..3` / `t_0..3` | 同上 | `multimax_ranges` / `multimax_ts` 分量 | 全局 | 全 0 = SegLU 仍是恒等，即没在学 |
-| 9 | `{1~7}_std` | `multimax/global_{metric}_std` | 同一批采样 token 上的（掩码加权）标准差 | 全局 | viewer 画成均值上下 ±1σ 阴影；变宽 = token 之间行为分化 |
+| 9 | `{1~7}_p50/p95/p98` | `multimax/global_{metric}_p50` 等 | 同一批采样 token 的最近秩分位（秩 `ceil(q·n)`，掩码与均值一致） | 全局 | viewer 画成 p50~p95 阴影，p98 在 hover 里；这些量右偏且有界，用分位数而非 ±1σ。分位数不可跨 hook 调用平均，`gradient_accumulation_steps>1` 时是近似 |
 
 第 2 项按 `exp(x_l − logsumexp(x) − log s)` 在**对数空间**求值，只用 logits，
 避免 fp32 下词表规模的概率下溢成 0。参考概率 `s` 的优先级是

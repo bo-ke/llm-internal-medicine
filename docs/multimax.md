@@ -101,23 +101,33 @@ softmax 单调，所以定义不变；`prob_eps = 1/V` 的含义是「概率超�
 
 全部键都落在 `multimax/global_{metric}`：LM head 不是逐层结构，没有 layer 维度。
 
-### 5. `*_std`：同一 step 内 token 之间的离散度
+### 5. `*_p50` / `*_p95` / `*_p98`：同一 step 内 token 的分布
 
 上面每个按 token 求均值的指标（`entropy`、`entropy_norm`、`top1_prob`、`top10_prob`、
-`multi_modality`、`sparsity`、`relevant_count`、`sparse_count`）都额外报一个
-`{metric}_std`，即这一批采样 token 上的（加权）标准差：
+`multi_modality`、`sparsity`、`relevant_count`、`sparse_count`）都额外报三个分位数，
+取的是这一批采样 token 的**最近秩分位**（nearest-rank，秩 `ceil(q·n)`）：
 
 ```
-mean = Σ w·v / Σ w,    std = sqrt(Σ w·(v − mean)² / Σ w)
+p50 = 典型 token,   p95 / p98 = 尾部落在哪
 ```
 
-权重就是均值用的那份掩码，所以 `multi_modality_std` 只统计 N > 0 的行、
-`sparsity_std` 只统计 L > 0 的行，和对应均值的样本集完全一致（除数是 `Σ w`，即有偏/总体标准差）。
-viewer 把 `{metric}_std` 画成均值曲线上下各 1σ 的阴影，而不是独立曲线。
-阴影变宽 = token 之间行为分化（部分 token 已经很尖锐、部分还很平），
-与「均值本身在跨 step 抖动」是两件事，别混着读。
+**为什么是分位数而不是 ±1σ。** 这些量要么有下界（熵 ≥ 0、计数 ≥ 0），要么落在 `[0,1]`，
+而且都右偏：多数 token 近乎确定、少数 token 很不确定。对称的 `mean ± σ` 在这种分布上
+下沿会跑出定义域（熵的下沿变成负数），而且 σ 会被尾部拉大到超过均值本身，读起来像是
+「指标不稳」，其实只是分布偏斜。分位数不假设对称，直接回答「典型值在哪、尾巴在哪」。
 
-`rows` 没有 `_std`（它是常数）。
+掩码与均值完全一致：无效行（M 的 N = 0、S 的 L = 0）在排序前被推到 `+inf`，
+分位下标由有效行数（张量）算出，所以 `multi_modality_p50` 只看 N > 0 的行、
+`sparsity_p50` 只看 L > 0 的行。整个过程没有 python 层过滤，因此不会在热路径上触发 D2H 同步。
+
+viewer 把 `p50~p95` 画成均值曲线周围的阴影，`p98` 只在 hover 里给，避免图上线条过多。
+
+**一个聚合上的注意点：分位数不是线性的**，不能像均值那样跨 hook 调用平均。
+`record_mean` 对每次调用的分位数求平均，只有在「每个记录 step 只有一次调用」
+（`gradient_accumulation_steps=1`）时才等于真分位数；开了梯度累积就是近似。
+真要在累积下保持精确，应该调大 `sample_tokens`，而不是依赖这个平均。
+
+`rows` 是常数，没有分位数。
 
 开 MTP 时上游有两个 head（`GPTMainLMHead` 和 `GPTMTPLMHead`），各自持有**独立**的
 `multimax_ranges` / `multimax_ts`，所以 MTP head 走单独的命名空间

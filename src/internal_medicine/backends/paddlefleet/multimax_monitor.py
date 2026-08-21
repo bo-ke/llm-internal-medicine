@@ -54,6 +54,7 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         topk: int = 10,
         prob_eps: float | None = None,
         logit_eps: float | None = None,
+        sparsity_ref: float | None = None,
     ):
         super().__init__(
             log_per_layer=log_per_layer,
@@ -70,6 +71,7 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         self._topk_effective = int(topk)
         self.prob_eps = prob_eps
         self.logit_eps = logit_eps
+        self.sparsity_ref = sparsity_ref
         self.tp_size = 1
         self.tp_group = None
         self._hook_failed = False
@@ -246,6 +248,7 @@ class PaddleMultiMaxMonitor(PaddleProbe):
                         prob_eps=self.prob_eps,
                         logit_eps=self.logit_eps,
                         topk=self._topk_effective,
+                        sparsity_ref=self.sparsity_ref,
                     )
                     for name, value in metrics.items():
                         self.record_mean(self._global_key(tag + name), value)
@@ -267,6 +270,7 @@ def setup_multimax_monitor(
     topk: int = 10,
     prob_eps: float | None = None,
     logit_eps: float | None = None,
+    sparsity_ref: float | None = None,
     monitor_dict: dict | None = None,
 ):
     monitor = PaddleMultiMaxMonitor(
@@ -278,6 +282,7 @@ def setup_multimax_monitor(
         topk=topk,
         prob_eps=prob_eps,
         logit_eps=logit_eps,
+        sparsity_ref=sparsity_ref,
     )
     monitor.register_hooks(model)
     if monitor_dict is not None:

@@ -684,7 +684,7 @@ Definition 3.2 / 3.3，外加预测熵与 top-k 概率质量。
 | # | 指标 | 键 | 公式 | 粒度 | 含义 |
 |---|------|-----|------|------|------|
 | 1 | `multi_modality` | `multimax/global_multi_modality` | `1 − (1/N)Σ_{ε<xₙ<x_max}(φ_max − φₙ)` | 全局 | **上升 = 更多峰**；N=0 的行排除在均值外 |
-| 2 | `sparsity` | `multimax/global_sparsity` | `(1/L)Σ_{x_l<ε} exp(−exp(x_l − x_min))` | 全局 | **上升 = 无关项被压得更死**；上界 `e⁻¹` |
+| 2 | `sparsity` | `multimax/global_sparsity` | `(1/L)Σ_{x_l<ε} exp(−p_l/s)`, 默认 `s = 1/V` | 全局 | **上升 = 无关项被压得更死**；值域 `(e⁻¹, 1)`。`s` 必须与被打分的分布无关，取 `φ_min` 会让它退化成 `e⁻¹/L` |
 | 3 | `entropy` | `multimax/global_entropy` | `logsumexp(x) − E_p[x]` | 全局 | 预测熵 (nats) |
 | 4 | `entropy_norm` | `multimax/global_entropy_norm` | `H / log V` | 全局 | 归一化熵，跨词表可比 |
 | 5 | `top1_prob` | `multimax/global_top1_prob` | `φ_max` | 全局 | 最大概率 |
@@ -861,7 +861,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MLPUpdate** | `update_zmax_max` | `max_e max_m z(r_m)` | max | 层内最异常专家，上界 `(E−1)/√E` |
 | **MLPUpdate** | `shared_{m}_rel_update` | `r_m` of shared expert | mean | 路由专家的对照组 |
 | **MultiMax** | `multi_modality` | `1 − (1/N)Σ(φ_max − φₙ)`, `ε<xₙ<x_max` | mean | 上升 = 输出分布更多峰 (Def 3.2) |
-| **MultiMax** | `sparsity` | `(1/L)Σ exp(−exp(x_l − x_min))`, `x_l<ε` | mean | 上升 = 无关项更贴近最小值 (Def 3.3)，上界 `e⁻¹` |
+| **MultiMax** | `sparsity` | `(1/L)Σ exp(−p_l/s)`, `x_l<ε`, 默认 `s=1/V` | mean | 上升 = 无关概率质量更小 (Def 3.3)，值域 `(e⁻¹, 1)` |
 | **MultiMax** | `entropy` / `entropy_norm` | `logsumexp(x) − E_p[x]` / `÷ log V` | mean | 预测熵；与 sparsity/multi_modality 一起看 |
 | **MultiMax** | `top1_prob` / `top10_prob` | `φ_max` / `Σ top-10 φ` | mean | 概率质量集中度，k 可配 |
 | **MultiMax** | `relevant_count` / `sparse_count` | `N` / `L` | mean | Def 3.2/3.3 的样本量，核对 ε 是否合理 |

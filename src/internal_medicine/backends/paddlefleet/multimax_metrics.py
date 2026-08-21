@@ -17,11 +17,23 @@ logits) and ``eps`` a relevance threshold on the logits ``x``:
     Sparsity (Def 3.3), over the L entries with x_l < eps:
         S(x) = (1/L) * sum_l exp((s - phi(x)_l) / s - 1)
 
-``S`` simplifies exactly: ``(s - p)/s - 1 == -p/s``, and with the paper's
-suggested reference ``s = phi(x)_min`` the ratio is shard-safe and
-scale-free, ``p_l / s = exp(x_l - x_min)``. That form needs no probability
-underflow guard, which matters at LM-head vocab sizes where ``phi_min``
-rounds to 0 in fp32.
+``S`` simplifies exactly: ``(s - p)/s - 1 == -p/s``, so each term is
+``exp(-p_l / s)``. The paper leaves ``s`` free ("can be any reference value")
+and asks only that ``S`` stay a smooth step approximation normalized to
+``[0, 1]``, larger meaning sparser. That normalization holds only while ``s`` is
+**independent of the distribution being scored**: with ``s = phi(x)_min`` every
+``p_l / s >= 1`` by construction, so each term is capped at ``e^-1`` and
+``S -> e^-1 / L`` once ``L`` is vocab-sized. The score then tracks ``1 / L``
+rather than sparsity, and is not comparable across steps because the reference
+moves with the distribution.
+
+The default reference is the uniform probability ``s = 1 / V``, which matches
+the default ``eps`` ("relevant" = beats uniform): every sparse entry then has
+``p_l < s``, terms live in ``(e^-1, 1)``, and the series is comparable across
+steps. ``sparsity_ref`` overrides it -- e.g. with the paper's example, the
+smallest probability of the *unmodulated* temperature-1 softmax. The ratio is
+evaluated as ``exp(x_l - log_z - log s)``, so nothing underflows at LM-head
+vocab sizes where ``phi_min`` rounds to 0 in fp32.
 
 Hot-path discipline (``.claude/skills/monitor-hook-perf-rules``): every
 function here returns 0-dim GPU tensors and never syncs to host.
@@ -81,6 +93,7 @@ def compute_distribution_metrics(
     prob_eps: float | None = None,
     logit_eps: float | None = None,
     topk: int = 10,
+    sparsity_ref: float | None = None,
 ) -> dict[str, paddle.Tensor]:
     """Token-mean distribution metrics for one ``[rows, vocab]`` logits tile.
 
@@ -88,6 +101,10 @@ def compute_distribution_metrics(
     vocab-parallel shards first) and must already carry the SegLU modulation.
     ``vocab_size`` defaults to the tile's last dim; pass it explicitly only if
     the tile is a strict subset of the vocab.
+
+    ``sparsity_ref`` is Def 3.3's reference probability ``s``; it defaults to
+    ``1 / vocab_size`` and must not depend on the scored distribution (see the
+    module docstring).
 
     Returns 0-dim fp32 GPU tensors: ``entropy``, ``entropy_norm``,
     ``top1_prob``, ``top{k}_prob``, ``multi_modality``, ``sparsity``,
@@ -102,7 +119,6 @@ def compute_distribution_metrics(
     log_z = paddle.logsumexp(x, axis=-1, keepdim=True)  # [rows, 1]
     p = paddle.exp(x - log_z)
     x_max = x.max(axis=-1, keepdim=True)
-    x_min = x.min(axis=-1, keepdim=True)
     p_max = paddle.exp(x_max - log_z)
     eps = _relevance_threshold(log_z, vocab_size, prob_eps, logit_eps)
 
@@ -118,14 +134,18 @@ def compute_distribution_metrics(
     # drop them from the mean instead of scoring them as fully multi-modal.
     mm_valid = (n_relevant > 0).astype("float32")
 
-    # Def 3.3 -- exp((s - p_l)/s - 1) == exp(-p_l/s) == exp(-exp(x_l - x_min))
-    # for the paper's reference value s = phi(x)_min. The bound is strict, as in
-    # the paper: an entry sitting exactly at eps belongs to neither set, so a
-    # uniform row (every entry at the threshold) yields L == 0 and is dropped
-    # from the mean rather than scoring as maximally sparse.
+    # Def 3.3 -- exp((s - p_l)/s - 1) == exp(-p_l/s), evaluated in log space as
+    # exp(-exp(x_l - log_z - log s)) so phi_min underflow never appears. ``s`` is
+    # a fixed reference (default: uniform 1/V), never a statistic of this row --
+    # see the module docstring for why phi_min collapses the score onto e^-1/L.
+    # The set bound is strict, as in the paper: an entry sitting exactly at eps
+    # belongs to neither set, so a uniform row (every entry at the threshold)
+    # yields L == 0 and is dropped from the mean rather than scoring as
+    # maximally sparse.
     sparse = (x < eps).astype("float32")
     n_sparse = sparse.sum(axis=-1)
-    ratio = paddle.clip(x - x_min, max=_EXP_CLAMP)
+    log_s = math.log(1.0 / vocab_size if sparsity_ref is None else float(sparsity_ref))
+    ratio = paddle.clip(x - log_z - log_s, max=_EXP_CLAMP)
     sparsity_terms = paddle.exp(-paddle.exp(ratio)) * sparse
     sparsity = sparsity_terms.sum(axis=-1) / paddle.clip(n_sparse, min=1.0)
     sp_valid = (n_sparse > 0).astype("float32")

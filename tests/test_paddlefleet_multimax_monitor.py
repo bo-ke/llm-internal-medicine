@@ -92,19 +92,44 @@ class DistributionMetricsTest(unittest.TestCase):
 
         self.assertLess(float(peaked_m["multi_modality"]), float(flat_m["multi_modality"]))
 
-    def test_sparsity_peaks_when_irrelevant_entries_sit_at_the_minimum(self):
-        # All sub-eps entries equal the row minimum -> every term is exp(-1).
-        at_min = paddle.to_tensor([[10.0, -20.0, -20.0, -20.0]], dtype="float32")
-        m = mm_metrics.compute_distribution_metrics(at_min, prob_eps=1e-6, topk=1)
-        self.assertAlmostEqual(float(m["sparsity"]), math.exp(-1.0), places=5)
+    def test_sparsity_matches_hand_computed_definition(self):
+        # Def 3.3 with an explicit reference s: mean of exp(-p_l / s) over the
+        # entries below eps. s is chosen so the terms land mid-range, where a
+        # wrong reference cannot hide behind saturation at 0 or 1.
+        logits = paddle.to_tensor([[6.0, -1.0, -2.0]], dtype="float32")
+        ref = 0.05
+        m = mm_metrics.compute_distribution_metrics(logits, prob_eps=0.01, topk=1, sparsity_ref=ref)
+
+        p = paddle.nn.functional.softmax(logits, axis=-1)[0]
+        sparse_p = [float(p[1]), float(p[2])]
+        expected = sum(math.exp(-v / ref) for v in sparse_p) / len(sparse_p)
+        self.assertAlmostEqual(float(m["sparsity"]), expected, places=5)
+        self.assertAlmostEqual(float(m["sparse_count"]), 2.0, places=6)
+
+    def test_sparsity_rises_as_irrelevant_mass_shrinks(self):
+        near = paddle.to_tensor([[6.0, 2.5, 2.4]], dtype="float32")
+        far = paddle.to_tensor([[6.0, -4.0, -4.5]], dtype="float32")
+        kwargs = {"prob_eps": 0.2, "topk": 1, "sparsity_ref": 0.05}
+        near_s = float(mm_metrics.compute_distribution_metrics(near, **kwargs)["sparsity"])
+        far_s = float(mm_metrics.compute_distribution_metrics(far, **kwargs)["sparsity"])
+        self.assertLess(near_s, far_s)
+
+    def test_sparsity_reference_is_independent_of_the_scored_row(self):
+        # Regression guard: referencing phi_min (a statistic of the same row)
+        # caps every term at e^-1, so a genuinely sparse row could never score
+        # above that, and the score decays as 1/L. With a fixed reference it
+        # approaches 1, which is the [0, 1] normalization Def 3.3 asks for.
+        very_sparse = paddle.to_tensor([[20.0, -20.0, -20.0, -20.0]], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(very_sparse, prob_eps=1e-6, topk=1)
+        self.assertGreater(float(m["sparsity"]), math.exp(-1.0))
+        self.assertAlmostEqual(float(m["sparsity"]), 1.0, places=5)
         self.assertAlmostEqual(float(m["sparse_count"]), 3.0, places=6)
 
-        # Lifting them well above the minimum drives the score toward 0.
-        spread = paddle.to_tensor([[10.0, -20.0, -12.0, -8.0]], dtype="float32")
-        self.assertLess(
-            float(mm_metrics.compute_distribution_metrics(spread, prob_eps=1e-6, topk=1)["sparsity"]),
-            float(m["sparsity"]),
-        )
+        # Pushing this row's own minimum further down must not move the score,
+        # since the mass below eps is already negligible either way.
+        deeper = paddle.to_tensor([[20.0, -40.0, -20.0, -20.0]], dtype="float32")
+        deeper_s = float(mm_metrics.compute_distribution_metrics(deeper, prob_eps=1e-6, topk=1)["sparsity"])
+        self.assertAlmostEqual(deeper_s, float(m["sparsity"]), places=5)
 
     def test_metrics_are_zero_dim_and_finite(self):
         logits = paddle.randn([4, 16], dtype="float32")

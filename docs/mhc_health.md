@@ -123,7 +123,7 @@ key 数量：`n = 4`、43 层、2 模块 = 2064 条逐层序列，是本 monitor
 两者都高，才说明每个 token 的总门量也在明显变化。反过来，`h_post_token_std -> 0` 仍允许不同 token 在 stream 间
 重新分配相同总门量，因此不能据此断言门控已完全失去输入区分能力。
 
-### 结构指标（paddlefleet 独有）
+### 结构指标
 
 `h_post_mean` / `h_post_std` 把 token 轴和 stream 轴一起池化，因此「n 个流一起变弱」与「n-1 个流死掉、
 剩一个扛全部」在均值上不可分；`branch_residual_share` 则回答 `h_post_mean` 回答不了的问题：门变小可能被
@@ -263,7 +263,7 @@ B_l = prod_{i=1}^{L-l} R_{L-i}
 应读 `||F_l||∞`，composite backward amplification 应读 `||B_l^T||∞ = ||B_l||1`。这里的 `l` 是每个顺序执行的
 residual branch；映射到 Transformer 时，attention 和 MLP 是交错的相邻 branch，不能拆成两条互不相干的链。
 
-#### 当前 PaddleFleet 实现
+#### 当前实现
 
 `apply_h_res` 的实际运算是 `mixed = h_resᵀ @ residual`，所以实现先对 token 求平均并转置，得到真正作用在
 流向量上的算子 `T_q = mean_token(h_res_q)ᵀ`。所有非 MTP branch 按物理执行顺序排列：
@@ -293,10 +293,17 @@ prefix `F_q = T_q @ ... @ T_0`；逆序遍历构造当前 branch 到尾部的 su
 3. **累乘发生在 microbatch 结算时**，快照按 `(layer_idx, attn-before-mlp)` 排序，不在 hook 里增量累乘。因此结果与
    hook 触发顺序无关；recompute 即使按反向层序重放，也会恢复成物理 branch 顺序。回归测试会故意逆序触发 hook，
    并用非交换矩阵分别核对正序 prefix 和逆序 suffix。
-4. **MTP 层被排除。** MTP 层不在主干传播路径上，乘进链条没有物理意义。
+4. **MTP 层被排除。** MTP 层不在主干传播路径上，乘进链条没有物理意义。megatron 后端不需要这道过滤：MTP block
+   不在 `decoder.layers` 里，discovery 根本走不到。
+
+两处后端差异：megatron 的 `h_res_logits*` 四条指标依赖 `_compute_h`，而 `config.use_fused_mhc` 会让
+`compute_mappings` 直接走 `fused_proj_rms_compute_h` 而跳过它——此时这四条累加器为空、不落盘（其余 12 条不受影响）；
+AMP 反除只在 fp16 且调用方传入 `grad_scaler` 时发生，bf16 下 megatron 本就不缩放，`finalize_scaled_grad_metrics()`
+是 no-op。
 
 作用域限制：复合只覆盖**本 rank 持有的层**。在 `sharding: stage1` 且无 PP 时，每张卡持有全部 Transformer 层，
-所以覆盖全网层范围。真开 PP 后它会退化成 stage 内语义，而我们既检测不到也修不了——`get_pipeline_model_parallel_rank`
+所以覆盖全网层范围。真开 PP 后它会退化成 stage 内语义（megatron 后端即如此，多 chunk 时按 `layer_offset` 排序，
+链条覆盖本 stage 持有的所有 chunk），而在 PaddleFleet 上我们既检测不到也修不了——`get_pipeline_model_parallel_rank`
 和 `get_pipeline_model_parallel_world_size` 在 PaddleFleet 里目前是 stub（无条件返回 0 / 1，
 `parallel_state.py:229`、`:246`）。要支持 PP 需要先等这两个函数实现，再补一次 flush 时的 all-gather；届时
 **collective 必须放在所有 per-layer `try/except` 之外**，否则单个 rank 吞异常会让整个 job 挂死而不是报错。

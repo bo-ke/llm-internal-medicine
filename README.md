@@ -488,6 +488,10 @@ Figure 10 那类映射热图使用：
 热路径上每个映射只有一次 `add_`，而不是每个元素一个 kernel；并且**不派生 `global_*` 键**——单个 cell 在
 43 层上的均值没有判读意义。`log_per_layer=False` 时这三组整体不产出。
 
+> megatron 与 paddlefleet 两个后端 schema、口径与归约方式一致，曲线可直接跨后端对比。两点后端差异：megatron 开启
+> `use_fused_mhc` 时 `compute_mappings` 会绕过 `_compute_h`，此时 11–14 四条 `h_res_logits*` 不落盘；AMP 反除只在
+> fp16 且调用方传入 `grad_scaler` 时发生（bf16 本就不缩放）。
+
 指标公式、采集路径、健康判读及论文 composite 定义统一维护在
 [`docs/mhc_health.md`](docs/mhc_health.md)，README 不再重复展开。
 

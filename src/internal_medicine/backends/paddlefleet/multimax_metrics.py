@@ -87,35 +87,58 @@ def _relevance_threshold(
     return math.log(p_eps) + log_z
 
 
+SPARSITY_REF_MODES = ("geomean", "min", "uniform")
+
+
 def _sparsity_log_ref(
     vocab_size: int,
     sparsity_ref: float | None,
     ref_logits: paddle.Tensor | None,
-    log_z: paddle.Tensor,
+    prob_eps: float | None = None,
+    logit_eps: float | None = None,
+    mode: str = "geomean",
 ) -> paddle.Tensor | float:
     """``log s`` for Def 3.3, in priority order: explicit, baseline, uniform.
 
-    The paper's example reference is the smallest probability of the plain
-    temperature-1 SoftMax of the *input* logits, i.e. of the distribution before
-    the reweighting function is applied. ``ref_logits`` supplies exactly that
-    (the unmodulated tile), giving a per-row ``log s = x_raw_min - log_z_raw``;
-    it is typically far below ``1/V`` for a peaked head, so the score measures
-    how much sparser the modulated tail is *than the softmax baseline*.
+    Def 3.3 lets ``s`` be "any reference value for a non-linear scaling", with
+    the smallest SoftMax(t=1) probability given as one example. The choice only
+    has to be independent of the row being scored -- but it decides where the
+    smooth step ``exp(-p_l/s)`` sits, and both extremes are useless in practice:
 
-    Fallback is the uniform probability ``1/V``, which is the reference implied
-    by the default ``eps``. Either way ``s`` must not be a statistic of the
-    modulated row being scored -- see the module docstring.
+    * ``uniform`` (``s = 1/V``): every irrelevant entry is already below ``s``,
+      so all terms saturate near 1 and the score has no resolution.
+    * ``min`` (the paper's example, ``s = min SoftMax(x_raw)``): orders of
+      magnitude below ``1/V``, so nearly every term underflows to 0. Measured on
+      a live 44800-step run this gave ``S`` p50 = 0.013 with p95 = 0.265 -- all
+      signal in the top few percent of tokens.
+    * ``geomean`` (default): the geometric mean of the *baseline* tail
+      probabilities, i.e. the mean of ``log phi_ref`` over the reference's own
+      irrelevant set. That is a middle-of-the-tail reference, so a tail pushed
+      below the baseline lands in the responsive part of the step.
+
+    The baseline's tail is selected by the reference distribution's own ``eps``,
+    never by the scored row's, so ``s`` stays independent of the modulation --
+    see the module docstring for why a statistic of the scored row collapses the
+    score onto ``e^-1/L``.
     """
     if sparsity_ref is not None:
         return math.log(float(sparsity_ref))
-    if ref_logits is not None:
-        ref = ref_logits.astype("float32")
-        if ref.ndim > 2:
-            ref = ref.reshape([-1, ref.shape[-1]])
-        ref_log_z = paddle.logsumexp(ref, axis=-1, keepdim=True)
+    uniform = math.log(1.0 / vocab_size)
+    if ref_logits is None or mode == "uniform":
+        return uniform
+    ref = ref_logits.astype("float32")
+    if ref.ndim > 2:
+        ref = ref.reshape([-1, ref.shape[-1]])
+    ref_log_z = paddle.logsumexp(ref, axis=-1, keepdim=True)
+    if mode == "min":
         return ref.min(axis=-1, keepdim=True) - ref_log_z
-    del log_z  # uniform reference needs no per-row term
-    return math.log(1.0 / vocab_size)
+    ref_eps = _relevance_threshold(ref_log_z, vocab_size, prob_eps, logit_eps)
+    tail = (ref < ref_eps).astype("float32")
+    n_tail = tail.sum(axis=-1, keepdim=True)
+    log_geo = ((ref - ref_log_z) * tail).sum(axis=-1, keepdim=True) / paddle.clip(n_tail, min=1.0)
+    # A baseline row with no tail at all (uniform reference) has no geometric
+    # mean to take; fall back to the uniform probability for those rows only.
+    return paddle.where(n_tail > 0, log_geo, paddle.full_like(log_geo, uniform))
 
 
 QUANTILES: tuple[float, ...] = (0.5, 0.95, 0.98)
@@ -175,6 +198,7 @@ def compute_distribution_metrics(
     topk: int = 10,
     sparsity_ref: float | None = None,
     ref_logits: paddle.Tensor | None = None,
+    sparsity_ref_mode: str = "geomean",
 ) -> dict[str, paddle.Tensor]:
     """Token-mean distribution metrics for one ``[rows, vocab]`` logits tile.
 
@@ -183,13 +207,15 @@ def compute_distribution_metrics(
     ``vocab_size`` defaults to the tile's last dim; pass it explicitly only if
     the tile is a strict subset of the vocab.
 
-    ``sparsity_ref`` is Def 3.3's reference probability ``s``; it defaults to
-    ``1 / vocab_size`` and must not depend on the scored distribution (see the
-    module docstring).
+    ``sparsity_ref`` pins Def 3.3's reference probability ``s`` to a constant;
+    otherwise ``sparsity_ref_mode`` picks how it is derived from ``ref_logits``
+    (``geomean`` / ``min`` / ``uniform``, see ``_sparsity_log_ref``). ``s`` must
+    never depend on the scored distribution (see the module docstring).
 
     Returns 0-dim fp32 GPU tensors: ``entropy``, ``entropy_norm``,
-    ``top1_prob``, ``top{k}_prob``, ``multi_modality``, ``sparsity``,
-    ``relevant_count``, ``sparse_count``.
+    ``top1_prob``, ``top{k}_prob``, ``multi_modality``,
+    ``multi_modality_top{k}``, ``sparsity``, ``relevant_count``,
+    ``sparse_count`` -- each with ``_p50`` / ``_p95`` / ``_p98`` companions.
     """
     x = logits.astype("float32")
     if x.ndim > 2:
@@ -225,14 +251,27 @@ def compute_distribution_metrics(
     # maximally sparse.
     sparse = (x < eps).astype("float32")
     n_sparse = sparse.sum(axis=-1)
-    log_s = _sparsity_log_ref(vocab_size, sparsity_ref, ref_logits, log_z)
+    log_s = _sparsity_log_ref(vocab_size, sparsity_ref, ref_logits, prob_eps, logit_eps, sparsity_ref_mode)
     ratio = paddle.clip(x - log_z - log_s, max=_EXP_CLAMP)
     sparsity_terms = paddle.exp(-paddle.exp(ratio)) * sparse
     sparsity = sparsity_terms.sum(axis=-1) / paddle.clip(n_sparse, min=1.0)
     sp_valid = (n_sparse > 0).astype("float32")
 
     k = min(int(topk), width)
-    topk_mass = paddle.topk(p, k=k, axis=-1)[0].sum(axis=-1)
+    p_top = paddle.topk(p, k=k, axis=-1)[0]  # descending, p_top[:, 0] == p_max
+    topk_mass = p_top.sum(axis=-1)
+
+    # Def 3.2 with eps = the k-th largest entry: the relevant set is the top-k
+    # minus the max, so this is literally "the average gap between top-1 and the
+    # other top-k entries". Reported next to the eps-thresholded M because with
+    # the default eps = 1/V the relevant set runs to ~1e3 entries whose
+    # probabilities are orders of magnitude below phi_max, which drives M to
+    # 1 - top1_prob and leaves it carrying no independent information (measured:
+    # M - (1 - top1_prob) is pinned at +0.023..+0.026 across three checkpoints).
+    if k > 1:
+        mm_topk = 1.0 - (p_top[:, :1] - p_top[:, 1:].mean(axis=-1, keepdim=True)).squeeze(-1)
+    else:
+        mm_topk = paddle.ones_like(topk_mass)
 
     # Every distribution metric is a token mean; each also reports p50/p95/p98
     # over the sampled tokens, which the viewer draws as a band plus a tail line.
@@ -244,6 +283,7 @@ def compute_distribution_metrics(
         ("top1_prob", p_max.squeeze(-1), None),
         (f"top{k}_prob", topk_mass, None),
         ("multi_modality", multi_modality, mm_valid),
+        (f"multi_modality_top{k}", mm_topk, None),
         ("sparsity", sparsity, sp_valid),
         ("relevant_count", n_relevant, None),
         ("sparse_count", n_sparse, None),

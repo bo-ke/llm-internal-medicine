@@ -22,6 +22,7 @@ from paddle import nn
 from .base import PaddleProbe
 from .multimax_metrics import (
     QUANTILES,
+    SPARSITY_REF_MODES,
     _quantile_suffix,
     apply_seglu,
     compute_distribution_metrics,
@@ -64,6 +65,7 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         prob_eps: float | None = None,
         logit_eps: float | None = None,
         sparsity_ref: float | None = None,
+        sparsity_ref_mode: str = "geomean",
     ):
         super().__init__(
             log_per_layer=log_per_layer,
@@ -81,6 +83,10 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         self.prob_eps = prob_eps
         self.logit_eps = logit_eps
         self.sparsity_ref = sparsity_ref
+        assert sparsity_ref_mode in SPARSITY_REF_MODES, (
+            f"sparsity_ref_mode must be one of {SPARSITY_REF_MODES}, got {sparsity_ref_mode!r}"
+        )
+        self.sparsity_ref_mode = sparsity_ref_mode
         self.tp_size = 1
         self.tp_group = None
         self._hook_failed = False
@@ -93,7 +99,8 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         # topk is clamped to the vocab width at compute time; the key must be
         # declared up front, so clamp it here too when the width is known.
         k = self.topk if vocab_width is None else min(self.topk, vocab_width)
-        topk_keys = (f"top{k}_prob",) + tuple(f"top{k}_prob_{_quantile_suffix(q)}" for q in QUANTILES)
+        topk_bases = (f"top{k}_prob", f"multi_modality_top{k}")
+        topk_keys = topk_bases + tuple(f"{base}_{_quantile_suffix(q)}" for base in topk_bases for q in QUANTILES)
         return _DIST_METRICS + _DIST_QUANTILE_METRICS + topk_keys + ("rows",) + _PARAM_METRICS
 
     @staticmethod
@@ -296,6 +303,7 @@ class PaddleMultiMaxMonitor(PaddleProbe):
                         topk=self._topk_effective,
                         sparsity_ref=self.sparsity_ref,
                         ref_logits=raw,
+                        sparsity_ref_mode=self.sparsity_ref_mode,
                     )
                     for name, value in metrics.items():
                         self.record_mean(self._global_key(tag + name), value)
@@ -318,6 +326,7 @@ def setup_multimax_monitor(
     prob_eps: float | None = None,
     logit_eps: float | None = None,
     sparsity_ref: float | None = None,
+    sparsity_ref_mode: str = "geomean",
     monitor_dict: dict | None = None,
 ):
     monitor = PaddleMultiMaxMonitor(
@@ -330,6 +339,7 @@ def setup_multimax_monitor(
         prob_eps=prob_eps,
         logit_eps=logit_eps,
         sparsity_ref=sparsity_ref,
+        sparsity_ref_mode=sparsity_ref_mode,
     )
     monitor.register_hooks(model)
     if monitor_dict is not None:

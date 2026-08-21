@@ -12,7 +12,7 @@
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
 - **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 36 指标；仅权重)
-- **[MultiMax](./docs/multimax.md)** — LM head SegLU 调制的输出分布监控：论文的 sparsity / multi-modality 指标 + 熵 + top-k 概率质量，每项另报 `p50/p95/p98`（viewer 画成 p50~p95 阴影） (41 指标；仅 paddlefleet；仅在 `multimax_modules` 含 `lm_head` 时生效)
+- **[MultiMax](./docs/multimax.md)** — LM head SegLU 调制的输出分布监控：论文的 sparsity / multi-modality 指标 + 熵 + top-k 概率质量，每项另报 `p50/p95/p98`（viewer 画成 p50~p95 阴影） (45 指标；仅 paddlefleet；仅在 `multimax_modules` 含 `lm_head` 时生效)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
 - **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
@@ -683,8 +683,9 @@ Definition 3.2 / 3.3，外加预测熵与 top-k 概率质量。
 
 | # | 指标 | 键 | 公式 | 粒度 | 含义 |
 |---|------|-----|------|------|------|
-| 1 | `multi_modality` | `multimax/global_multi_modality` | `1 − (1/N)Σ_{ε<xₙ<x_max}(φ_max − φₙ)` | 全局 | **上升 = 更多峰**；N=0 的行排除在均值外 |
-| 2 | `sparsity` | `multimax/global_sparsity` | `(1/L)Σ_{x_l<ε} exp(−p_l/s)`, 默认 `s = min SoftMax_{t=1}(未调制 logits)` | 全局 | **上升 = 无关项被压得更死**。`s` 必须与被打分的分布无关；取 `φ_min` 会让它退化成 `e⁻¹/L`，取 `1/V` 会把整段压在 `(e⁻¹, 1)` |
+| 1 | `multi_modality` | `multimax/global_multi_modality` | `1 − (1/N)Σ_{ε<xₙ<x_max}(φ_max − φₙ)` | 全局 | 论文原式。**默认 ε=1/V 时相关集上千项，它 ≈ 1−top1_prob**（实测差值恒定 +0.023~+0.026），读多峰性用下一项 |
+| 1b | `multi_modality_top{k}` | `multimax/global_multi_modality_top10` | `1 − (φ_max − mean(φ_2..φ_k))` | 全局 | Def 3.2 取 `ε=第 k 大项`，即「top-1 与其余 top-k 的平均差距」。**上升 = 更多峰**；复用 topk 结果，无额外排序 |
+| 2 | `sparsity` | `multimax/global_sparsity` | `(1/L)Σ_{x_l<ε} exp(−φ_l/s)` | 全局 | **上升 = 无关项被压得更死**。`s` 默认取未调制 softmax 尾部概率的**几何平均**（`sparsity_ref_mode=geomean`）；`min`/`uniform` 两个极端分别把 S 压到 ~0 / ~1 |
 | 3 | `entropy` | `multimax/global_entropy` | `logsumexp(x) − E_p[x]` | 全局 | 预测熵 (nats) |
 | 4 | `entropy_norm` | `multimax/global_entropy_norm` | `H / log V` | 全局 | 归一化熵，跨词表可比 |
 | 5 | `top1_prob` | `multimax/global_top1_prob` | `φ_max` | 全局 | 最大概率 |
@@ -695,7 +696,8 @@ Definition 3.2 / 3.3，外加预测熵与 top-k 概率质量。
 
 第 2 项按 `exp(x_l − logsumexp(x) − log s)` 在**对数空间**求值，只用 logits，
 避免 fp32 下词表规模的概率下溢成 0。参考概率 `s` 的优先级是
-`sparsity_ref`（常数）> 未调制 logits 的 softmax 最小概率 > `1/V`。
+`sparsity_ref`（常数）> `sparsity_ref_mode`（`geomean` 默认 / `min` / `uniform`）> `1/V`；
+`s` 必须与被打分的那一行无关——取本行 `φ_min` 会让 `S` 退化成 `e⁻¹/L`。
 
 开 MTP 时 `GPTMTPLMHead` 有自己的一套 SegLU 参数，指标落在 `multimax/global_mtp_*`，
 与 main head 分开统计。
@@ -862,8 +864,9 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MLPUpdate** | `{m}_stable_rank_mean` | `‖ΔW_m‖_F²/‖ΔW_m‖₂²` | mean | 更新是否集中到少数方向 |
 | **MLPUpdate** | `update_zmax_max` | `max_e max_m z(r_m)` | max | 层内最异常专家，上界 `(E−1)/√E` |
 | **MLPUpdate** | `shared_{m}_rel_update` | `r_m` of shared expert | mean | 路由专家的对照组 |
-| **MultiMax** | `multi_modality` | `1 − (1/N)Σ(φ_max − φₙ)`, `ε<xₙ<x_max` | mean | 上升 = 输出分布更多峰 (Def 3.2) |
-| **MultiMax** | `sparsity` | `(1/L)Σ exp(−p_l/s)`, `x_l<ε`, 默认 `s=1/V` | mean | 上升 = 无关概率质量更小 (Def 3.3)，值域 `(e⁻¹, 1)` |
+| **MultiMax** | `multi_modality` | `1 − (1/N)Σ(φ_max − φₙ)`, `ε<xₙ<x_max` | mean | 论文原式；默认 ε 下 ≈ 1−top1_prob，看多峰性用 top{k} 变体 |
+| **MultiMax** | `multi_modality_top{k}` | `1 − (φ_max − mean(φ_2..φ_k))` | mean | 上升 = 前 k 项更接近等概率 = 更多峰 (Def 3.2, ε=第 k 大项) |
+| **MultiMax** | `sparsity` | `(1/L)Σ exp(−φ_l/s)`, `x_l<ε`, 默认 `s`=baseline 尾部几何平均 | mean | 上升 = 无关概率质量更小 (Def 3.3) |
 | **MultiMax** | `entropy` / `entropy_norm` | `logsumexp(x) − E_p[x]` / `÷ log V` | mean | 预测熵；与 sparsity/multi_modality 一起看 |
 | **MultiMax** | `top1_prob` / `top10_prob` | `φ_max` / `Σ top-10 φ` | mean | 概率质量集中度，k 可配 |
 | **MultiMax** | `relevant_count` / `sparse_count` | `N` / `L` | mean | Def 3.2/3.3 的样本量，核对 ε 是否合理 |

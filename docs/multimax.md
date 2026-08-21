@@ -41,6 +41,26 @@ N 是满足 `ε < xₙ < x_max` 的项数（不含最大项）。相关项的概
 只有 N = 0 的行（除最大项外没有任何相关项）被排除在均值外，而不是记成 1.0——
 否则一个完全单峰的分布会被打成「最多峰」。
 
+#### 1b. `multi_modality_top{k}`：把 ε 取成第 k 大项
+
+Def 3.2 里的 ε 是「任何合理的相关性阈值」。取 `ε = 第 k 大的 logit` 时，相关集正好是
+**top-k 去掉最大项**，于是式子退化成一句话：
+
+```
+M_topk(x) = 1 − (φ_max − mean(φ_2..φ_k))
+```
+
+即「**top-1 与其余 top-k 项的平均差距**」，`= 1` 表示前 k 项完全等概率。
+
+**为什么必须同时报这一条。** 默认 `ε` 对应「概率超过均匀分布 1/V」，在 LM head 上相关集有
+上千项（实测 `relevant_count` 均值 ≈ 275、p95 ≈ 1000），这些 `φₙ` 比 `φ_max` 小两三个数量级，
+于是 `(1/N)Σ(φ_max − φₙ) ≈ φ_max`，`M ≈ 1 − top1_prob`——实测三个 checkpoint 上
+`M − (1 − top1_prob)` 恒定在 `+0.023 ~ +0.026`（最大偏离 0.027），也就是说**原式那条曲线
+不含 `top1_prob` 之外的任何信息**。`top{k}` 变体的相关集只有 k−1 项、量级与 `φ_max` 可比，
+才真正反映头部形状。两条都保留：一条对齐论文原式，一条可读。
+
+复用 `topk_prob` 已经算出的 `paddle.topk` 结果，没有额外的排序开销。
+
 ### 2. Sparsity（Def 3.3）
 
 ```
@@ -60,13 +80,25 @@ S(x) = (1/L) · Σ_{x_l < ε} exp(−p_l / s)
 > 而且 `L` 一旦是词表量级，`S → e⁻¹/L`（LM head 上就是 1e-6 量级）——此时它衡量的是
 > 「有几项贴在最小值上」，几乎只反映 `1/L`，而且因为参考值随分布漂移，跨 step 不可比。
 
-默认 `s` 取论文举例的那个参考值：**同一行未经 SegLU 调制的 logits** 过 temperature-1 softmax
-后的最小概率（`ref_logits` 参数，monitor 在 hook 里用 head 的权重把 baseline 重算一遍）。
-它远小于 `1/V`，对应「temperature → 0」那一侧的参考，所以无关项不再被自动压在 `e⁻¹` 之下——
-`S` 会随着尾部概率被推到 baseline 以下而上升，这才是「越大越稀疏」的可读区间。
+**参考概率 `s` 的取法**（`sparsity_ref` > `sparsity_ref_mode`，优先级由高到低）。`s` 只要求与被
+打分的行无关，但它决定平滑阶跃 `exp(−p_l/s)` 落在哪一段，两个极端都不可用：
 
-拿不到未调制 logits（例如上游只交出调制后的结果）时退化为 `s = 1/V`（均匀概率），
-语义与默认 ε 一致；`sparsity_ref=<常数>` 优先于上述两者，用来固定一个跨实验可比的参考。
+| 取法 | `s` 的量级 | 实测 `S`（44800，V≈201k） | 问题 |
+|------|-----------|--------------------------|------|
+| `uniform`（`s = 1/V`） | 5e-6 | ≈ 0.98 | 无关项本来就都低于 `s`，整段饱和到 1，没有分辨力 |
+| `min`（论文举例：baseline softmax 最小概率） | ~1e-11 | 均值 0.051 / **p50 0.013** / p95 0.265 | 比 `1/V` 小几个数量级，几乎所有项下溢到 0，信号只剩最上面几个百分点 |
+| **`geomean`（默认）** | 尾部中段 | 合成数据上 ≈ 0.585 | —— |
+
+`geomean` = **未经 SegLU 调制**的同一行 logits 过 temperature-1 softmax 后，**其自身无关项**
+概率的几何平均，即 `log s = mean_{l ∈ ref 的无关集}(x_ref,l − logsumexp(x_ref))`。
+落在尾部中段，所以尾部被压到 baseline 以下时 `S` 会明确上升，这才是「越大越稀疏」的可读区间。
+
+注意无关集是按**参考分布自己的 ε** 选的，不是被打分那一行的 ε，否则 `s` 又会重新依赖调制结果。
+baseline 本身没有尾部（`n_tail = 0`）的行退化为 `1/V`。
+
+`ref_logits` 由 monitor 在 hook 里用 head 的权重把 baseline 重算一遍得到；拿不到（上游只交出
+调制后的结果）时退化为 `uniform`。`sparsity_ref=<常数>` 优先于所有 mode，用来固定一个跨实验
+可比的参考。
 
 比值按 `exp(x_l − log_z − log s)` 在对数空间求值，因此在 LM head 的词表规模下
 （fp32 里 `φ_min` 会下溢成 0）不会有下溢问题。
@@ -161,10 +193,12 @@ setup_monitors(model, monitors=["multimax"], monitor_interval=100,
 ```
 
 - `sample_tokens`（默认 256）：参与统计的 token 数。TP all_gather 的大小与之成正比。
-- `topk`（默认 10）：概率质量的 k，会被词表宽度截断，键名跟着变（`top{k}_prob`）。
+- `topk`（默认 10）：概率质量的 k，会被词表宽度截断，键名跟着变（`top{k}_prob`、
+  `multi_modality_top{k}`）。
 - `prob_eps`（默认 `None` → `1/V`）/ `logit_eps`（默认 `None`）：ε 的两种给法，后者优先。
-- `sparsity_ref`（默认 `None`）：Def 3.3 的参考概率 `s` 取常数。不传时优先用未调制 logits 的
-  temperature-1 softmax 最小概率，再退化到 `1/V`（见「Sparsity」一节）。
+- `sparsity_ref`（默认 `None`）：Def 3.3 的参考概率 `s` 取常数，优先于 mode。
+- `sparsity_ref_mode`（默认 `"geomean"`，可选 `"min"` / `"uniform"`）：不给常数时 `s` 怎么从
+  未调制 logits 推出来（见「Sparsity」一节的对比表）。
 
 ## 判读
 

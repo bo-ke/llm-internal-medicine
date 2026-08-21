@@ -134,12 +134,15 @@ class DistributionMetricsTest(unittest.TestCase):
         self.assertAlmostEqual(deeper_s, float(m["sparsity"]), places=5)
 
     def test_ref_logits_supply_the_baseline_softmax_minimum(self):
-        # Default reference: the smallest probability of the *unmodulated*
-        # distribution (the paper's SoftMax_{t=1} example), which sits far below
-        # 1/V, so a tail that merely matches the baseline is not scored sparse.
+        # sparsity_ref_mode="min" is the paper's SoftMax_{t=1} example: the
+        # smallest probability of the *unmodulated* distribution, far below 1/V.
+        # It is no longer the default (it underflows most terms to 0), but it must
+        # stay available and exact.
         logits = paddle.to_tensor([[6.0, -1.0, -2.0]], dtype="float32")
         ref_logits = paddle.to_tensor([[5.0, 0.0, -3.0]], dtype="float32")
-        m = mm_metrics.compute_distribution_metrics(logits, prob_eps=0.01, topk=1, ref_logits=ref_logits)
+        m = mm_metrics.compute_distribution_metrics(
+            logits, prob_eps=0.01, topk=1, ref_logits=ref_logits, sparsity_ref_mode="min"
+        )
 
         p = paddle.nn.functional.softmax(logits, axis=-1)[0]
         ref_p = paddle.nn.functional.softmax(ref_logits, axis=-1)[0]
@@ -218,6 +221,63 @@ class DistributionMetricsTest(unittest.TestCase):
                 float(single["multi_modality"]),
                 places=5,
                 msg=f"{suffix} must not pick up the masked row",
+            )
+
+    def test_multi_modality_topk_is_the_top1_minus_topk_mean_gap(self):
+        # The paper's Def 3.2 with eps = the k-th largest entry: "the average
+        # difference between the reweighted relevant entries and the maximum",
+        # where relevant == top-k minus the max.
+        logits = paddle.to_tensor([[6.0, 5.5, 5.0, -2.0, -9.0]], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, topk=3)
+
+        p = paddle.nn.functional.softmax(logits, axis=-1)[0]
+        expected = 1.0 - (float(p[0]) - (float(p[1]) + float(p[2])) / 2)
+        self.assertAlmostEqual(float(m["multi_modality_top3"]), expected, places=5)
+
+    def test_multi_modality_topk_separates_a_flat_head_from_a_peaked_one(self):
+        # The eps-thresholded M cannot: with eps = 1/V the relevant set is a long
+        # tail whose probabilities are negligible next to phi_max, so M collapses
+        # onto 1 - top1_prob. The top-k variant must stay sensitive to the shape
+        # of the head itself.
+        peaked = paddle.to_tensor([[9.0, 1.0, 0.9, 0.8]], dtype="float32")
+        flat = paddle.to_tensor([[1.1, 1.0, 0.9, 0.8]], dtype="float32")
+        peaked_m = mm_metrics.compute_distribution_metrics(peaked, topk=4)
+        flat_m = mm_metrics.compute_distribution_metrics(flat, topk=4)
+        self.assertLess(float(peaked_m["multi_modality_top4"]), float(flat_m["multi_modality_top4"]))
+        self.assertGreater(float(flat_m["multi_modality_top4"]), 0.9)
+
+    def test_sparsity_ref_modes_are_ordered_and_geomean_sits_in_between(self):
+        # uniform (s = 1/V) saturates near 1, min (s = the baseline minimum)
+        # underflows toward 0; the geomean reference must land between them so the
+        # smooth step actually has resolution.
+        paddle.seed(0)
+        raw = paddle.randn([8, 512], dtype="float32") * 2.0
+        mod = raw * 1.3
+        scores = {
+            mode: float(
+                mm_metrics.compute_distribution_metrics(mod, ref_logits=raw, topk=5, sparsity_ref_mode=mode)["sparsity"]
+            )
+            for mode in mm_metrics.SPARSITY_REF_MODES
+        }
+        self.assertLess(scores["min"], scores["geomean"])
+        self.assertLess(scores["geomean"], scores["uniform"])
+        self.assertGreater(scores["geomean"], 0.05)
+        self.assertLess(scores["geomean"], 0.95)
+
+    def test_sparsity_reference_never_depends_on_the_scored_row(self):
+        # Same baseline, different modulation of the *same* row: the reference is
+        # a statistic of ref_logits only, so log s must not move with the tile.
+        paddle.seed(1)
+        raw = paddle.randn([4, 256], dtype="float32")
+        a = mm_metrics._sparsity_log_ref(256, None, raw, None, None, "geomean")
+        b = mm_metrics._sparsity_log_ref(256, None, raw, None, None, "geomean")
+        self.assertTrue(bool(paddle.all(a == b)))
+        # ... and an explicit constant wins over every mode.
+        for mode in mm_metrics.SPARSITY_REF_MODES:
+            self.assertAlmostEqual(
+                float(mm_metrics._sparsity_log_ref(256, 0.01, raw, None, None, mode)),
+                math.log(0.01),
+                places=6,
             )
 
     def test_metrics_are_zero_dim_and_finite(self):

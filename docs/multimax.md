@@ -29,7 +29,9 @@ SegLU(x) = x + t₀·relu(b₀−x) + t₁·relu(x−d₁) + t₂·relu(b₂−x
 
 设 `x` 为调制后的 logits，`φ(x) = softmax(x)`，`ε` 为「这一项是否相关」的阈值。
 
-### 1. Multi-Modality（Def 3.2）
+### 1. Multi-Modality（Def 3.2），报为 `multi_modality_top{k}`
+
+论文原式是
 
 ```
 M(x) = 1 − (1/N) · Σ_{ε < xₙ < x_max} (φ(x)_max − φ(x)ₙ)
@@ -38,28 +40,27 @@ M(x) = 1 − (1/N) · Σ_{ε < xₙ < x_max} (φ(x)_max − φ(x)ₙ)
 N 是满足 `ε < xₙ < x_max` 的项数（不含最大项）。相关项的概率越接近最大项，M 越接近 1，
 即分布越多峰。**上升 = 更多峰**。
 
-只有 N = 0 的行（除最大项外没有任何相关项）被排除在均值外，而不是记成 1.0——
-否则一个完全单峰的分布会被打成「最多峰」。
-
-#### 1b. `multi_modality_top{k}`：把 ε 取成第 k 大项
-
-Def 3.2 里的 ε 是「任何合理的相关性阈值」。取 `ε = 第 k 大的 logit` 时，相关集正好是
-**top-k 去掉最大项**，于是式子退化成一句话：
+其中 `ε` 是「任何合理的相关性阈值」。本仓库把它取成**第 k 大的 logit**，相关集正好是
+**top-k 去掉最大项**，式子退化成一句话：
 
 ```
-M_topk(x) = 1 − (φ_max − mean(φ_2..φ_k))
+M_topk(x) = 1 − (φ_max − mean(φ_2..φ_k))       # k 由 topk 配置，默认 10
 ```
 
-即「**top-1 与其余 top-k 项的平均差距**」，`= 1` 表示前 k 项完全等概率。
+即「**top-1 概率与第 2~k 名概率平均值之差**」，再用 1 减，使「大 = 更多峰」。
+`φ` 都是概率，所以 `M_topk ∈ (0, 1]`：`= 1` 表示前 k 项完全等概率（最多峰），
+越接近 `1 − φ_max` 表示 top-1 越独大（单峰）。
 
-**为什么必须同时报这一条。** 默认 `ε` 对应「概率超过均匀分布 1/V」，在 LM head 上相关集有
-上千项（实测 `relevant_count` 均值 ≈ 275、p95 ≈ 1000），这些 `φₙ` 比 `φ_max` 小两三个数量级，
+**为什么不用 `ε = 1/V` 的原式。** 那个默认 `ε` 对应「概率超过均匀分布」，在 LM head 上相关集
+有上千项（实测 `relevant_count` 均值 ≈ 275、p95 ≈ 1000），这些 `φₙ` 比 `φ_max` 小两三个数量级，
 于是 `(1/N)Σ(φ_max − φₙ) ≈ φ_max`，`M ≈ 1 − top1_prob`——实测三个 checkpoint 上
-`M − (1 − top1_prob)` 恒定在 `+0.023 ~ +0.026`（最大偏离 0.027），也就是说**原式那条曲线
-不含 `top1_prob` 之外的任何信息**。`top{k}` 变体的相关集只有 k−1 项、量级与 `φ_max` 可比，
-才真正反映头部形状。两条都保留：一条对齐论文原式，一条可读。
+`M − (1 − top1_prob)` 恒定在 `+0.023 ~ +0.026`（最大偏离 0.027），也就是说**那条曲线
+不含 `top1_prob` 之外的任何信息**，已于 2026-08-22 移除。`top{k}` 形式的相关集只有 k−1 项、
+量级与 `φ_max` 可比，才真正反映头部形状。
 
 复用 `topk_prob` 已经算出的 `paddle.topk` 结果，没有额外的排序开销。
+`relevant_count` 仍然保留，但只作 `ε` 划分是否合理的校验（配合 `sparse_count` 校验
+`N + L + 1 == V`），不再是任何指标的分母。
 
 ### 2. Sparsity（Def 3.3）
 
@@ -83,11 +84,14 @@ S(x) = (1/L) · Σ_{x_l < ε} exp(−p_l / s)
 **参考概率 `s` 的取法**（`sparsity_ref` > `sparsity_ref_mode`，优先级由高到低）。`s` 只要求与被
 打分的行无关，但它决定平滑阶跃 `exp(−p_l/s)` 落在哪一段，两个极端都不可用：
 
-| 取法 | `s` 的量级 | 实测 `S`（44800，V≈201k） | 问题 |
+| 取法 | `s` 的量级 | 实测 `S`（44800，V≈201k） | 说明 |
 |------|-----------|--------------------------|------|
 | `uniform`（`s = 1/V`） | 5e-6 | ≈ 0.98 | 无关项本来就都低于 `s`，整段饱和到 1，没有分辨力 |
-| `min`（论文举例：baseline softmax 最小概率） | ~1e-11 | 均值 0.051 / **p50 0.013** / p95 0.265 | 比 `1/V` 小几个数量级，几乎所有项下溢到 0，信号只剩最上面几个百分点 |
-| **`geomean`（默认）** | 尾部中段 | 合成数据上 ≈ 0.585 | —— |
+| **`geomean`（默认）** | 尾部中段 | 合成数据上 ≈ 0.585 | 有分辨力，但 `s` 随 run 变化，**只能自比** |
+
+论文举例的 `s = min SoftMax(x_raw)` 已移除：量级 ~1e-11，比 `1/V` 小几个数量级，
+几乎所有项下溢到 0（实测均值 0.051 / p50 **0.013** / p95 0.265，信号只剩最上面几个百分点），
+而且它同样是 per-run 的参考值。
 
 `geomean` = **未经 SegLU 调制**的同一行 logits 过 temperature-1 softmax 后，**其自身无关项**
 概率的几何平均，即 `log s = mean_{l ∈ ref 的无关集}(x_ref,l − logsumexp(x_ref))`。
@@ -97,8 +101,11 @@ S(x) = (1/L) · Σ_{x_l < ε} exp(−p_l / s)
 baseline 本身没有尾部（`n_tail = 0`）的行退化为 `1/V`。
 
 `ref_logits` 由 monitor 在 hook 里用 head 的权重把 baseline 重算一遍得到；拿不到（上游只交出
-调制后的结果）时退化为 `uniform`。`sparsity_ref=<常数>` 优先于所有 mode，用来固定一个跨实验
-可比的参考。
+调制后的结果）时退化为 `uniform`。
+
+> **跨模型对比必须用 `sparsity_ref=<常数>`。** `geomean` 是每个 run 用自己的 baseline 尾部
+> 当尺子，两个模型各自被自己的尺子量，比出来的 `S` 没有意义。要回答「MultiMax 模型是不是比
+> softmax baseline 更稀疏」，必须给两个 run 传同一个常数 `s`。
 
 比值按 `exp(x_l − log_z − log s)` 在对数空间求值，因此在 LM head 的词表规模下
 （fp32 里 `φ_min` 会下溢成 0）不会有下溢问题。
@@ -127,8 +134,8 @@ softmax 单调，所以定义不变；`prob_eps = 1/V` 的含义是「概率超�
 | `entropy_norm` | `H / log V` | 归一化到 `[0,1]`，跨词表可比 |
 | `top1_prob` | `φ(x)_max` | 最大概率 |
 | `top10_prob` | `Σ top-10 φ(x)` | 前 10 项的概率质量；与 `top1_prob` 的差 = 第 2~10 名分掉多少 |
-| `relevant_count` | `N` | Def 3.2 的样本量，用来核对 ε 是否选得合理 |
-| `sparse_count` | `L` | Def 3.3 的样本量，同上 |
+| `relevant_count` | `N` | ε 划分的相关项个数，只用来核对 ε 是否选得合理 |
+| `sparse_count` | `L` | Def 3.3 的样本量，同上；`N + L + 1` 应正好等于 V |
 | `range_0..3` / `t_0..3` | `multimax_ranges` / `multimax_ts` 的四个分量 | 全为 0 = SegLU 还是恒等，即 multimax 没开始学 |
 
 全部键都落在 `multimax/global_{metric}`：LM head 不是逐层结构，没有 layer 维度。
@@ -136,7 +143,7 @@ softmax 单调，所以定义不变；`prob_eps = 1/V` 的含义是「概率超�
 ### 5. `*_p50` / `*_p95` / `*_p98`：同一 step 内 token 的分布
 
 上面每个按 token 求均值的指标（`entropy`、`entropy_norm`、`top1_prob`、`top10_prob`、
-`multi_modality`、`sparsity`、`relevant_count`、`sparse_count`）都额外报三个分位数，
+`multi_modality_top10`、`sparsity`、`relevant_count`、`sparse_count`）都额外报三个分位数，
 取的是这一批采样 token 的**最近秩分位**（nearest-rank，秩 `ceil(q·n)`）：
 
 ```
@@ -148,9 +155,9 @@ p50 = 典型 token,   p95 / p98 = 尾部落在哪
 下沿会跑出定义域（熵的下沿变成负数），而且 σ 会被尾部拉大到超过均值本身，读起来像是
 「指标不稳」，其实只是分布偏斜。分位数不假设对称，直接回答「典型值在哪、尾巴在哪」。
 
-掩码与均值完全一致：无效行（M 的 N = 0、S 的 L = 0）在排序前被推到 `+inf`，
-分位下标由有效行数（张量）算出，所以 `multi_modality_p50` 只看 N > 0 的行、
-`sparsity_p50` 只看 L > 0 的行。整个过程没有 python 层过滤，因此不会在热路径上触发 D2H 同步。
+掩码与均值完全一致：无效行（S 的 L = 0）在排序前被推到 `+inf`，
+分位下标由有效行数（张量）算出，所以 `sparsity_p50` 只看 L > 0 的行。
+整个过程没有 python 层过滤，因此不会在热路径上触发 D2H 同步。
 
 viewer 把 `p50~p95` 画成均值曲线周围的阴影，`p98` 只在 hover 里给，避免图上线条过多。
 
@@ -197,13 +204,14 @@ setup_monitors(model, monitors=["multimax"], monitor_interval=100,
   `multi_modality_top{k}`）。
 - `prob_eps`（默认 `None` → `1/V`）/ `logit_eps`（默认 `None`）：ε 的两种给法，后者优先。
 - `sparsity_ref`（默认 `None`）：Def 3.3 的参考概率 `s` 取常数，优先于 mode。
-- `sparsity_ref_mode`（默认 `"geomean"`，可选 `"min"` / `"uniform"`）：不给常数时 `s` 怎么从
+  **跨模型/跨 run 对比时必须显式给同一个常数**，否则每个 run 用自己的尺子。
+- `sparsity_ref_mode`（默认 `"geomean"`，可选 `"uniform"`）：不给常数时 `s` 怎么从
   未调制 logits 推出来（见「Sparsity」一节的对比表）。
 
 ## 判读
 
 - `range_*` / `t_*` 恒为 0：SegLU 没在学，先查 `[MULTIMAX-LMHEAD-APPLIED]` 日志有没有出现。
-- M 与 S **同时**上升：这是论文期望的 Pareto 改善方向。
+- `multi_modality_top10` 与 `sparsity` **同时**上升：这是论文期望的 Pareto 改善方向。
 - 一个升一个降：退化成了温度调参的权衡，说明调制没带来额外收益。
 - `entropy` 与 `top1_prob` 反向变化属正常；两者同时下降说明概率质量从 top-1 流向了 2~10 名，
   配合 `top10_prob` 一起看。

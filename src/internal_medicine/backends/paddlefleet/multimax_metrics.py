@@ -17,6 +17,15 @@ logits) and ``eps`` a relevance threshold on the logits ``x``:
     Sparsity (Def 3.3), over the L entries with x_l < eps:
         S(x) = (1/L) * sum_l exp((s - phi(x)_l) / s - 1)
 
+``M`` is emitted with ``eps`` = the k-th largest entry, i.e. the relevant set is
+the top-k minus the max, so ``M_topk = 1 - (phi_max - mean(phi_2..phi_k))`` --
+"the average gap between top-1 and the other top-k entries". The eps-based form
+over the *full* relevant set was dropped (2026-08-22): at the default
+``eps = 1/V`` the set holds thousands of entries two to three orders of
+magnitude below ``phi_max``, so ``M`` collapses onto ``1 - top1_prob`` (measured
+gap constant at +0.023..+0.026 across three checkpoints) and carried no
+information ``top1_prob`` did not already have.
+
 ``S`` simplifies exactly: ``(s - p)/s - 1 == -p/s``, so each term is
 ``exp(-p_l / s)``. The paper leaves ``s`` free ("can be any reference value")
 and asks only that ``S`` stay a smooth step approximation normalized to
@@ -27,13 +36,13 @@ and asks only that ``S`` stay a smooth step approximation normalized to
 rather than sparsity, and is not comparable across steps because the reference
 moves with the distribution.
 
-The default reference is the uniform probability ``s = 1 / V``, which matches
-the default ``eps`` ("relevant" = beats uniform): every sparse entry then has
-``p_l < s``, terms live in ``(e^-1, 1)``, and the series is comparable across
-steps. ``sparsity_ref`` overrides it -- e.g. with the paper's example, the
-smallest probability of the *unmodulated* temperature-1 softmax. The ratio is
-evaluated as ``exp(x_l - log_z - log s)``, so nothing underflows at LM-head
-vocab sizes where ``phi_min`` rounds to 0 in fp32.
+``s`` defaults to the geometric mean of the *unmodulated* softmax's own tail
+(``sparsity_ref_mode="geomean"``), which sits mid-tail and so leaves ``S``
+responsive; ``"uniform"`` falls back to ``s = 1 / V``, where nearly every term
+saturates near 1. Both are per-run yardsticks -- **cross-model comparison
+requires passing an explicit constant ``sparsity_ref`` shared by every run.**
+The ratio is evaluated as ``exp(x_l - log_z - log s)``, so nothing underflows at
+LM-head vocab sizes where ``phi_min`` rounds to 0 in fp32.
 
 Hot-path discipline (``.claude/skills/monitor-hook-perf-rules``): every
 function here returns 0-dim GPU tensors and never syncs to host.
@@ -87,7 +96,7 @@ def _relevance_threshold(
     return math.log(p_eps) + log_z
 
 
-SPARSITY_REF_MODES = ("geomean", "min", "uniform")
+SPARSITY_REF_MODES = ("geomean", "uniform")
 
 
 def _sparsity_log_ref(
@@ -98,23 +107,30 @@ def _sparsity_log_ref(
     logit_eps: float | None = None,
     mode: str = "geomean",
 ) -> paddle.Tensor | float:
-    """``log s`` for Def 3.3, in priority order: explicit, baseline, uniform.
+    """``log s`` for Def 3.3, in priority order: explicit constant, then mode.
 
     Def 3.3 lets ``s`` be "any reference value for a non-linear scaling", with
     the smallest SoftMax(t=1) probability given as one example. The choice only
-    has to be independent of the row being scored -- but it decides where the
-    smooth step ``exp(-p_l/s)`` sits, and both extremes are useless in practice:
+    has to be independent of the row being scored, but it decides where the
+    smooth step ``exp(-p_l/s)`` sits:
 
-    * ``uniform`` (``s = 1/V``): every irrelevant entry is already below ``s``,
-      so all terms saturate near 1 and the score has no resolution.
-    * ``min`` (the paper's example, ``s = min SoftMax(x_raw)``): orders of
-      magnitude below ``1/V``, so nearly every term underflows to 0. Measured on
-      a live 44800-step run this gave ``S`` p50 = 0.013 with p95 = 0.265 -- all
-      signal in the top few percent of tokens.
+    * ``uniform`` (``s = 1/V``): a run-independent constant, but so large that
+      every irrelevant entry already sits below it -- the terms saturate near 1
+      (measured ~0.98) and the score has almost no resolution.
     * ``geomean`` (default): the geometric mean of the *baseline* tail
       probabilities, i.e. the mean of ``log phi_ref`` over the reference's own
       irrelevant set. That is a middle-of-the-tail reference, so a tail pushed
       below the baseline lands in the responsive part of the step.
+
+    **``geomean`` is per-run and not comparable across models.** It is derived
+    from that model's own unmodulated logits, so two runs are each scored against
+    their own yardstick: useful for watching one run evolve, wrong for "is the
+    MultiMax model sparser than the softmax baseline". Cross-model comparison
+    needs an explicit ``sparsity_ref`` constant shared by every run.
+
+    The paper's ``min SoftMax(x_raw)`` example was dropped: it is both a per-run
+    reference and orders of magnitude below ``1/V``, so nearly every term
+    underflows to 0 (measured on a live run: ``S`` p50 = 0.013).
 
     The baseline's tail is selected by the reference distribution's own ``eps``,
     never by the scored row's, so ``s`` stays independent of the modulation --
@@ -130,8 +146,6 @@ def _sparsity_log_ref(
     if ref.ndim > 2:
         ref = ref.reshape([-1, ref.shape[-1]])
     ref_log_z = paddle.logsumexp(ref, axis=-1, keepdim=True)
-    if mode == "min":
-        return ref.min(axis=-1, keepdim=True) - ref_log_z
     ref_eps = _relevance_threshold(ref_log_z, vocab_size, prob_eps, logit_eps)
     tail = (ref < ref_eps).astype("float32")
     n_tail = tail.sum(axis=-1, keepdim=True)
@@ -207,15 +221,16 @@ def compute_distribution_metrics(
     ``vocab_size`` defaults to the tile's last dim; pass it explicitly only if
     the tile is a strict subset of the vocab.
 
-    ``sparsity_ref`` pins Def 3.3's reference probability ``s`` to a constant;
-    otherwise ``sparsity_ref_mode`` picks how it is derived from ``ref_logits``
-    (``geomean`` / ``min`` / ``uniform``, see ``_sparsity_log_ref``). ``s`` must
-    never depend on the scored distribution (see the module docstring).
+    ``sparsity_ref`` pins Def 3.3's reference probability ``s`` to a constant --
+    the only setting that makes ``sparsity`` comparable across models. Otherwise
+    ``sparsity_ref_mode`` picks how it is derived from ``ref_logits``
+    (``geomean`` / ``uniform``, see ``_sparsity_log_ref``). ``s`` must never
+    depend on the scored distribution (see the module docstring).
 
     Returns 0-dim fp32 GPU tensors: ``entropy``, ``entropy_norm``,
-    ``top1_prob``, ``top{k}_prob``, ``multi_modality``,
-    ``multi_modality_top{k}``, ``sparsity``, ``relevant_count``,
-    ``sparse_count`` -- each with ``_p50`` / ``_p95`` / ``_p98`` companions.
+    ``top1_prob``, ``top{k}_prob``, ``multi_modality_top{k}``, ``sparsity``,
+    ``relevant_count``, ``sparse_count`` -- each with ``_p50`` / ``_p95`` /
+    ``_p98`` companions -- plus ``rows``.
     """
     x = logits.astype("float32")
     if x.ndim > 2:
@@ -232,19 +247,20 @@ def compute_distribution_metrics(
     # Entropy via H = log_z - E_p[x]: no separate log of the probabilities.
     entropy = log_z.squeeze(-1) - (p * x).sum(axis=-1)
 
-    # Def 3.2 -- relevant entries are eps < x_n < x_max (the max is excluded).
+    # Def 3.2's relevant set, kept only as an eps sanity check (see
+    # relevant_count): the metric built on it was dropped, because with the
+    # default eps = 1/V the set runs to ~1e3 entries whose probabilities are
+    # orders of magnitude below phi_max, so (1/N)sum(phi_max - phi_n) collapses
+    # onto phi_max and M becomes 1 - top1_prob (measured: the difference is
+    # pinned at +0.023..+0.026 across three checkpoints). The top-k form below
+    # is the one that tracks the head's shape.
     relevant = paddle.logical_and(x > eps, x < x_max).astype("float32")
     n_relevant = relevant.sum(axis=-1)
-    gap_sum = ((p_max - p) * relevant).sum(axis=-1)
-    multi_modality = 1.0 - gap_sum / paddle.clip(n_relevant, min=1.0)
-    # Rows whose only relevant entry is the max leave M undefined (N == 0);
-    # drop them from the mean instead of scoring them as fully multi-modal.
-    mm_valid = (n_relevant > 0).astype("float32")
 
     # Def 3.3 -- exp((s - p_l)/s - 1) == exp(-p_l/s), evaluated in log space as
     # exp(-exp(x_l - log_z - log s)) so phi_min underflow never appears. ``s`` is
-    # a fixed reference (default: uniform 1/V), never a statistic of this row --
-    # see the module docstring for why phi_min collapses the score onto e^-1/L.
+    # a fixed reference, never a statistic of this row -- see the module
+    # docstring for why phi_min collapses the score onto e^-1/L.
     # The set bound is strict, as in the paper: an entry sitting exactly at eps
     # belongs to neither set, so a uniform row (every entry at the threshold)
     # yields L == 0 and is dropped from the mean rather than scoring as
@@ -263,11 +279,7 @@ def compute_distribution_metrics(
 
     # Def 3.2 with eps = the k-th largest entry: the relevant set is the top-k
     # minus the max, so this is literally "the average gap between top-1 and the
-    # other top-k entries". Reported next to the eps-thresholded M because with
-    # the default eps = 1/V the relevant set runs to ~1e3 entries whose
-    # probabilities are orders of magnitude below phi_max, which drives M to
-    # 1 - top1_prob and leaves it carrying no independent information (measured:
-    # M - (1 - top1_prob) is pinned at +0.023..+0.026 across three checkpoints).
+    # other top-k entries", and its terms are comparable in magnitude to phi_max.
     if k > 1:
         mm_topk = 1.0 - (p_top[:, :1] - p_top[:, 1:].mean(axis=-1, keepdim=True)).squeeze(-1)
     else:
@@ -282,7 +294,6 @@ def compute_distribution_metrics(
         ("entropy_norm", entropy / log_v, None),
         ("top1_prob", p_max.squeeze(-1), None),
         (f"top{k}_prob", topk_mass, None),
-        ("multi_modality", multi_modality, mm_valid),
         (f"multi_modality_top{k}", mm_topk, None),
         ("sparsity", sparsity, sp_valid),
         ("relevant_count", n_relevant, None),

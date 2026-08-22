@@ -36,7 +36,6 @@ _DIST_METRICS = (
     "entropy",
     "entropy_norm",
     "top1_prob",
-    "multi_modality",
     "sparsity",
     "relevant_count",
     "sparse_count",

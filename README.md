@@ -7,7 +7,7 @@
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
-- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 14 指标；仅在开启 mHC 层时生效)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 指标，megatron 后端 16 指标；仅在开启 mHC 层时生效)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
@@ -430,10 +430,14 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 监控 mHC (Manifold-Constrained Hyper-Connections) 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`，
 以及 `x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)` 两项的相对大小。
 只在模型开启 mHC 层时生效，mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
-彻底 no-op。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 16 个指标，
+彻底 no-op。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 29 个指标，
 指标名以 `attn_` / `mlp_` 前缀区分；`branch_residual_share_max`、`h_res_logits_max`、
-`h_res_logits_grad_max`、`composite_amax_gain_{fwd,bwd}_max` 取极大值，`h_res_logits_min` 与
-`h_res_logits_grad_min` 取极小值，其余按 token/batch 求均值。
+`h_res_logits_grad_max`、`composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、
+`bias_{pre,post,res}_abs_max` 取极大值，`h_res_logits_min`、`h_res_logits_grad_min` 与
+`h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值。
+
+第 17-29 条对应论文 Eq. (7) 的静态与 pre-sigmoid 部分（`alpha` / `bias` / 门控 logits），
+**目前仅 paddlefleet 后端实现**，megatron 后端仍为前 16 条。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
@@ -453,8 +457,22 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 | 14 | `{c}_h_res_logits_grad_max` | `mhc_health/layer_{i}/{c}_h_res_logits_grad_max` | `max dL/dz` | 每层+全局 | 同上取最大值。AMP loss scale 被反除，不除 gradient accumulation。按 **max** 归约 |
 | 15 | `{c}_composite_amax_gain_fwd_max` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd_max` | 入口到当前 branch 的 attention/MLP 交错 prefix 最大绝对行和 | 每层+全局 | 按 **max** 跨 microbatch/层归约 |
 | 16 | `{c}_composite_amax_gain_bwd_max` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd_max` | 当前 branch 到模型尾部的 attention/MLP 交错 suffix 最大绝对列和 | 每层+全局 | 按 **max** 跨 microbatch/层归约 |
+| 17 | `{c}_h_pre_logits_min` | `mhc_health/layer_{i}/{c}_h_pre_logits_min` | `min(r·proj[:n]·α_pre + b_pre)` | 每层+全局 | `H_pre` 进 sigmoid 前的 logit 最小值，判断聚合门是否饱和到 0。按 **min** 归约 |
+| 18 | `{c}_h_pre_logits_max` | `mhc_health/layer_{i}/{c}_h_pre_logits_max` | 同上取最大值 | 每层+全局 | 判断聚合门是否饱和到 1。按 **max** 归约 |
+| 19 | `{c}_h_post_logits_min` | `mhc_health/layer_{i}/{c}_h_post_logits_min` | `min(r·proj[n:2n]·α_post + b_post)` | 每层+全局 | `H_post` 的 pre-sigmoid logit 最小值（因子 2 在 sigmoid 之外，不进 logit）。按 **min** 归约 |
+| 20 | `{c}_h_post_logits_max` | `mhc_health/layer_{i}/{c}_h_post_logits_max` | 同上取最大值 | 每层+全局 | 扩展门饱和哨兵。按 **max** 归约 |
+| 21 | `{c}_alpha_pre` | `mhc_health/layer_{i}/{c}_alpha_pre` | `α_pre`（标量参数） | 每层+全局 | 动态映射门控因子，从 `mhc_init_gating_factor` 起漂移 |
+| 22 | `{c}_alpha_post` | `mhc_health/layer_{i}/{c}_alpha_post` | `α_post` | 每层+全局 | 同上 |
+| 23 | `{c}_alpha_res` | `mhc_health/layer_{i}/{c}_alpha_res` | `α_res` | 每层+全局 | 同上；直接决定 Sinkhorn 输入 logits 的尺度 |
+| 24 | `{c}_bias_pre_mean` | `mhc_health/layer_{i}/{c}_bias_pre_mean` | `mean(bias[:n])` | 每层+全局 | `b_pre` 静态偏置均值（初始为 0） |
+| 25 | `{c}_bias_pre_abs_max` | `mhc_health/layer_{i}/{c}_bias_pre_abs_max` | `max\|bias[:n]\|` | 每层+全局 | 单元素跑飞哨兵。按 **max** 归约 |
+| 26 | `{c}_bias_post_mean` | `mhc_health/layer_{i}/{c}_bias_post_mean` | `mean(bias[n:2n])` | 每层+全局 | `b_post` 均值 |
+| 27 | `{c}_bias_post_abs_max` | `mhc_health/layer_{i}/{c}_bias_post_abs_max` | `max\|bias[n:2n]\|` | 每层+全局 | 同上取极值。按 **max** 归约 |
+| 28 | `{c}_bias_res_mean` | `mhc_health/layer_{i}/{c}_bias_res_mean` | `mean(bias[2n:])` | 每层+全局 | `b_res` 均值 |
+| 29 | `{c}_bias_res_abs_max` | `mhc_health/layer_{i}/{c}_bias_res_abs_max` | `max\|bias[2n:]\|` | 每层+全局 | 同上取极值。按 **max** 归约 |
 
-`{c}` ∈ `{attn, mlp}`。
+`{c}` ∈ `{attn, mlp}`。第 21-29 条是 step 级参数量，在 `on_optimizer_begin`（optimizer step 之前）读一次参数，
+不在热路径，且仅在本 step 确实跑过被监控的 forward 时记录。
 
 指标公式、采集路径、健康判读及论文 composite 定义统一维护在
 [`docs/mhc_health.md`](docs/mhc_health.md)，README 不再重复展开。

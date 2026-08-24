@@ -7,7 +7,7 @@
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
-- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 指标，megatron 后端 16 指标；仅在开启 mHC 层时生效)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 标量指标 + `n²+2n` 条逐元素映射序列，megatron 后端 16 指标；仅在开启 mHC 层时生效)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
@@ -473,6 +473,20 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 
 `{c}` ∈ `{attn, mlp}`。第 21-29 条是 step 级参数量，在 `on_optimizer_begin`（optimizer step 之前）读一次参数，
 不在热路径，且仅在本 step 确实跑过被监控的 forward 时记录。
+
+除上述 29 个标量外，paddlefleet 后端还额外产出 **每元素展开的映射序列**（`n² + 2n` 条 / hc 模块，`n = 4` 时 24 条，
+每层两个模块共 48 条）——即把 `h_res` 的 4×4 矩阵和 `h_pre` / `h_post` 两条 n 维向量逐元素记录，供还原论文
+Figure 10 那类映射热图使用：
+
+| 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
+|------|--------|------|------|----------|
+| `{c}_h_res_cell{k}` | `mhc_health/layer_{i}/{c}_h_res_cell{k}` | `mean_t(h_res[t, r, c])`，`k = r·n + c` 行主序 | 仅每层 | 残差混合矩阵的单个 cell。`h_res` 按 `compute_mappings` 返回的朝向记录（与 `amax_gain_fwd` 读的列和同一朝向，**非** composite 链式用的转置） |
+| `{c}_h_pre_idx{j}` | `mhc_health/layer_{i}/{c}_h_pre_idx{j}` | `mean_t(h_pre[t, j])` | 仅每层 | 第 `j` 条流的聚合门开度 |
+| `{c}_h_post_idx{j}` | `mhc_health/layer_{i}/{c}_h_post_idx{j}` | `mean_t(h_post[t, j])` | 仅每层 | 第 `j` 条流的扩展门开度 |
+
+这三组走 `declare_layer_vector` / `record_layer_vector`：
+热路径上每个映射只有一次 `add_`，而不是每个元素一个 kernel；并且**不派生 `global_*` 键**——单个 cell 在
+43 层上的均值没有判读意义。`log_per_layer=False` 时这三组整体不产出。
 
 指标公式、采集路径、健康判读及论文 composite 定义统一维护在
 [`docs/mhc_health.md`](docs/mhc_health.md)，README 不再重复展开。

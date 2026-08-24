@@ -70,6 +70,45 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 （并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，
 `{c}` ∈ `{attn, mlp}`；对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
 
+此外还有一组**逐元素展开的映射序列**（`n² + 2n` 条 / hc 模块），见下方「逐元素映射序列」。
+
+### 逐元素映射序列（h_res cell / h_pre、h_post per-stream）
+
+上面 29 个标量都是对 `h_res` / `h_pre` / `h_post` 做了某种聚合（均值、极值、行列和）之后的读数，
+因此无法回答「矩阵长什么样」——例如 `h_res` 是否退化成近似单位矩阵（各流互不混合）、还是某一列吸走了
+全部质量。论文 Figure 10 那类映射热图需要的是矩阵本身，所以这组指标把三个映射**逐元素**记录下来：
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_h_res_cell{k}` | `mean_t( h_res[t, r, c] )`，`k = r·n + c`（行主序） | 残差混合矩阵的单个 cell。对角元 = 该流的自我保留，非对角元 = 跨流混合 |
+| `{c}_h_pre_idx{j}` | `mean_t( h_pre[t, j] )` | 第 `j` 条流的聚合门开度 |
+| `{c}_h_post_idx{j}` | `mean_t( h_post[t, j] )` | 第 `j` 条流的扩展门开度 |
+
+**朝向**：`h_res_cell{k}` 记录的是 `compute_mappings` 返回的 `h_res` 本身，即与 `amax_gain_fwd`
+读列和时同一个朝向，**不是** composite 乘积链用的 `h_resᵀ`（见「amax-gain」一节）。读热图时
+行索引 `r = k // n`、列索引 `c = k % n`；按本文档的约定，**列**和是前向增益、**行**和是反向增益。
+
+**行/列和不必单独出指标**：mHC 的 `h_res` 经 Sinkhorn 投影后是双随机矩阵，行和与列和恒为 1
+（这也是 `amax_gain_{fwd,bwd}` 作为不变量守卫的依据）。论文 Figure 10 里标在 HC 那一行的
+forward/backward gain 之所以有信息量，是因为原始 HC 的映射没有这个约束；mHC 这一行标的就是 1.00。
+
+**实现方式**：这三组走 `declare_layer_vector` / `record_layer_vector`（与 `moe_health` 的 per-expert
+占比同一机制），而不是 `n² + 2n` 次 `record_layer_metric`。两个后果：
+
+- 热路径上每个映射只有一次向量 `add_`。若逐元素标量记录，`n = 4` 时每个模块每 microbatch 要多 24 次
+  kernel launch，43 层 × 2 模块 × 16 microbatch ≈ 33k 次/step，直接违反
+  `.claude/skills/monitor-hook-perf-rules` 的启动预算。
+- 向量指标**不参与 `global_*` 派生**：单个 cell 在 43 层上求均值没有判读意义。跨层视图交给 viewer
+  自己从各层曲线汇总。
+
+`h_res` 的 token 均值本来就要为 composite 乘积算一次（`_h_res_snapshot`），这组指标复用同一个 reduce，
+只多出一次 transpose 之外的 reshape，没有额外的归约开销。
+
+`log_per_layer=False` 时这三组整体不产出（`declare_layer_vector` 直接 return）。
+key 数量：`n = 4`、43 层、2 模块 = 2064 条逐层序列，是本 monitor 标量部分（29 × 2 × 43 ≈ 2494）的同量级。
+`cell` / `idx` 这两个 tag 刻意选了任何标量指标名都不含的词——`_s{j}` 会和已有的 `h_pre_std` 共享前缀，
+`_stream{j}` 会和 `h_post_stream_concentration` 冲突，都会破坏下游按前缀分组的逻辑。
+
 ### 门控统计（h_pre / h_post）
 
 | 指标 | 公式 | 诊断意义 |

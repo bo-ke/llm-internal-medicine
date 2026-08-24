@@ -1,4 +1,5 @@
 import importlib
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -322,6 +323,62 @@ class MHCMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["mhc_health/global_attn_amax_gain_bwd"], 1.0, places=5)
         self.assertAlmostEqual(latest["mhc_health/global_attn_composite_amax_gain_fwd_max"], 1.5, places=5)
         self.assertAlmostEqual(latest["mhc_health/global_attn_composite_amax_gain_bwd_max"], 1.0, places=5)
+
+    def test_per_element_mapping_series_are_recorded_row_major(self):
+        # The n^2 + 2n per-element curves. An asymmetric h_res pins the layout:
+        # cell{i} is row-major over h_res *as compute_mappings returns it*, so a
+        # stray transpose (the orientation the composite product needs) would
+        # swap cell1 and cell2.
+        n, s, b = 2, 2, 3
+        h_res = paddle.to_tensor([[0.1, 0.2], [0.3, 0.4]]).reshape([1, 1, n, n]).expand([s, b, n, n])
+        hc = FakeHC(
+            n=n,
+            h_pre=paddle.to_tensor([0.25, 0.75]).reshape([1, 1, n]).expand([s, b, n]),
+            h_post=paddle.to_tensor([1.0, 2.0]).reshape([1, 1, n]).expand([s, b, n]),
+            h_res=paddle.assign(h_res),
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            for i, expected in enumerate((0.1, 0.2, 0.3, 0.4)):
+                key = f"mhc_health/layer_0/{comp}_h_res_cell{i}"
+                self.assertIn(key, latest)
+                self.assertAlmostEqual(latest[key], expected, places=5)
+            for j, (pre, post) in enumerate(((0.25, 1.0), (0.75, 2.0))):
+                self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_pre_idx{j}"], pre, places=5)
+                self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_idx{j}"], post, places=5)
+
+        # Vector metrics must not spawn `global_*` keys: the mean of one cell over
+        # layers has no reading, and the flush-time derivation would emit it.
+        self.assertNotIn("mhc_health/global_attn_h_res_cell0", latest)
+        # The composite product still reads the transposed operator, unchanged by
+        # sharing the token-mean reduce with the new series.
+        self.assertIn("mhc_health/layer_0/attn_composite_amax_gain_fwd_max", latest)
+
+    def test_per_element_series_count_matches_n(self):
+        n, s, b = 4, 2, 3
+        model = _mhc_model([self._identity_layer(n, s, b)])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        # Exact `<tag><digits>` suffixes, not a substring test: `_h_pre_s` would
+        # also catch the scalar `h_pre_std`, which is what the `idx` tag avoids.
+        elem_re = re.compile(r"_(?:h_res_cell|h_pre_idx|h_post_idx)\d+$")
+        for comp in ("attn", "mlp"):
+            for tag, expected in (("h_res_cell", n * n), ("h_pre_idx", n), ("h_post_idx", n)):
+                found = [k for k in latest if re.search(rf"/{comp}_{tag}\d+$", k)]
+                self.assertEqual(len(found), expected, tag)
+        # 2 components x (n^2 + 2n) = 48 new per-layer keys at n=4.
+        self.assertEqual(len([k for k in latest if elem_re.search(k)]), 48)
 
     def test_logits_gradient_extrema_are_unscaled_without_changing_backward(self):
         n, s, b = 2, 1, 1

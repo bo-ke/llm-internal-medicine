@@ -108,6 +108,11 @@ _PARAM_METRICS = (
     "bias_res_abs_max",
 )
 
+def _vector_metric_specs(n: int) -> tuple[tuple[str, str, int], ...]:
+    """``(metric_name, elem_tag, size)`` for the per-element mapping series."""
+    return (("h_res", "cell", n * n), ("h_pre", "idx", n), ("h_post", "idx", n))
+
+
 # Extrema, not means: a worst case that a mean over 43 layers would bury. The
 # `_max` / `_min` suffixes keep training_logs' classifier in agreement on the
 # full key too.
@@ -270,9 +275,14 @@ class PaddleMHCHealthMonitor(PaddleProbe):
             entries = self._find_hc_modules(chunk)
             if not entries:
                 continue
-            for global_idx, comp, _ in entries:
+            for global_idx, comp, mod in entries:
                 for name in _METRIC_NAMES:
                     self.declare_layer_metric(global_idx, f"{comp}_{name}")
+                # `n` is static module metadata, so reading it at declare time
+                # costs no hot-path sync and keeps the schema fixed (Rule 3).
+                for name, tag, size in _vector_metric_specs(int(getattr(mod, "n", 0) or 0)):
+                    if size > 0:
+                        self.declare_layer_vector(global_idx, f"{comp}_{name}", size, elem_tag=tag)
             all_targets.append(entries)
         return all_targets
 
@@ -478,11 +488,20 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_fwd", amax_gain(h_res, axis=-2))
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_bwd", amax_gain(h_res, axis=-1))
 
-                    # Token-mean snapshot of the *operator* for the composite product.
+                    # Token-mean of every mapping element. One reduce feeds both
+                    # the per-cell series and the composite product's snapshot.
                     n = int(h_res.shape[-1])
-                    self._h_res_snapshot[(layer_idx, component)] = (
-                        h_res.astype("float32").reshape([-1, n, n]).mean(axis=0).transpose([1, 0])
+                    res_mean = h_res.astype("float32").reshape([-1, n, n]).mean(axis=0)
+                    self.record_layer_vector(layer_idx, f"{component}_h_res", res_mean.reshape([-1]))
+                    self.record_layer_vector(
+                        layer_idx, f"{component}_h_pre", h_pre.astype("float32").reshape([-1, n]).mean(axis=0)
                     )
+                    self.record_layer_vector(
+                        layer_idx, f"{component}_h_post", h_post.astype("float32").reshape([-1, n]).mean(axis=0)
+                    )
+
+                    # Token-mean snapshot of the *operator* for the composite product.
+                    self._h_res_snapshot[(layer_idx, component)] = res_mean.transpose([1, 0])
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[PaddleMHCMonitor] Error layer {layer_idx}/{component}: {e}")

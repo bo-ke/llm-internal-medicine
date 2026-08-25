@@ -63,11 +63,51 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 
 ## 监控指标
 
-每个 hc 模块产出 16 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 8 个），指标名以
+每个 hc 模块产出 29 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 16 个），指标名以
 `attn_` / `mlp_` 前缀区分。`branch_residual_share_max`、`h_res_logits_max`、`h_res_logits_grad_max`、
-`composite_amax_gain_{fwd,bwd}_max` 取极大值，`h_res_logits_min` 与 `h_res_logits_grad_min` 取极小值，其余按 token/batch 求均值
+`composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、`bias_{pre,post,res}_abs_max` 取极大值，
+`h_res_logits_min`、`h_res_logits_grad_min` 与 `h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值
 （并在 flush 时对 microbatch/rank 求均值）。日志键形如 `mhc_health/layer_{i}/{c}_{name}`，
 `{c}` ∈ `{attn, mlp}`；对应的 `mhc_health/global_{c}_{name}` 由逐层累加器在 flush 时自动派生。
+
+此外还有一组**逐元素展开的映射序列**（`n² + 2n` 条 / hc 模块），见下方「逐元素映射序列」。
+
+### 逐元素映射序列（h_res cell / h_pre、h_post per-stream）
+
+上面 29 个标量都是对 `h_res` / `h_pre` / `h_post` 做了某种聚合（均值、极值、行列和）之后的读数，
+因此无法回答「矩阵长什么样」——例如 `h_res` 是否退化成近似单位矩阵（各流互不混合）、还是某一列吸走了
+全部质量。论文 Figure 10 那类映射热图需要的是矩阵本身，所以这组指标把三个映射**逐元素**记录下来：
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_h_res_cell{k}` | `mean_t( h_res[t, r, c] )`，`k = r·n + c`（行主序） | 残差混合矩阵的单个 cell。对角元 = 该流的自我保留，非对角元 = 跨流混合 |
+| `{c}_h_pre_idx{j}` | `mean_t( h_pre[t, j] )` | 第 `j` 条流的聚合门开度 |
+| `{c}_h_post_idx{j}` | `mean_t( h_post[t, j] )` | 第 `j` 条流的扩展门开度 |
+
+**朝向**：`h_res_cell{k}` 记录的是 `compute_mappings` 返回的 `h_res` 本身，即与 `amax_gain_fwd`
+读列和时同一个朝向，**不是** composite 乘积链用的 `h_resᵀ`（见「amax-gain」一节）。读热图时
+行索引 `r = k // n`、列索引 `c = k % n`；按本文档的约定，**列**和是前向增益、**行**和是反向增益。
+
+**行/列和不必单独出指标**：mHC 的 `h_res` 经 Sinkhorn 投影后是双随机矩阵，行和与列和恒为 1
+（这也是 `amax_gain_{fwd,bwd}` 作为不变量守卫的依据）。论文 Figure 10 里标在 HC 那一行的
+forward/backward gain 之所以有信息量，是因为原始 HC 的映射没有这个约束；mHC 这一行标的就是 1.00。
+
+**实现方式**：这三组走 `declare_layer_vector` / `record_layer_vector`（与 `moe_health` 的 per-expert
+占比同一机制），而不是 `n² + 2n` 次 `record_layer_metric`。两个后果：
+
+- 热路径上每个映射只有一次向量 `add_`。若逐元素标量记录，`n = 4` 时每个模块每 microbatch 要多 24 次
+  kernel launch，43 层 × 2 模块 × 16 microbatch ≈ 33k 次/step，直接违反
+  `.claude/skills/monitor-hook-perf-rules` 的启动预算。
+- 向量指标**不参与 `global_*` 派生**：单个 cell 在 43 层上求均值没有判读意义。跨层视图交给 viewer
+  自己从各层曲线汇总。
+
+`h_res` 的 token 均值本来就要为 composite 乘积算一次（`_h_res_snapshot`），这组指标复用同一个 reduce，
+只多出一次 transpose 之外的 reshape，没有额外的归约开销。
+
+`log_per_layer=False` 时这三组整体不产出（`declare_layer_vector` 直接 return）。
+key 数量：`n = 4`、43 层、2 模块 = 2064 条逐层序列，是本 monitor 标量部分（29 × 2 × 43 ≈ 2494）的同量级。
+`cell` / `idx` 这两个 tag 刻意选了任何标量指标名都不含的词——`_s{j}` 会和已有的 `h_pre_std` 共享前缀，
+`_stream{j}` 会和 `h_post_stream_concentration` 冲突，都会破坏下游按前缀分组的逻辑。
 
 ### 门控统计（h_pre / h_post）
 
@@ -152,6 +192,53 @@ hook 热路径只在 GPU 上计算 fp32 min/max 并写 0 维 accumulator。AMP �
 `on_optimizer_begin`（`scaler.step/update` 之前）用本 step loss scale 统一反除；不除 gradient accumulation，保留每个
 microbatch 在真实反向路径上的 activation-gradient 量级。recompute 的首次 forward 运行于 `no_grad`，由现有
 `_should_monitor()` 跳过；grad-enabled backward replay 再注册 hook，因此不会重复采集 checkpoint 的首次执行。
+
+### 门控 logits 范围（h_pre / h_post，pre-sigmoid）
+
+Eq. (8) 的 `H_pre = σ(·)`、`H_post = 2σ(·)` 把值域压进 `(0,1)` / `(0,2)`，饱和后从激活值已经看不出来
+logit 有多极端。这两对指标读的是 sigmoid **之前**的 Eq. (7) 结果：
+
+```
+h_pre_logits  = r · proj[..., :n]    · α_pre  + b_pre
+h_post_logits = r · proj[..., n:2n]  · α_post + b_post
+```
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_h_pre_logits_min` | `min` 上式 | 聚合门是否饱和到 0。按 **min** 归约 |
+| `{c}_h_pre_logits_max` | `max` 上式 | 聚合门是否饱和到 1。按 **max** 归约 |
+| `{c}_h_post_logits_min` | `min` 上式 | 扩展门下饱和哨兵。按 **min** 归约 |
+| `{c}_h_post_logits_max` | `max` 上式 | 扩展门上饱和哨兵。按 **max** 归约 |
+
+`_compute_h` 只返回激活后的门，所以这四条由 monitor 在 wrap 点用它自己的入参 `(proj, r)` 加模块的
+`alpha` / `bias` **按同一行公式重算**（`mhc_metrics.gate_logits_extrema`），不是对 sigmoid 求逆——求逆会
+把所有饱和元素丢成 `±inf`，恰好丢掉这两条指标存在的意义。代价是与模型实现耦合：`_compute_h` 里
+`h` 的构成方式一旦改变，这四条会静默算错，改模型时必须同步。`H_post` 的因子 2 在 sigmoid 之外，不进 logit。
+
+调用方没有传 `proj` / `r` 时（stub、或未来绕过该签名的 fused 路径）这四个累加器保持为空，不写值。
+
+### Eq. (7) 静态参数（alpha / bias）
+
+论文 Eq. (7) 的静态半边：三个标量门控因子 `α_pre` / `α_post` / `α_res`，以及一个 `[n² + 2n]` 的
+`bias`——它按切片承担论文的 `b^pre`（`[:n]`）/ `b^post`（`[n:2n]`）/ `b^res`（`[2n:]`），因此分片统计而不是
+合成一个数。
+
+| 指标 | 公式 | 诊断意义 |
+|------|------|----------|
+| `{c}_alpha_pre` / `{c}_alpha_post` / `{c}_alpha_res` | 参数值 | 动态映射门控因子，从 `mhc_init_gating_factor` 起漂移；`α_res` 直接决定 Sinkhorn 输入 logits 的尺度 |
+| `{c}_bias_{pre,post,res}_mean` | `mean(bias 切片)` | 静态偏置整体位置（初始为 0） |
+| `{c}_bias_{pre,post,res}_abs_max` | `max abs(bias 切片)` | 单元素跑飞哨兵，均值会掩盖它。按 **max** 归约 |
+
+采集在 `on_optimizer_begin`（经 `finalize_scaled_grad_metrics`）读一次参数，不在热路径——否则 9 条 × 层数 ×
+2 component × microbatch 数会平白多出上万次 kernel launch。选这个钩子而不是 flush 是因为它在
+`optimizer.step()` **之前**，读到的是本 step forward 实际用的参数值；`_flush_buffers` 保留为兜底路径（`on_step_end`
+在 optimizer step 之后，走兜底时记到的是更新后的值，比同 step 其余曲线晚一次更新）。两处都调也只记一次。
+参数在 TP 各 rank 上是同一份副本（`HyperConnectionModule` 用普通 `nn.Linear` 并把参数标记为
+`is_distributed=False`），所以不需要任何 collective。
+
+只有本 step 真正跑过被监控的 forward 才记录（`_captured_this_step`），这样 `monitor_interval > 1` 时参数曲线
+与激活曲线落在同一批 step 上。注意命名是 `bias_*_abs_max` 而不是 `bias_*_absmax`：`training_logs` 的
+max/min 分类器按 `_max` 后缀字面匹配。
 
 ### 复合映射（composite_amax_gain_{fwd,bwd}_max）
 

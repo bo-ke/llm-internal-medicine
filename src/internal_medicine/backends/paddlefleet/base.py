@@ -36,6 +36,10 @@ class PaddleProbe(Probe):
         self._layer_metric_groups: dict[str, tuple[str, list[str]]] = {}
         self._layer_metric_keys: set[str] = set()  # 所有 per-layer key，用于 flush 时判断是否输出
         self._disabled_keys: set[str] = set()  # log_global=False 时被禁用的 global keys
+        self._vector_keys: dict[str, int] = {}  # per-layer 向量 key → 长度
+        self._gpu_vec: dict[str, paddle.Tensor] = {}  # per-layer 向量累加器 [size]
+        self._gpu_vec_cnt: dict[str, int] = {}
+        self._vector_elem_keys: dict[str, list[str]] = {}  # 向量 key → 展开后的逐元素 key
         self._mtp_layer_ids: set[int] = set()
         self._buffers_allocated = False
 
@@ -98,11 +102,16 @@ class PaddleProbe(Probe):
         for k in self._min_keys:
             self._gpu_acc[k] = paddle.full((), float("inf"), dtype=dtype)
             self._gpu_cnt[k] = 0
+        # vector: 每层一条 [size] 累加器，flush 时按元素展开成独立 key
+        for k, size in self._vector_keys.items():
+            self._gpu_vec[k] = paddle.zeros([size], dtype=dtype)
+            self._gpu_vec_cnt[k] = 0
         self._buffers_allocated = True
         if self.verbose:
             logger.info(
                 f"[{self.METRIC_PREFIX}] GPU buffer: "
-                f"mean={len(self._mean_keys)} max={len(self._max_keys)} min={len(self._min_keys)}"
+                f"mean={len(self._mean_keys)} max={len(self._max_keys)} min={len(self._min_keys)} "
+                f"vector={len(self._vector_keys)}"
             )
 
     def record_mean(self, key: str, val: paddle.Tensor) -> None:
@@ -212,6 +221,36 @@ class PaddleProbe(Probe):
         else:
             self.record_mean(layer_key, val)
 
+    # ------------------------------------------------------------------
+    # Per-layer vector metrics (one curve per element, e.g. per expert)
+    # ------------------------------------------------------------------
+
+    def declare_layer_vector(self, layer_idx: int, metric_name: str, size: int, elem_tag: str = "e") -> None:
+        """声明一个 per-layer 向量指标，mean 聚合，flush 时展开为 ``{key}_{elem_tag}{i}``。
+
+        用于「每层每个元素一条曲线」的指标（例如每个专家的占比）：热路径上整条
+        向量只有一次 ``add_``，而不是每个元素一个 kernel。向量指标不参与 global
+        派生 —— 跨层视图由 viewer 自己从各层曲线汇总。
+        """
+        assert not self._buffers_allocated, f"declare_layer_vector({metric_name!r}) after allocate_buffers"
+        if not self.log_per_layer:
+            return
+        key = self._layer_key(layer_idx, metric_name)
+        assert key not in self._vector_keys, f"declare_layer_vector({key!r}) declared twice"
+        size = int(size)
+        assert size > 0
+        self._vector_keys[key] = size
+        self._vector_elem_keys[key] = [f"{key}_{elem_tag}{i}" for i in range(size)]
+
+    def record_layer_vector(self, layer_idx: int, metric_name: str, vec: paddle.Tensor) -> None:
+        """热路径：整条 ``[size]`` 向量一次就地累加，不触发 D2H 同步。"""
+        key = self._layer_key(layer_idx, metric_name)
+        buf = self._gpu_vec.get(key)
+        if buf is None:  # log_per_layer=False 或该层未声明
+            return
+        buf.add_(vec.detach().astype(buf.dtype))
+        self._gpu_vec_cnt[key] += 1
+
     def _emits_layer_key(self, key: str) -> bool:
         """per-layer key 是否写进日志（global 派生不受此影响）。"""
         if key not in self._layer_metric_keys:
@@ -219,7 +258,7 @@ class PaddleProbe(Probe):
         return self.log_per_layer
 
     def _flush_gpu_buffer(self) -> dict[str, float]:
-        """单次批量 D2H：收集所有累加器 → 推导 global → stack→cpu→tolist → 重置。"""
+        """单次批量 D2H：收集所有累加器 → 推导 global → concat→cpu→tolist → 重置。"""
         keys: list[str] = []
         tensors: list[paddle.Tensor] = []
 
@@ -264,11 +303,25 @@ class PaddleProbe(Probe):
                     tensors.append(paddle.stack([self._gpu_acc[lk] for lk in active]).min())
                 keys.append(global_key)
 
-        # 5) 唯一 D2H 同步点：一次 stack → cpu → tolist
+        # 5) 唯一 D2H 同步点：一次 concat → cpu → tolist（标量与向量共用）
+        vec_key_groups: list[list[str]] = []
+        vec_tensors: list[paddle.Tensor] = []
+        for k, elem_keys in self._vector_elem_keys.items():
+            cnt = self._gpu_vec_cnt[k]
+            if cnt == 0:
+                continue
+            vec_key_groups.append(elem_keys)
+            vec_tensors.append(self._gpu_vec[k] / cnt)
+
         out: dict[str, float] = {}
-        if tensors:
-            vals = paddle.stack(tensors).cpu().tolist()
+        if tensors or vec_tensors:
+            flat = paddle.concat([t.reshape([-1]) for t in tensors] + vec_tensors)
+            vals = flat.cpu().tolist()
             out = dict(zip(keys, vals, strict=False))
+            offset = len(keys)
+            for elem_keys in vec_key_groups:
+                out.update(zip(elem_keys, vals[offset : offset + len(elem_keys)], strict=False))
+                offset += len(elem_keys)
 
         # 6) 重置所有累加器，为下一个 step 准备
         for k in self._mean_keys:
@@ -280,4 +333,7 @@ class PaddleProbe(Probe):
         for k in self._min_keys:
             paddle.assign(paddle.full((), float("inf"), dtype=self._gpu_acc[k].dtype), self._gpu_acc[k])
             self._gpu_cnt[k] = 0
+        for k in self._vector_keys:
+            self._gpu_vec[k].zero_()
+            self._gpu_vec_cnt[k] = 0
         return out

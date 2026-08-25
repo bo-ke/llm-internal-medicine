@@ -1,6 +1,6 @@
 """mHC Health Monitor for PaddleFleet.
 
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 16
+Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 29
 series, name-prefixed by component:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
@@ -11,6 +11,16 @@ series, name-prefixed by component:
     {attn,mlp}_h_res_logits_min  {attn,mlp}_h_res_logits_max
     {attn,mlp}_h_res_logits_grad_min  {attn,mlp}_h_res_logits_grad_max
     {attn,mlp}_composite_amax_gain_fwd_max  {attn,mlp}_composite_amax_gain_bwd_max
+    {attn,mlp}_h_pre_logits_min   {attn,mlp}_h_pre_logits_max
+    {attn,mlp}_h_post_logits_min  {attn,mlp}_h_post_logits_max
+    {attn,mlp}_alpha_pre  {attn,mlp}_alpha_post  {attn,mlp}_alpha_res
+    {attn,mlp}_bias_pre_mean   {attn,mlp}_bias_pre_abs_max
+    {attn,mlp}_bias_post_mean  {attn,mlp}_bias_post_abs_max
+    {attn,mlp}_bias_res_mean   {attn,mlp}_bias_res_abs_max
+
+The last 13 cover paper Eq. (7) — the ``alpha`` / ``bias`` / pre-sigmoid-logit
+terms that feed Eq. (8) — and were added for the algorithm side. The nine
+parameter series are step-level and are read once per flush, off the hot path.
 
 Forward hooks are not enough, so three bound methods are wrapped instead (see
 ``mhc_metrics`` for what each metric means):
@@ -32,9 +42,11 @@ from .layer_discovery import get_decoder_layers, iter_monitor_layers
 from .mhc_metrics import (
     amax_gain,
     branch_residual_share,
+    gate_logits_extrema,
     gate_stats,
     h_post_structure_stats,
     h_res_logits_extrema,
+    mapping_param_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,7 +80,38 @@ _METRIC_NAMES = (
     "h_res_logits_grad_max",
     "composite_amax_gain_fwd_max",
     "composite_amax_gain_bwd_max",
+    "h_pre_logits_min",
+    "h_pre_logits_max",
+    "h_post_logits_min",
+    "h_post_logits_max",
+    "alpha_pre",
+    "alpha_post",
+    "alpha_res",
+    "bias_pre_mean",
+    "bias_pre_abs_max",
+    "bias_post_mean",
+    "bias_post_abs_max",
+    "bias_res_mean",
+    "bias_res_abs_max",
 )
+
+# Read once per flush from the module parameters, not from the hot path.
+_PARAM_METRICS = (
+    "alpha_pre",
+    "alpha_post",
+    "alpha_res",
+    "bias_pre_mean",
+    "bias_pre_abs_max",
+    "bias_post_mean",
+    "bias_post_abs_max",
+    "bias_res_mean",
+    "bias_res_abs_max",
+)
+
+def _vector_metric_specs(n: int) -> tuple[tuple[str, str, int], ...]:
+    """``(metric_name, elem_tag, size)`` for the per-element mapping series."""
+    return (("h_res", "cell", n * n), ("h_pre", "idx", n), ("h_post", "idx", n))
+
 
 # Extrema, not means: a worst case that a mean over 43 layers would bury. The
 # `_max` / `_min` suffixes keep training_logs' classifier in agreement on the
@@ -80,9 +123,21 @@ _MAX_METRICS = frozenset(
         "h_res_logits_grad_max",
         "composite_amax_gain_fwd_max",
         "composite_amax_gain_bwd_max",
+        "h_pre_logits_max",
+        "h_post_logits_max",
+        "bias_pre_abs_max",
+        "bias_post_abs_max",
+        "bias_res_abs_max",
     }
 )
-_MIN_METRICS = frozenset({"h_res_logits_min", "h_res_logits_grad_min"})
+_MIN_METRICS = frozenset(
+    {
+        "h_res_logits_min",
+        "h_res_logits_grad_min",
+        "h_pre_logits_min",
+        "h_post_logits_min",
+    }
+)
 
 # (component_name, layer attribute) — attn runs before mlp in the layer forward.
 _COMPONENTS = (
@@ -148,6 +203,14 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         self._h_res_snapshot: dict[tuple[int, str], paddle.Tensor] = {}
         # MTP layers are off the main trunk and must not enter the product.
         self._mtp_layer_ids: set[int] = set()
+        # (layer_idx, component, module) for the step-level parameter series.
+        self._param_targets: list[tuple[int, str, nn.Layer]] = []
+        # Set by the capture wrapper: whether this step's forward was monitored.
+        # A plain bool assignment, so it costs nothing on the hot path, and it
+        # keeps the parameter series on exactly the steps the rest are on
+        # (`_should_monitor()` cannot answer that at flush time — `step()` has
+        # already incremented `step_count` by then).
+        self._captured_this_step = False
         # Gradient hooks see AMP-scaled activation gradients. The callback
         # finalizes these accumulators with this step's scale before flush.
         self._grad_metrics_finalized = False
@@ -212,9 +275,14 @@ class PaddleMHCHealthMonitor(PaddleProbe):
             entries = self._find_hc_modules(chunk)
             if not entries:
                 continue
-            for global_idx, comp, _ in entries:
+            for global_idx, comp, mod in entries:
                 for name in _METRIC_NAMES:
                     self.declare_layer_metric(global_idx, f"{comp}_{name}")
+                # `n` is static module metadata, so reading it at declare time
+                # costs no hot-path sync and keeps the schema fixed (Rule 3).
+                for name, tag, size in _vector_metric_specs(int(getattr(mod, "n", 0) or 0)):
+                    if size > 0:
+                        self.declare_layer_vector(global_idx, f"{comp}_{name}", size, elem_tag=tag)
             all_targets.append(entries)
         return all_targets
 
@@ -224,9 +292,10 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                 orig = mod.compute_mappings
                 mod.compute_mappings = self._make_capture(orig, layer_idx, comp)
                 self._wrapped.append((mod, "compute_mappings", orig))
+                self._param_targets.append((layer_idx, comp, mod))
                 orig_h = getattr(mod, "_compute_h", None)
                 if orig_h is not None:
-                    mod._compute_h = self._make_logits_capture(orig_h, layer_idx, comp)
+                    mod._compute_h = self._make_logits_capture(orig_h, layer_idx, comp, mod)
                     self._wrapped.append((mod, "_compute_h", orig_h))
                 orig_bda = getattr(mod, "fused_h_res_h_post_bda", None)
                 if orig_bda is None:
@@ -255,6 +324,7 @@ class PaddleMHCHealthMonitor(PaddleProbe):
             except AttributeError:
                 setattr(mod, attr, orig)
         self._wrapped = []
+        self._param_targets = []
         self._h_res_snapshot.clear()
         super().remove_hooks()
 
@@ -319,6 +389,11 @@ class PaddleMHCHealthMonitor(PaddleProbe):
 
     def finalize_scaled_grad_metrics(self, scaler=None) -> None:
         """Remove AMP loss scaling from this step's logits-gradient extrema."""
+        # `on_optimizer_begin` is the last hook before `optimizer_step()`, so it
+        # is also where the Eq. (7) parameters still hold the values this step's
+        # forward actually used. Called outside the guard below and idempotent
+        # within a step, so the `_flush_buffers` fallback stays harmless.
+        self.finalize_param_metrics()
         if self._grad_metrics_finalized:
             return
         scale = getattr(scaler, "_scale", None) if scaler is not None else None
@@ -329,8 +404,54 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                     self._gpu_acc[key].divide_(scale)
         self._grad_metrics_finalized = True
 
+    def finalize_param_metrics(self) -> None:
+        """Record the step-level ``alpha`` / ``bias`` series from the parameters.
+
+        Cold path: once per step, so nine tiny reductions per module instead of
+        per microbatch. Skipped entirely when this step's forward was not
+        monitored, which keeps these series sampled on the same steps as the
+        activation ones under ``monitor_interval > 1`` — ``_should_monitor()``
+        cannot answer that here, because ``step()`` increments ``step_count``
+        before ``_flush_buffers`` runs.
+
+        Read point is ``on_optimizer_begin`` (via ``finalize_scaled_grad_metrics``),
+        i.e. *before* ``optimizer.step()``, so the values line up with the forward
+        that produced this step's activation metrics. A caller that only drives
+        ``step()`` (direct users, and PaddleFormers' ``on_step_end`` runs after
+        the optimizer) falls back to the flush path and therefore logs the
+        post-update value — one update later than the rest of the step's series.
+
+        The parameters are replicated across TP ranks (``HyperConnectionModule``
+        uses a plain ``nn.Linear`` and marks its params ``is_distributed=False``),
+        so no collective is needed — every rank holds the same values.
+        """
+        if not self._captured_this_step:
+            return
+        try:
+            for layer_idx, component, mod in self._param_targets:
+                try:
+                    with paddle.no_grad():
+                        stats = mapping_param_stats(
+                            mod.alpha_pre,
+                            mod.alpha_post,
+                            mod.alpha_res,
+                            mod.bias,
+                            int(mod.n),
+                        )
+                    for name, value in stats.items():
+                        self.record_layer_metric(layer_idx, f"{component}_{name}", value)
+                except Exception as e:
+                    # Per module, so one module without the Eq. (7) parameters
+                    # cannot silence the series for every other layer.
+                    if self.verbose:
+                        logger.error(f"[PaddleMHCMonitor] Error mapping params {layer_idx}/{component}: {e}")
+        finally:
+            self._captured_this_step = False
+
     def _flush_buffers(self) -> None:
         # Direct users and non-AMP trainers may not emit on_optimizer_begin.
+        # finalize_scaled_grad_metrics also covers the parameter series, so this
+        # is the fallback read point for both.
         self.finalize_scaled_grad_metrics()
         self.finalize_composite_microbatch()
         super()._flush_buffers()
@@ -349,6 +470,7 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                 return out
             try:
                 h_pre, h_post, h_res = out
+                self._captured_this_step = True
                 with paddle.no_grad():
                     h_pre = h_pre.detach()
                     h_post = h_post.detach()
@@ -366,11 +488,20 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_fwd", amax_gain(h_res, axis=-2))
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_bwd", amax_gain(h_res, axis=-1))
 
-                    # Token-mean snapshot of the *operator* for the composite product.
+                    # Token-mean of every mapping element. One reduce feeds both
+                    # the per-cell series and the composite product's snapshot.
                     n = int(h_res.shape[-1])
-                    self._h_res_snapshot[(layer_idx, component)] = (
-                        h_res.astype("float32").reshape([-1, n, n]).mean(axis=0).transpose([1, 0])
+                    res_mean = h_res.astype("float32").reshape([-1, n, n]).mean(axis=0)
+                    self.record_layer_vector(layer_idx, f"{component}_h_res", res_mean.reshape([-1]))
+                    self.record_layer_vector(
+                        layer_idx, f"{component}_h_pre", h_pre.astype("float32").reshape([-1, n]).mean(axis=0)
                     )
+                    self.record_layer_vector(
+                        layer_idx, f"{component}_h_post", h_post.astype("float32").reshape([-1, n]).mean(axis=0)
+                    )
+
+                    # Token-mean snapshot of the *operator* for the composite product.
+                    self._h_res_snapshot[(layer_idx, component)] = res_mean.transpose([1, 0])
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[PaddleMHCMonitor] Error layer {layer_idx}/{component}: {e}")
@@ -378,8 +509,15 @@ class PaddleMHCHealthMonitor(PaddleProbe):
 
         return wrapped
 
-    def _make_logits_capture(self, orig, layer_idx: int, component: str):
-        """Wrap ``_compute_h`` to record the saturation sentinel."""
+    def _make_logits_capture(self, orig, layer_idx: int, component: str, mod):
+        """Wrap ``_compute_h`` to record the saturation sentinels.
+
+        Two families come from here: the residual-mixing logits (the real return
+        value) and the pre-sigmoid ``H_pre`` / ``H_post`` logits, which
+        ``_compute_h`` does not return and are therefore rebuilt from its own
+        ``(proj, r)`` arguments plus ``mod``'s ``alpha`` / ``bias`` — see
+        ``gate_logits_extrema``.
+        """
 
         def wrapped(proj, r):
             out = orig(proj, r)  # the real mappings the model consumes — returned unchanged
@@ -406,8 +544,7 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                         except Exception as e:
                             if self.verbose:
                                 logger.error(
-                                    f"[PaddleMHCMonitor] Error logits gradient "
-                                    f"layer {layer_idx}/{component}: {e}"
+                                    f"[PaddleMHCMonitor] Error logits gradient layer {layer_idx}/{component}: {e}"
                                 )
                         return grad
 
@@ -415,6 +552,21 @@ class PaddleMHCHealthMonitor(PaddleProbe):
                 with paddle.no_grad():
                     for name, value in h_res_logits_extrema(h_res_logits).items():
                         self.record_layer_metric(layer_idx, f"{component}_{name}", value)
+                    # proj / r are the only route to the pre-sigmoid pre/post
+                    # logits; a caller that does not supply them (a stub, or a
+                    # future fused path that bypasses this signature) simply
+                    # leaves those four accumulators empty.
+                    if proj is not None and r is not None:
+                        gate_logits = gate_logits_extrema(
+                            proj,
+                            r,
+                            mod.alpha_pre,
+                            mod.alpha_post,
+                            mod.bias,
+                            int(mod.n),
+                        )
+                        for name, value in gate_logits.items():
+                            self.record_layer_metric(layer_idx, f"{component}_{name}", value)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[PaddleMHCMonitor] Error logits layer {layer_idx}/{component}: {e}")

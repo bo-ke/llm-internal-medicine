@@ -3,11 +3,11 @@
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
 包含十大监控模块：
-- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
+- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (28 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
-- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 14 指标；仅在开启 mHC 层时生效)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 标量指标 + `n²+2n` 条逐元素映射序列，megatron 后端 16 指标；仅在开启 mHC 层时生效)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
@@ -182,6 +182,8 @@ setup_internal_medicine()
 | 24 | `expert_gate_singular_entropy_max` | `moe_health/.../expert_gate_singular_entropy_max` | `max_e(...)` | 每层+全局 | 全谱最均匀的专家 |
 | 25 | `shared_gate_stable_rank` | `moe_health/.../shared_gate_stable_rank` | `‖W_g‖_F² / ‖W_g‖_2²` | 每层+全局 | 共享专家门控矩阵谱宽度 |
 | 26 | `shared_gate_singular_entropy` | `moe_health/.../shared_gate_singular_entropy` | `-Σ pᵢ log pᵢ, pᵢ = σᵢ²/Σσⱼ²` | 每层+全局 | 共享专家门控矩阵全谱利用率 |
+| 27 | `expert_token_share` | `moe_health/layer_N/expert_token_share_eK` | `count_K / Σ count × 100%` | 每层每专家 | 专家 K 分到的 token 占本层路由量的百分比 |
+| 28 | `expert_weight_share` | `moe_health/layer_N/expert_weight_share_eK` | `Σ probs_K / ΣΣ probs × 100%` | 每层每专家 | 专家 K 占本层总 combine 权重的百分比 (激活幅度贡献) |
 
 > 19-26 针对的是**专家 MLP 的 SwiGLU 门控投影** (`fc1` 前一半输出，即经过 SiLU 的那一半)，不是 router 的 `gate.weight`。
 > 奇异值经 Gram 矩阵特征分解得到 (`W Wᵀ` 或 `WᵀW` 取较小方阵)，比 `svdvals` 快约 40 倍；路由专家与共享专家的 Gram 拼成一个批次求解，避免 cuSOLVER 因批次形状变化重建 workspace。
@@ -212,6 +214,28 @@ PaddleFleet 后端还会直接从每次 router forward 的实际选择结果输�
 > 两种来源都在 global batch 级读取 (不在 forward hook 热路径上), 且计数已跨 rank
 > reduce, 因此无需 monitor 侧 collective, 统计值已是全局正确值。load 比值本身
 > scale-invariant, 直接用累加计数即可。
+
+> **注**: 指标 27-28 (`expert_*_share`) 是**每层每专家一条曲线**的向量指标 (256 专家的
+> 18 层模型 = 9216 个键), 只在 `log_per_layer=true` 时输出, 且不派生 `global_*`。
+> 它们与 `assignment_load_*` / `gate_mass_*` 互补: 后者回答一层「有多不均衡」,
+> 前者回答「是哪个专家造成的、是否长期是同一个」。
+>
+> `expert_token_share` 直接复用 `assignment_load_*` 已经算出的 hard-assignment
+> 计数向量, 因此除归一化外不增加任何 kernel, 且与之严格一致
+> (`max(expert_token_share) == assignment_load_max_frac × 100`)。
+> `expert_weight_share` 用的是 **combine 权重** (归一化并乘 `routed_scaling_factor`
+> 之后的 `probs`), 即该专家输出以多大权重进入残差 —— 这是「激活幅度」的可观测代理量。
+> 这里刻意不复用 `gate_mass` (它不含 scaling factor, 在
+> `routed_scaling_factor_param` 可学习时两者会分叉)。开 `moe_expert_fusion` 时融合
+> MoE 算子只返回已合并的输出, 真正的专家级输出 L2 取不到。
+>
+> 两者都不出 GPU: 热路径上整条向量一次 `add_`, 而不是每个专家一个累加器, 无 D2H
+> 同步、无 hook 内 collective。跨 rank 聚合就是各 DP rank 的普通均值, 与全局占比
+> 一致 (每个 rank 路由的 token 数相同)。
+>
+> 读法: 完全均衡时两者都等于 `100 / num_experts` (256 专家 ≈ 0.39%)。按层取这组
+> 曲线的 max / 中位 / min 最好用 —— max 抬升 = 热点专家, min 贴 0 = dead expert,
+> 中位数应稳定在均衡点附近; max 与中位数拉开距离即长尾不均衡。
 
 ### 健康阈值
 
@@ -407,10 +431,14 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 监控 mHC (Manifold-Constrained Hyper-Connections) 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`，
 以及 `x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)` 两项的相对大小。
 只在模型开启 mHC 层时生效，mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
-彻底 no-op。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 16 个指标，
+彻底 no-op。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 29 个指标，
 指标名以 `attn_` / `mlp_` 前缀区分；`branch_residual_share_max`、`h_res_logits_max`、
-`h_res_logits_grad_max`、`composite_amax_gain_{fwd,bwd}_max` 取极大值，`h_res_logits_min` 与
-`h_res_logits_grad_min` 取极小值，其余按 token/batch 求均值。
+`h_res_logits_grad_max`、`composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、
+`bias_{pre,post,res}_abs_max` 取极大值，`h_res_logits_min`、`h_res_logits_grad_min` 与
+`h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值。
+
+第 17-29 条对应论文 Eq. (7) 的静态与 pre-sigmoid 部分（`alpha` / `bias` / 门控 logits），
+**目前仅 paddlefleet 后端实现**，megatron 后端仍为前 16 条。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
@@ -430,8 +458,36 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 | 14 | `{c}_h_res_logits_grad_max` | `mhc_health/layer_{i}/{c}_h_res_logits_grad_max` | `max dL/dz` | 每层+全局 | 同上取最大值。AMP loss scale 被反除，不除 gradient accumulation。按 **max** 归约 |
 | 15 | `{c}_composite_amax_gain_fwd_max` | `mhc_health/layer_{i}/{c}_composite_amax_gain_fwd_max` | 入口到当前 branch 的 attention/MLP 交错 prefix 最大绝对行和 | 每层+全局 | 按 **max** 跨 microbatch/层归约 |
 | 16 | `{c}_composite_amax_gain_bwd_max` | `mhc_health/layer_{i}/{c}_composite_amax_gain_bwd_max` | 当前 branch 到模型尾部的 attention/MLP 交错 suffix 最大绝对列和 | 每层+全局 | 按 **max** 跨 microbatch/层归约 |
+| 17 | `{c}_h_pre_logits_min` | `mhc_health/layer_{i}/{c}_h_pre_logits_min` | `min(r·proj[:n]·α_pre + b_pre)` | 每层+全局 | `H_pre` 进 sigmoid 前的 logit 最小值，判断聚合门是否饱和到 0。按 **min** 归约 |
+| 18 | `{c}_h_pre_logits_max` | `mhc_health/layer_{i}/{c}_h_pre_logits_max` | 同上取最大值 | 每层+全局 | 判断聚合门是否饱和到 1。按 **max** 归约 |
+| 19 | `{c}_h_post_logits_min` | `mhc_health/layer_{i}/{c}_h_post_logits_min` | `min(r·proj[n:2n]·α_post + b_post)` | 每层+全局 | `H_post` 的 pre-sigmoid logit 最小值（因子 2 在 sigmoid 之外，不进 logit）。按 **min** 归约 |
+| 20 | `{c}_h_post_logits_max` | `mhc_health/layer_{i}/{c}_h_post_logits_max` | 同上取最大值 | 每层+全局 | 扩展门饱和哨兵。按 **max** 归约 |
+| 21 | `{c}_alpha_pre` | `mhc_health/layer_{i}/{c}_alpha_pre` | `α_pre`（标量参数） | 每层+全局 | 动态映射门控因子，从 `mhc_init_gating_factor` 起漂移 |
+| 22 | `{c}_alpha_post` | `mhc_health/layer_{i}/{c}_alpha_post` | `α_post` | 每层+全局 | 同上 |
+| 23 | `{c}_alpha_res` | `mhc_health/layer_{i}/{c}_alpha_res` | `α_res` | 每层+全局 | 同上；直接决定 Sinkhorn 输入 logits 的尺度 |
+| 24 | `{c}_bias_pre_mean` | `mhc_health/layer_{i}/{c}_bias_pre_mean` | `mean(bias[:n])` | 每层+全局 | `b_pre` 静态偏置均值（初始为 0） |
+| 25 | `{c}_bias_pre_abs_max` | `mhc_health/layer_{i}/{c}_bias_pre_abs_max` | `max\|bias[:n]\|` | 每层+全局 | 单元素跑飞哨兵。按 **max** 归约 |
+| 26 | `{c}_bias_post_mean` | `mhc_health/layer_{i}/{c}_bias_post_mean` | `mean(bias[n:2n])` | 每层+全局 | `b_post` 均值 |
+| 27 | `{c}_bias_post_abs_max` | `mhc_health/layer_{i}/{c}_bias_post_abs_max` | `max\|bias[n:2n]\|` | 每层+全局 | 同上取极值。按 **max** 归约 |
+| 28 | `{c}_bias_res_mean` | `mhc_health/layer_{i}/{c}_bias_res_mean` | `mean(bias[2n:])` | 每层+全局 | `b_res` 均值 |
+| 29 | `{c}_bias_res_abs_max` | `mhc_health/layer_{i}/{c}_bias_res_abs_max` | `max\|bias[2n:]\|` | 每层+全局 | 同上取极值。按 **max** 归约 |
 
-`{c}` ∈ `{attn, mlp}`。
+`{c}` ∈ `{attn, mlp}`。第 21-29 条是 step 级参数量，在 `on_optimizer_begin`（optimizer step 之前）读一次参数，
+不在热路径，且仅在本 step 确实跑过被监控的 forward 时记录。
+
+除上述 29 个标量外，paddlefleet 后端还额外产出 **每元素展开的映射序列**（`n² + 2n` 条 / hc 模块，`n = 4` 时 24 条，
+每层两个模块共 48 条）——即把 `h_res` 的 4×4 矩阵和 `h_pre` / `h_post` 两条 n 维向量逐元素记录，供还原论文
+Figure 10 那类映射热图使用：
+
+| 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
+|------|--------|------|------|----------|
+| `{c}_h_res_cell{k}` | `mhc_health/layer_{i}/{c}_h_res_cell{k}` | `mean_t(h_res[t, r, c])`，`k = r·n + c` 行主序 | 仅每层 | 残差混合矩阵的单个 cell。`h_res` 按 `compute_mappings` 返回的朝向记录（与 `amax_gain_fwd` 读的列和同一朝向，**非** composite 链式用的转置） |
+| `{c}_h_pre_idx{j}` | `mhc_health/layer_{i}/{c}_h_pre_idx{j}` | `mean_t(h_pre[t, j])` | 仅每层 | 第 `j` 条流的聚合门开度 |
+| `{c}_h_post_idx{j}` | `mhc_health/layer_{i}/{c}_h_post_idx{j}` | `mean_t(h_post[t, j])` | 仅每层 | 第 `j` 条流的扩展门开度 |
+
+这三组走 `declare_layer_vector` / `record_layer_vector`：
+热路径上每个映射只有一次 `add_`，而不是每个元素一个 kernel；并且**不派生 `global_*` 键**——单个 cell 在
+43 层上的均值没有判读意义。`log_per_layer=False` 时这三组整体不产出。
 
 指标公式、采集路径、健康判读及论文 composite 定义统一维护在
 [`docs/mhc_health.md`](docs/mhc_health.md)，README 不再重复展开。
@@ -799,6 +855,8 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | **MoE** | `expert_gate_singular_entropy_max` | `max_e(H(σ²))` | max | 上限 `log k`，平谱时取等 |
 | **MoE** | `shared_gate_stable_rank` | `srank(W_g)` | mean | 稳定 |
 | **MoE** | `shared_gate_singular_entropy` | `H(σ²)` | mean | 初始约 `0.96·log k`，不应持续下滑 |
+| **MoE** | `expert_token_share_eK` | `count_K/Σcount × 100%` | mean | 每层每专家；均衡时 = 100/E，长期高企 = 热点，贴 0 = dead expert |
+| **MoE** | `expert_weight_share_eK` | `Σprobs_K/ΣΣprobs × 100%` | mean | 每层每专家；与 token 占比偏离越大 = 该专家单 token 权重越重 |
 | **QK** | `max` | `max(QK^T/√d)` | max | 不应暴增 |
 | **QK** | `mean` | `mean(logits)` | mean | 稳定 |
 | **QK** | `entropy_avg` | `-Σ(p log p)` avg | mean | 适中 |

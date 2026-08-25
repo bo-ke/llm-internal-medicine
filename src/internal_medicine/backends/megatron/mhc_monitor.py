@@ -1,7 +1,7 @@
 """mHC Health Monitor for Megatron-Bridge.
 
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 16
-series, name-prefixed by component:
+Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 29
+scalar series, name-prefixed by component:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
@@ -11,12 +11,25 @@ series, name-prefixed by component:
     {attn,mlp}_h_res_logits_min  {attn,mlp}_h_res_logits_max
     {attn,mlp}_h_res_logits_grad_min  {attn,mlp}_h_res_logits_grad_max
     {attn,mlp}_composite_amax_gain_fwd_max  {attn,mlp}_composite_amax_gain_bwd_max
+    {attn,mlp}_h_pre_logits_min   {attn,mlp}_h_pre_logits_max
+    {attn,mlp}_h_post_logits_min  {attn,mlp}_h_post_logits_max
+    {attn,mlp}_alpha_pre  {attn,mlp}_alpha_post  {attn,mlp}_alpha_res
+    {attn,mlp}_bias_pre_mean   {attn,mlp}_bias_pre_abs_max
+    {attn,mlp}_bias_post_mean  {attn,mlp}_bias_post_abs_max
+    {attn,mlp}_bias_res_mean   {attn,mlp}_bias_res_abs_max
+
+plus a set of per-element mapping series (``n^2 + 2n`` per hc module) that expand
+``h_res`` / ``h_pre`` / ``h_post`` cell by cell.
+
+The last 13 scalars cover paper Eq. (7) — the ``alpha`` / ``bias`` /
+pre-sigmoid-logit terms that feed Eq. (8). The nine parameter series are
+step-level and are read once per flush, off the hot path.
 
 The schema, the metric semantics and the aggregation choices are kept identical
 to ``backends/paddlefleet/mhc_monitor.py`` on purpose: the two backends train
 the same mHC model, so the curves have to be comparable across them.
 
-Forward hooks are not enough, so three bound methods are wrapped instead (see
+Forward hooks are not enough, so four bound methods are wrapped instead (see
 ``mhc_metrics`` for what each metric means):
 
 - ``compute_mappings`` — ``h_pre`` is not in ``forward``'s return value.
@@ -28,16 +41,27 @@ Forward hooks are not enough, so three bound methods are wrapped instead (see
   the logits inside the kernel instead. Both paths converge on the
   ``_sinkhorn_op`` argument, so wrapping it records the logits the model
   actually consumes on either path.
+- ``_compute_h`` — the *only* route to the pre-sigmoid ``h_pre`` / ``h_post``
+  logits, which need its ``(proj, r)`` arguments. See the caveat below.
 - ``fused_h_res_h_post_bda`` — the only point where both update terms are
   visible.
 
-The fused kernel computes the logits itself, so on that path their values carry
-the kernel's numerics rather than the native reference's. The four
-``h_res_logits*`` series are therefore trend-comparable, but not value-for-value
-comparable, against a backend whose logits come from a native ``_compute_h``
-(PaddleFleet with fused mHC, or an older Megatron whose fused switch only swaps
-``_proj_rms_op`` / ``_sinkhorn_op``). Strict alignment runs should disable
-``use_fused_mhc`` on both sides.
+Two fused-path caveats, both specific to a Megatron whose ``use_fused_mhc``
+folds ``compute_h`` into the kernel:
+
+1. The kernel computes the residual-mixing logits itself, so on that path their
+   values carry the kernel's numerics rather than the native reference's. The
+   four ``h_res_logits*`` series are therefore trend-comparable, but not
+   value-for-value comparable, against a backend whose logits come from a native
+   ``_compute_h``.
+2. ``fused_proj_rms_compute_h`` returns ``(h_pre, h_post, h_res, r)`` and never
+   exposes ``proj``, so the four ``h_{pre,post}_logits_*`` series cannot be
+   rebuilt on that path without repeating the projection matmul on the hot path.
+   Their accumulators simply stay empty and are not emitted; the other 25
+   scalars and all the per-element series are unaffected.
+
+Strict cross-backend alignment runs should disable ``use_fused_mhc`` on both
+sides.
 
 Hot-path discipline (no D2H sync, no hook-time collectives, schema fixed at
 registration): see ``.claude/skills/monitor-hook-perf-rules``.
@@ -52,9 +76,11 @@ from .base import TorchProbe
 from .mhc_metrics import (
     amax_gain,
     branch_residual_share,
+    gate_logits_extrema,
     gate_stats,
     h_post_structure_stats,
     h_res_logits_extrema,
+    mapping_param_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +114,39 @@ _METRIC_NAMES = (
     "h_res_logits_grad_max",
     "composite_amax_gain_fwd_max",
     "composite_amax_gain_bwd_max",
+    "h_pre_logits_min",
+    "h_pre_logits_max",
+    "h_post_logits_min",
+    "h_post_logits_max",
+    "alpha_pre",
+    "alpha_post",
+    "alpha_res",
+    "bias_pre_mean",
+    "bias_pre_abs_max",
+    "bias_post_mean",
+    "bias_post_abs_max",
+    "bias_res_mean",
+    "bias_res_abs_max",
 )
+
+# Read once per flush from the module parameters, not from the hot path.
+_PARAM_METRICS = (
+    "alpha_pre",
+    "alpha_post",
+    "alpha_res",
+    "bias_pre_mean",
+    "bias_pre_abs_max",
+    "bias_post_mean",
+    "bias_post_abs_max",
+    "bias_res_mean",
+    "bias_res_abs_max",
+)
+
+
+def _vector_metric_specs(n: int) -> tuple[tuple[str, str, int], ...]:
+    """``(metric_name, elem_tag, size)`` for the per-element mapping series."""
+    return (("h_res", "cell", n * n), ("h_pre", "idx", n), ("h_post", "idx", n))
+
 
 # Extrema, not means: a worst case that a mean over all layers would bury. The
 # `_max` / `_min` suffixes keep training_logs' classifier in agreement on the
@@ -100,9 +158,21 @@ _MAX_METRICS = frozenset(
         "h_res_logits_grad_max",
         "composite_amax_gain_fwd_max",
         "composite_amax_gain_bwd_max",
+        "h_pre_logits_max",
+        "h_post_logits_max",
+        "bias_pre_abs_max",
+        "bias_post_abs_max",
+        "bias_res_abs_max",
     }
 )
-_MIN_METRICS = frozenset({"h_res_logits_min", "h_res_logits_grad_min"})
+_MIN_METRICS = frozenset(
+    {
+        "h_res_logits_min",
+        "h_res_logits_grad_min",
+        "h_pre_logits_min",
+        "h_post_logits_min",
+    }
+)
 
 # (component_name, layer attribute) — attn runs before mlp in the layer forward.
 _COMPONENTS = (
@@ -144,6 +214,14 @@ class MHCHealthMonitor(TorchProbe):
         # for the composite product. Keyed rather than appended so the product is
         # built in layer order, not call order (see _record_composite).
         self._h_res_snapshot: dict[tuple[int, str], torch.Tensor] = {}
+        # (layer_idx, component, module) for the step-level parameter series.
+        self._param_targets: list[tuple[int, str, nn.Module]] = []
+        # Set by the capture wrapper: whether this step's forward was monitored.
+        # A plain bool assignment, so it costs nothing on the hot path, and it
+        # keeps the parameter series on exactly the steps the rest are on
+        # (`_should_monitor()` cannot answer that at flush time — `step()` has
+        # already incremented `step_count` by then).
+        self._captured_this_step = False
         # Gradient hooks see AMP-scaled activation gradients. The callback
         # finalizes these accumulators with this step's scale before flush.
         self._grad_metrics_finalized = False
@@ -213,9 +291,14 @@ class MHCHealthMonitor(TorchProbe):
         ``declare_layer_metric`` call remains legal.
         """
         entries = self._find_hc_modules(model, layer_offset=layer_offset)
-        for global_idx, comp, _ in entries:
+        for global_idx, comp, mod in entries:
             for name in _METRIC_NAMES:
                 self.declare_layer_metric(global_idx, f"{comp}_{name}")
+            # `n` is static module metadata, so reading it at declare time costs
+            # no hot-path sync and keeps the schema fixed (Rule 3).
+            for name, tag, size in _vector_metric_specs(int(getattr(mod, "n", 0) or 0)):
+                if size > 0:
+                    self.declare_layer_vector(global_idx, f"{comp}_{name}", size, elem_tag=tag)
         return entries
 
     def _attach_hooks(self, targets):
@@ -223,10 +306,15 @@ class MHCHealthMonitor(TorchProbe):
             orig = mod.compute_mappings
             mod.compute_mappings = self._make_capture(orig, layer_idx, comp)
             self._wrapped.append((mod, "compute_mappings", orig))
+            self._param_targets.append((layer_idx, comp, mod))
             orig_sinkhorn = getattr(mod, "_sinkhorn_op", None)
             if orig_sinkhorn is not None:
                 mod._sinkhorn_op = self._make_sinkhorn_input_capture(orig_sinkhorn, layer_idx, comp)
                 self._wrapped.append((mod, "_sinkhorn_op", orig_sinkhorn))
+            orig_h = getattr(mod, "_compute_h", None)
+            if orig_h is not None:
+                mod._compute_h = self._make_gate_logits_capture(orig_h, layer_idx, comp, mod)
+                self._wrapped.append((mod, "_compute_h", orig_h))
             orig_bda = getattr(mod, "fused_h_res_h_post_bda", None)
             if orig_bda is None:
                 continue
@@ -261,6 +349,7 @@ class MHCHealthMonitor(TorchProbe):
             except AttributeError:
                 setattr(mod, attr, orig)
         self._wrapped = []
+        self._param_targets = []
         self._h_res_snapshot.clear()
         super().remove_hooks()
 
@@ -325,6 +414,11 @@ class MHCHealthMonitor(TorchProbe):
         ``grad_scaler``; both the Megatron (``scale``) and torch
         (``_scale``) attribute names are accepted.
         """
+        # This is the last hook before ``optimizer_step()``, so it is also where
+        # the Eq. (7) parameters still hold the values this step's forward
+        # actually used. Called outside the guard below and idempotent within a
+        # step, so the ``_flush_buffers`` fallback stays harmless.
+        self.finalize_param_metrics()
         if self._grad_metrics_finalized:
             return
         scale = None
@@ -338,6 +432,49 @@ class MHCHealthMonitor(TorchProbe):
                     acc = self._gpu_acc[key]
                     acc.div_(torch.as_tensor(scale, device=acc.device, dtype=acc.dtype))
         self._grad_metrics_finalized = True
+
+    def finalize_param_metrics(self) -> None:
+        """Record the step-level ``alpha`` / ``bias`` series from the parameters.
+
+        Cold path: once per step, so nine tiny reductions per module instead of
+        per microbatch. Skipped entirely when this step's forward was not
+        monitored, which keeps these series sampled on the same steps as the
+        activation ones under ``monitor_interval > 1`` — ``_should_monitor()``
+        cannot answer that here, because ``step()`` increments ``step_count``
+        before ``_flush_buffers`` runs.
+
+        Read point is ``finalize_scaled_grad_metrics``, i.e. *before*
+        ``optimizer.step()``, so the values line up with the forward that
+        produced this step's activation metrics. A caller that only drives
+        ``step()`` falls back to the flush path and therefore logs the
+        post-update value — one update later than the rest of the step's series.
+
+        The parameters are replicated across TP ranks (``HyperConnectionModule``
+        uses a plain ``nn.Linear``), so no collective is needed — every rank
+        holds the same values.
+        """
+        if not self._captured_this_step:
+            return
+        try:
+            for layer_idx, component, mod in self._param_targets:
+                try:
+                    with torch.no_grad():
+                        stats = mapping_param_stats(
+                            mod.alpha_pre,
+                            mod.alpha_post,
+                            mod.alpha_res,
+                            mod.bias,
+                            int(mod.n),
+                        )
+                    for name, value in stats.items():
+                        self.record_layer_metric(layer_idx, f"{component}_{name}", value)
+                except Exception as e:
+                    # Per module, so one module without the Eq. (7) parameters
+                    # cannot silence the series for every other layer.
+                    if self.verbose:
+                        logger.error(f"[MHCMonitor] Error mapping params {layer_idx}/{component}: {e}")
+        finally:
+            self._captured_this_step = False
 
     def _flush_buffers(self) -> None:
         # Direct users and non-AMP trainers never call finalize_* themselves.
@@ -366,6 +503,7 @@ class MHCHealthMonitor(TorchProbe):
                 return out
             try:
                 h_pre, h_post, h_res = out
+                self._captured_this_step = True
                 with torch.no_grad():
                     h_pre = h_pre.detach()
                     h_post = h_post.detach()
@@ -383,11 +521,18 @@ class MHCHealthMonitor(TorchProbe):
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_fwd", amax_gain(h_res, dim=-2))
                     self.record_layer_metric(layer_idx, f"{component}_amax_gain_bwd", amax_gain(h_res, dim=-1))
 
-                    # Token-mean snapshot of the *operator* for the composite product.
+                    # Token-mean of every mapping element. One reduce feeds both
+                    # the per-cell series and the composite product's snapshot.
                     n = int(h_res.shape[-1])
-                    self._h_res_snapshot[(layer_idx, component)] = (
-                        h_res.float().reshape(-1, n, n).mean(dim=0).transpose(0, 1)
+                    res_mean = h_res.float().reshape(-1, n, n).mean(dim=0)
+                    self.record_layer_vector(layer_idx, f"{component}_h_res", res_mean.reshape(-1))
+                    self.record_layer_vector(layer_idx, f"{component}_h_pre", h_pre.float().reshape(-1, n).mean(dim=0))
+                    self.record_layer_vector(
+                        layer_idx, f"{component}_h_post", h_post.float().reshape(-1, n).mean(dim=0)
                     )
+
+                    # Token-mean snapshot of the *operator* for the composite product.
+                    self._h_res_snapshot[(layer_idx, component)] = res_mean.transpose(0, 1)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MHCMonitor] Error layer {layer_idx}/{component}: {e}")
@@ -440,6 +585,44 @@ class MHCHealthMonitor(TorchProbe):
                         logger.error(f"[MHCMonitor] Error logits layer {layer_idx}/{component}: {e}")
             # The real doubly-stochastic matrix the model consumes — unchanged.
             return orig(h_res_logits, *args, **kwargs)
+
+        return wrapped
+
+    def _make_gate_logits_capture(self, orig, layer_idx: int, component: str, mod):
+        """Wrap ``_compute_h`` for the pre-sigmoid ``h_pre`` / ``h_post`` logits.
+
+        ``_compute_h`` does not return them, so they are rebuilt from its own
+        ``(proj, r)`` arguments plus ``mod``'s ``alpha`` / ``bias`` — see
+        ``gate_logits_extrema``. The residual-mixing logits are *not* read here;
+        ``_sinkhorn_op`` covers those on both the fused and the unfused path.
+
+        Under ``use_fused_mhc`` this wrapper never runs (``compute_mappings``
+        skips ``_compute_h``) and ``fused_proj_rms_compute_h`` does not expose
+        ``proj``, so these four accumulators stay empty and are not emitted
+        rather than being filled from a different quantity.
+        """
+
+        def wrapped(proj, r):
+            out = orig(proj, r)  # the real mappings the model consumes — returned unchanged
+            if not self._should_monitor():
+                return out
+            try:
+                if proj is not None and r is not None:
+                    with torch.no_grad():
+                        gate_logits = gate_logits_extrema(
+                            proj,
+                            r,
+                            mod.alpha_pre,
+                            mod.alpha_post,
+                            mod.bias,
+                            int(mod.n),
+                        )
+                    for name, value in gate_logits.items():
+                        self.record_layer_metric(layer_idx, f"{component}_{name}", value)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[MHCMonitor] Error gate logits layer {layer_idx}/{component}: {e}")
+            return out
 
         return wrapped
 

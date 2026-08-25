@@ -31,9 +31,9 @@ def _fake_sinkhorn(input_logits, num_iterations=1, eps=1e-6):
 
 
 class FakeHC(nn.Module):
-    """Stand-in for HyperConnectionModule exposing the three wrapped methods."""
+    """Stand-in for HyperConnectionModule exposing the four wrapped methods."""
 
-    def __init__(self, n, h_pre, h_post, h_res, h_res_logits=None):
+    def __init__(self, n, h_pre, h_post, h_res, h_res_logits=None, fused=False, proj=None, r=None):
         super().__init__()
         self.n = n
         self._h_pre = h_pre
@@ -46,14 +46,29 @@ class FakeHC(nn.Module):
         self._h_res_logits = h_res_logits
         # Instance attribute, exactly as the real module assigns it in __init__.
         self._sinkhorn_op = _fake_sinkhorn
+        # use_fused_mhc: compute_mappings then skips _compute_h entirely.
+        self._fused = fused
+        # The (proj, r) pair the native path hands _compute_h. Defaults make the
+        # pre/post logits read as bias-only, which keeps them easy to assert on.
+        leading = tuple(h_pre.shape[:-1])
+        self._proj = torch.zeros(*leading, n * n + 2 * n) if proj is None else proj
+        self._r = torch.ones(*leading, 1) if r is None else r
+        # Paper Eq. (7) parameters, same shapes as the real module.
+        self.alpha_pre = nn.Parameter(torch.full((1,), 0.1))
+        self.alpha_post = nn.Parameter(torch.full((1,), 0.2))
+        self.alpha_res = nn.Parameter(torch.full((1,), 0.3))
+        self.bias = nn.Parameter(torch.zeros(n * n + 2 * n))
 
     def _compute_h(self, proj, r):
         return self._h_pre, self._h_post, self._h_res_logits
 
     def compute_mappings(self, x):
-        # Mirrors the real module: the raw logits reach _sinkhorn_op on both the
-        # fused and the unfused path, which is why the monitor wraps that call
-        # instead of _compute_h (the fused kernel skips _compute_h entirely).
+        # Mirrors the real module: the native path goes through _compute_h, the
+        # fused kernel skips it, and the raw logits reach _sinkhorn_op on both —
+        # which is why the monitor reads h_res logits from that call and the
+        # pre-sigmoid pre/post logits from _compute_h's arguments.
+        if not self._fused:
+            self._compute_h(self._proj, self._r)
         self._sinkhorn_op(self._h_res_logits, 1, 1e-6)
         return self._h_pre, self._h_post, self._h_res
 
@@ -192,6 +207,36 @@ class MHCMetricsTest(unittest.TestCase):
             self.assertEqual(tuple(value.shape), ())
             self.assertEqual(value.dtype, torch.float32)
             self.assertFalse(value.requires_grad)
+
+    def test_gate_logits_extrema_match_compute_h_formula(self):
+        # Pins the helper against the model's own `h = r * proj * alpha + bias`
+        # slicing. n=2, so proj[..., :2] feeds pre and proj[..., 2:4] feeds post.
+        n = 2
+        proj = torch.tensor([[[1.0, -2.0, 3.0, -4.0, 0.0, 0.0, 0.0, 0.0]]])
+        r = torch.tensor([[[2.0]]])
+        bias = torch.tensor([0.5, 0.5, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0])
+        stats = mhc_metrics.gate_logits_extrema(proj, r, torch.tensor([3.0]), torch.tensor([0.5]), bias, n)
+        # pre  = 2 * [1, -2] * 3   + [0.5, 0.5]  = [6.5, -11.5]
+        # post = 2 * [3, -4] * 0.5 + [-1, -1]    = [2.0, -5.0]
+        self.assertAlmostEqual(stats["h_pre_logits_min"].item(), -11.5, places=5)
+        self.assertAlmostEqual(stats["h_pre_logits_max"].item(), 6.5, places=5)
+        self.assertAlmostEqual(stats["h_post_logits_min"].item(), -5.0, places=5)
+        self.assertAlmostEqual(stats["h_post_logits_max"].item(), 2.0, places=5)
+
+    def test_mapping_param_stats_slices_bias_by_paper_layout(self):
+        # bias is one [n^2 + 2n] parameter: [:n] pre, [n:2n] post, [2n:] res.
+        n = 2
+        bias = torch.tensor([1.0, -3.0, 2.0, 2.0, 0.0, -8.0, 4.0, 0.0])
+        stats = mhc_metrics.mapping_param_stats(torch.tensor([0.1]), torch.tensor([0.2]), torch.tensor([0.3]), bias, n)
+        self.assertAlmostEqual(stats["alpha_pre"].item(), 0.1, places=6)
+        self.assertAlmostEqual(stats["alpha_post"].item(), 0.2, places=6)
+        self.assertAlmostEqual(stats["alpha_res"].item(), 0.3, places=6)
+        self.assertAlmostEqual(stats["bias_pre_mean"].item(), -1.0, places=6)
+        self.assertAlmostEqual(stats["bias_pre_abs_max"].item(), 3.0, places=6)
+        self.assertAlmostEqual(stats["bias_post_mean"].item(), 2.0, places=6)
+        self.assertAlmostEqual(stats["bias_post_abs_max"].item(), 2.0, places=6)
+        self.assertAlmostEqual(stats["bias_res_mean"].item(), -1.0, places=6)
+        self.assertAlmostEqual(stats["bias_res_abs_max"].item(), 8.0, places=6)
 
 
 class _MHCFixture:
@@ -381,6 +426,7 @@ class MHCLogitsTest(_MHCFixture, unittest.TestCase):
             h_post=torch.ones(s, b, n),
             h_res=torch.eye(n).reshape(s, b, n, n),
             h_res_logits=torch.tensor([[[-3.0, 5.0, 0.0, 1.0]]]),
+            fused=True,
         )
         model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
         monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
@@ -393,6 +439,11 @@ class MHCLogitsTest(_MHCFixture, unittest.TestCase):
             self.assertAlmostEqual(latest[key], -3.0, places=5)
         for key in ("mhc_health/layer_0/attn_h_res_logits_max", "mhc_health/global_attn_h_res_logits_max"):
             self.assertAlmostEqual(latest[key], 5.0, places=5)
+        # The pre/post gate logits need _compute_h's (proj, r), which the fused
+        # kernel does not expose: those four must stay absent rather than be
+        # filled from some other quantity.
+        for name in ("h_pre_logits_min", "h_pre_logits_max", "h_post_logits_min", "h_post_logits_max"):
+            self.assertNotIn(f"mhc_health/layer_0/attn_{name}", latest)
 
     def test_logits_extrema_are_recorded_and_reduce_by_extremum_across_layers(self):
         # layer_0 has zero logits; layer_1 spans [-104, 7.5]. The global series
@@ -643,7 +694,9 @@ class MHCTeardownTest(_MHCFixture, unittest.TestCase):
         # assignment rather than by falling back to a class attribute.
         self.assertIs(hc._sinkhorn_op, _fake_sinkhorn)
         self.assertEqual(hc.fused_h_res_h_post_bda.__func__, FakeHC.fused_h_res_h_post_bda)
+        self.assertEqual(hc._compute_h.__func__, FakeHC._compute_h)
         self.assertEqual(monitor._wrapped, [])
+        self.assertEqual(monitor._param_targets, [])
         self.assertEqual(monitor._h_res_snapshot, {})
 
     def test_no_graph_retention(self):
@@ -671,6 +724,173 @@ class MHCTeardownTest(_MHCFixture, unittest.TestCase):
             self.assertFalse(mat.requires_grad, msg=str(key))
             self.assertIsNone(mat.grad_fn, msg=str(key))
         monitor.step()
+
+
+class MHCEq7Test(_MHCFixture, unittest.TestCase):
+    """Paper Eq. (7): the pre-sigmoid gate logits and the alpha / bias params."""
+
+    def _hc(self, n, s, b, proj=None):
+        return FakeHC(
+            n=n,
+            h_pre=torch.full((s, b, n), 0.5),
+            h_post=torch.ones(s, b, n),
+            h_res=torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous(),
+            proj=proj,
+        )
+
+    def test_gate_logits_recorded_from_compute_h_arguments(self):
+        n, s, b = 2, 1, 1
+        # r defaults to 1 and bias to 0, so the logits are proj * alpha:
+        # pre  = [1, -2] * 0.1 = [0.1, -0.2]
+        # post = [3, -4] * 0.2 = [0.6, -0.8]
+        proj = torch.tensor([[[1.0, -2.0, 3.0, -4.0, 0.0, 0.0, 0.0, 0.0]]])
+        hc = self._hc(n, s, b, proj=proj)
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for scope in ("layer_0/attn", "global_attn"):
+            self.assertAlmostEqual(latest[f"mhc_health/{scope}_h_pre_logits_min"], -0.2, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/{scope}_h_pre_logits_max"], 0.1, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/{scope}_h_post_logits_min"], -0.8, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/{scope}_h_post_logits_max"], 0.6, places=5)
+
+    def test_gate_logits_reduce_by_extremum_across_layers(self):
+        # A single saturating layer must not be averaged away by the global key.
+        n, s, b = 2, 1, 1
+        calm = torch.zeros(s, b, n * n + 2 * n)
+        wild = torch.tensor([[[0.0, -300.0, 90.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])
+        model = _mhc_model(
+            [
+                FakeLayer(attn=self._hc(n, s, b, proj=calm), mlp=self._hc(n, s, b, proj=calm), layer_number=1),
+                FakeLayer(attn=self._hc(n, s, b, proj=wild), mlp=self._hc(n, s, b, proj=wild), layer_number=2),
+            ]
+        )
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        # alpha_pre = 0.1 -> -300 * 0.1 = -30; alpha_post = 0.2 -> 90 * 0.2 = 18.
+        self.assertAlmostEqual(latest["mhc_health/global_attn_h_pre_logits_min"], -30.0, places=4)
+        self.assertAlmostEqual(latest["mhc_health/global_attn_h_post_logits_max"], 18.0, places=4)
+
+    def test_param_series_read_once_per_step_from_parameters(self):
+        n, s, b = 2, 1, 1
+        hc = self._hc(n, s, b)
+        with torch.no_grad():
+            hc.bias.copy_(torch.tensor([1.0, -3.0, 2.0, 2.0, 0.0, -8.0, 4.0, 0.0]))
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        # Cold path: nothing recorded until the flush reads the parameters.
+        self.assertEqual(monitor._gpu_cnt["mhc_health/layer_0/attn_alpha_pre"], 0)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_alpha_pre"], 0.1, places=6)
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_alpha_post"], 0.2, places=6)
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_alpha_res"], 0.3, places=6)
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_bias_pre_mean"], -1.0, places=6)
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_bias_res_abs_max"], 8.0, places=6)
+
+    def test_param_series_skipped_when_forward_was_not_monitored(self):
+        # The parameter series are read at flush time, off the hot path, so they
+        # need their own guard: without it they would log on every step even when
+        # no monitored forward ran, at a different cadence from every other
+        # series. Flushing without driving a forward must emit nothing.
+        n, s, b = 2, 1, 1
+        hc = self._hc(n, s, b)
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        self._prepare_and_attach(monitor, model)
+        self.assertFalse(monitor._captured_this_step)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertNotIn("mhc_health/layer_0/attn_alpha_pre", latest)
+        self.assertEqual(monitor._gpu_cnt["mhc_health/layer_0/attn_alpha_pre"], 0)
+
+
+class MHCVectorMetricsTest(_MHCFixture, unittest.TestCase):
+    """The per-element mapping series (n^2 + 2n per hc module)."""
+
+    def test_mapping_cells_expand_per_element(self):
+        n, s, b = 2, 2, 3
+        # h_res = identity -> token-mean cells are [1, 0, 0, 1] in row-major order.
+        hc = FakeHC(
+            n=n,
+            h_pre=torch.full((s, b, n), 0.25),
+            h_post=torch.full((s, b, n), 1.5),
+            h_res=torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous(),
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for cell, expected in enumerate((1.0, 0.0, 0.0, 1.0)):
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/attn_h_res_cell{cell}"], expected, places=5)
+        for idx in range(n):
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/attn_h_pre_idx{idx}"], 0.25, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/attn_h_post_idx{idx}"], 1.5, places=5)
+
+    def test_vector_series_derive_no_global_key(self):
+        # A mean of one cell over all layers has no diagnostic meaning, so the
+        # per-element series must not produce a global_* twin.
+        n, s, b = 2, 1, 1
+        hc = FakeHC(
+            n=n,
+            h_pre=torch.full((s, b, n), 0.5),
+            h_post=torch.ones(s, b, n),
+            h_res=torch.eye(n).reshape(s, b, n, n),
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertIn("mhc_health/layer_0/attn_h_res_cell0", latest)
+        for key in latest:
+            self.assertNotIn("global_attn_h_res_cell", key)
+            self.assertNotIn("global_attn_h_pre_idx", key)
+
+    def test_vector_series_absent_when_per_layer_logging_is_off(self):
+        n, s, b = 2, 1, 1
+        hc = FakeHC(
+            n=n,
+            h_pre=torch.full((s, b, n), 0.5),
+            h_post=torch.ones(s, b, n),
+            h_res=torch.eye(n).reshape(s, b, n, n),
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = MHCHealthMonitor(log_per_layer=False, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        self.assertEqual(monitor._vector_keys, {})
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for key in latest:
+            self.assertNotIn("_h_res_cell", key)
+        # The scalar globals still come through.
+        self.assertIn("mhc_health/global_attn_amax_gain_fwd", latest)
 
 
 class MHCMonitorNoOpTest(unittest.TestCase):

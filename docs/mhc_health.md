@@ -38,7 +38,8 @@ internal_medicine_monitors:
 
 `h_pre` 不在 `HyperConnectionModule.forward` 的返回中，普通 forward hook 看不到它。因此本 monitor **包裹
 （wrap）每个 mHC 模块的 `compute_mappings` 绑定方法**，直接捕获其真实返回的 `(h_pre, h_post, h_res)` —— 不重算。
-另外包 `_sinkhorn_op`（从其**入参**拿 Sinkhorn 之前的 `h_res` logits）和 `fused_h_res_h_post_bda`（拿子层输出，算分支/残差占比）。
+另外包 `_sinkhorn_op`（从其**入参**拿 Sinkhorn 之前的 `h_res` logits）、`_compute_h`（从其**入参** `(proj, r)`
+重建 `h_pre` / `h_post` 的 pre-sigmoid logits）和 `fused_h_res_h_post_bda`（拿子层输出，算分支/残差占比）。
 
 - `compute_mappings` 是普通 Python 方法（仅 `@nvtx_decorator`，非 `@torch.compile`），在 `_forward_normal` 中以
   `self.compute_mappings(...)` 调用，且**不被 checkpoint**，因此在 grad-enabled 的正向中恰好执行一次；实例属性
@@ -63,7 +64,7 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 
 ## 监控指标
 
-每个 hc 模块产出 29 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 16 个），指标名以
+每个 hc 模块产出 29 个指标（megatron 与 paddlefleet 两个后端同 schema），指标名以
 `attn_` / `mlp_` 前缀区分。`branch_residual_share_max`、`h_res_logits_max`、`h_res_logits_grad_max`、
 `composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、`bias_{pre,post,res}_abs_max` 取极大值，
 `h_res_logits_min`、`h_res_logits_grad_min` 与 `h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值
@@ -215,7 +216,8 @@ h_post_logits = r · proj[..., n:2n]  · α_post + b_post
 把所有饱和元素丢成 `±inf`，恰好丢掉这两条指标存在的意义。代价是与模型实现耦合：`_compute_h` 里
 `h` 的构成方式一旦改变，这四条会静默算错，改模型时必须同步。`H_post` 的因子 2 在 sigmoid 之外，不进 logit。
 
-调用方没有传 `proj` / `r` 时（stub、或未来绕过该签名的 fused 路径）这四个累加器保持为空，不写值。
+调用方没有传 `proj` / `r` 时（stub、或绕过该签名的 fused 路径）这四个累加器保持为空，不写值。新版 megatron 开
+`use_fused_mhc` 正是这种情况，见文末「后端差异」。
 
 ### Eq. (7) 静态参数（alpha / bias）
 
@@ -299,8 +301,8 @@ prefix `F_q = T_q @ ... @ T_0`；逆序遍历构造当前 branch 到尾部的 su
 一处后端差异：AMP 反除只在 fp16 且调用方传入 `grad_scaler` 时发生，bf16 下 megatron 本就不缩放，
 `finalize_scaled_grad_metrics()` 是 no-op。
 
-另有一处数值口径差异需要注意。两个后端的 `h_res_logits*` 都取自 `_sinkhorn_op` 的入参，所以**采集口径一致、
-16 条指标在两个后端都会落盘**（包括 megatron 开启 `use_fused_mhc` 时）。但 logits 由谁算出来在三种实现里不同：
+另有一处数值口径差异需要注意。两个后端的 `h_res_logits*`（11–14）都取自 `_sinkhorn_op` 的入参，所以**采集口径
+一致、这四条在两个后端都会落盘**（包括 megatron 开启 `use_fused_mhc` 时）。但 logits 由谁算出来在三种实现里不同：
 
 - paddlefleet 开 `use_fused_mhc`：只替换 `_proj_rms_op` / `_sinkhorn_op`，logits 仍由 native `_compute_h` 算出。
 - 旧版 megatron 开 `use_fused_mhc`：同上。
@@ -308,6 +310,12 @@ prefix `F_q = T_q @ ... @ T_0`；逆序遍历构造当前 branch 到尾部的 su
 
 因此新版 megatron + fused 的这四条与前两者**趋势可比、数值不可逐值比**。严格对齐验证应在两侧都关闭
 `use_fused_mhc`。
+
+还有一处只在新版 megatron + fused 下出现的缺口：`h_{pre,post}_logits_{min,max}` 这四条是从 `_compute_h` 的
+`(proj, r)` 入参重建出来的（`h = r · proj · α + b`，取 `[:n]` / `[n:2n]` 两段），而
+`fused_proj_rms_compute_h` 只返回 `(h_pre, h_post, h_res, r)`、不暴露 `proj`，在热路径上重做一遍投影 matmul
+又违反 hook 性能纪律。所以这四条在该路径下**累加器为空、不落盘**，而不是用别的量凑一个值上去。其余 25 条标量
+和全部逐元素序列不受影响。反推 sigmoid 也不可行：这四条正是饱和哨兵，一旦真的饱和，逆 sigmoid 就会溢出。
 
 作用域限制：复合只覆盖**本 rank 持有的层**。在 `sharding: stage1` 且无 PP 时，每张卡持有全部 Transformer 层，
 所以覆盖全网层范围。真开 PP 后它会退化成 stage 内语义（megatron 后端即如此，多 chunk 时按 `layer_offset` 排序，

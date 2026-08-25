@@ -53,6 +53,12 @@ class TorchProbe(Probe):
         self._layer_metric_groups: dict[str, tuple[str, list[str]]] = {}
         self._layer_metric_keys: set[str] = set()
         self._disabled_keys: set[str] = set()
+        # Per-layer vector metrics: key -> size, plus the expanded element keys
+        # the flush writes. Mean-aggregated only; they do not derive a global.
+        self._vector_keys: dict[str, int] = {}
+        self._vector_elem_keys: dict[str, list[str]] = {}
+        self._gpu_vec: dict[str, torch.Tensor] = {}
+        self._gpu_vec_cnt: dict[str, int] = {}
         self._buffers_allocated = False
         self.hook_timing_enabled = hook_timing_enabled
         self._hook_timing: dict[str, tuple[int, float]] = {}
@@ -147,12 +153,16 @@ class TorchProbe(Probe):
         for k in self._min_keys:
             self._gpu_acc[k] = torch.full((), float("inf"), device=device, dtype=dtype)
             self._gpu_cnt[k] = 0
+        # vector: one [size] accumulator per layer key, expanded per element at flush.
+        for k, size in self._vector_keys.items():
+            self._gpu_vec[k] = torch.zeros(size, device=device, dtype=dtype)
+            self._gpu_vec_cnt[k] = 0
         self._buffers_allocated = True
         if self.verbose:
             logger.info(
                 f"[{self.METRIC_PREFIX}] GPU buffer budget: "
                 f"mean={len(self._mean_keys)} max={len(self._max_keys)} "
-                f"min={len(self._min_keys)} keys"
+                f"min={len(self._min_keys)} vector={len(self._vector_keys)} keys"
             )
 
     def record_mean(self, key: str, val: torch.Tensor) -> None:
@@ -239,6 +249,37 @@ class TorchProbe(Probe):
         else:
             self.record_mean(layer_key, val)
 
+    # ------------------------------------------------------------------
+    # Per-layer vector metrics (one curve per element, e.g. per mapping cell)
+    # ------------------------------------------------------------------
+
+    def declare_layer_vector(self, layer_idx: int, metric_name: str, size: int, elem_tag: str = "e") -> None:
+        """Declare a per-layer vector metric, mean-aggregated, expanded at flush.
+
+        For "one curve per element per layer" series (a mapping cell, an expert
+        share): the hot path pays a single ``add_`` for the whole vector instead
+        of one kernel per element. Vector metrics derive **no** global key — a
+        mean of one cell over all layers has no diagnostic meaning.
+        """
+        assert not self._buffers_allocated, f"declare_layer_vector({metric_name!r}) after allocate_buffers"
+        if not self.log_per_layer:
+            return
+        key = self._layer_key(layer_idx, metric_name)
+        assert key not in self._vector_keys, f"declare_layer_vector({key!r}) declared twice"
+        size = int(size)
+        assert size > 0
+        self._vector_keys[key] = size
+        self._vector_elem_keys[key] = [f"{key}_{elem_tag}{i}" for i in range(size)]
+
+    def record_layer_vector(self, layer_idx: int, metric_name: str, vec: torch.Tensor) -> None:
+        """Hot path: one in-place accumulate for the whole ``[size]`` vector."""
+        key = self._layer_key(layer_idx, metric_name)
+        buf = self._gpu_vec.get(key)
+        if buf is None:  # log_per_layer=False, or this layer was never declared
+            return
+        buf.add_(vec.detach().to(buf.dtype))
+        self._gpu_vec_cnt[key] += 1
+
     def _flush_gpu_buffer(self) -> dict[str, float]:
         """Single batched D2H of all declared metrics, then reset.
 
@@ -289,9 +330,25 @@ class TorchProbe(Probe):
                 keys.append(global_key)
 
         out: dict[str, float] = {}
-        if tensors:
-            vals = torch.stack(tensors).cpu().tolist()
+        # Single D2H for scalars and vectors alike: flatten everything into one
+        # concat so the vector series cost no extra sync point.
+        vec_key_groups: list[list[str]] = []
+        vec_tensors: list[torch.Tensor] = []
+        for k, elem_keys in self._vector_elem_keys.items():
+            cnt = self._gpu_vec_cnt[k]
+            if cnt == 0:
+                continue
+            vec_key_groups.append(elem_keys)
+            vec_tensors.append(self._gpu_vec[k] / cnt)
+
+        if tensors or vec_tensors:
+            flat = torch.cat([t.reshape(-1) for t in tensors] + vec_tensors)
+            vals = flat.cpu().tolist()
             out = dict(zip(keys, vals, strict=False))
+            offset = len(keys)
+            for elem_keys in vec_key_groups:
+                out.update(zip(elem_keys, vals[offset : offset + len(elem_keys)], strict=False))
+                offset += len(elem_keys)
 
         for k in self._mean_keys:
             self._gpu_acc[k].zero_()
@@ -302,4 +359,7 @@ class TorchProbe(Probe):
         for k in self._min_keys:
             self._gpu_acc[k].fill_(float("inf"))
             self._gpu_cnt[k] = 0
+        for k in self._vector_keys:
+            self._gpu_vec[k].zero_()
+            self._gpu_vec_cnt[k] = 0
         return out

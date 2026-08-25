@@ -7,7 +7,7 @@
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
-- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 标量指标 + `n²+2n` 条逐元素映射序列，megatron 后端 16 指标；仅在开启 mHC 层时生效)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 标量指标 + `n²+2n` 条逐元素映射序列；megatron / paddlefleet 同 schema；仅在开启 mHC 层时生效)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
@@ -437,7 +437,7 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 `h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值。
 
 第 17-29 条对应论文 Eq. (7) 的静态与 pre-sigmoid 部分（`alpha` / `bias` / 门控 logits），
-**目前仅 paddlefleet 后端实现**，megatron 后端仍为前 16 条。
+megatron 与 paddlefleet 两个后端都已实现（17-20 在新版 megatron 开 `use_fused_mhc` 时不落盘，见本节末尾）。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
@@ -474,7 +474,7 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 `{c}` ∈ `{attn, mlp}`。第 21-29 条是 step 级参数量，在 `on_optimizer_begin`（optimizer step 之前）读一次参数，
 不在热路径，且仅在本 step 确实跑过被监控的 forward 时记录。
 
-除上述 29 个标量外，paddlefleet 后端还额外产出 **每元素展开的映射序列**（`n² + 2n` 条 / hc 模块，`n = 4` 时 24 条，
+除上述 29 个标量外，还额外产出 **每元素展开的映射序列**（`n² + 2n` 条 / hc 模块，`n = 4` 时 24 条，
 每层两个模块共 48 条）——即把 `h_res` 的 4×4 矩阵和 `h_pre` / `h_post` 两条 n 维向量逐元素记录，供还原论文
 Figure 10 那类映射热图使用：
 
@@ -488,10 +488,12 @@ Figure 10 那类映射热图使用：
 热路径上每个映射只有一次 `add_`，而不是每个元素一个 kernel；并且**不派生 `global_*` 键**——单个 cell 在
 43 层上的均值没有判读意义。`log_per_layer=False` 时这三组整体不产出。
 
-> megatron 与 paddlefleet 两个后端 schema、口径与归约方式一致，曲线可直接跨后端对比。两点后端差异：新版 megatron
-> 开启 `use_fused_mhc` 时，11–14 四条 `h_res_logits*` 的 logits 由 `fused_proj_rms_compute_h` kernel 算出（其余实现
-> 由 native `_compute_h` 算出），这四条因此只做趋势对比，严格对齐需两侧都关 `use_fused_mhc`；AMP 反除只在
-> fp16 且调用方传入 `grad_scaler` 时发生（bf16 本就不缩放）。
+> megatron 与 paddlefleet 两个后端 schema、口径与归约方式一致，曲线可直接跨后端对比。三点后端差异都只出现在
+> 新版 megatron 开启 `use_fused_mhc` 时：11–14 四条 `h_res_logits*` 的 logits 由 `fused_proj_rms_compute_h`
+> kernel 算出（其余实现由 native `_compute_h` 算出），因此只做趋势对比；17–20 四条 `h_{pre,post}_logits_*`
+> 需要 `_compute_h` 的 `(proj, r)` 入参，而 fused kernel 只返回 `(h_pre, h_post, h_res, r)` 不暴露 `proj`，
+> 这四条在该路径下不落盘（其余 25 条标量与全部逐元素序列不受影响）。严格对齐需两侧都关 `use_fused_mhc`。
+> 此外 AMP 反除只在 fp16 且调用方传入 `grad_scaler` 时发生（bf16 本就不缩放）。
 
 指标公式、采集路径、健康判读及论文 composite 定义统一维护在
 [`docs/mhc_health.md`](docs/mhc_health.md)，README 不再重复展开。

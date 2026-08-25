@@ -14,6 +14,9 @@ axis the backward one. For a single doubly-stochastic ``h_res`` both sit at
 ~1.0; on the *composite* mapping (cumulative product of ``h_res`` across layers)
 they drift away from 1.0 with depth, flagging residual-stream amplification.
 
+``gate_logits_extrema`` and ``mapping_param_stats`` reach one step further back,
+to the ``alpha`` / ``bias`` / pre-sigmoid-logit terms of paper Eq. (7).
+
 All functions return 0-dim GPU tensors and never sync the host (no ``.item()`` /
 ``.cpu()``), so they are safe to call from a forward hot path. See
 ``.claude/skills/monitor-hook-perf-rules``.
@@ -56,6 +59,74 @@ def h_res_logits_extrema(h_res_logits: torch.Tensor) -> dict[str, torch.Tensor]:
         "h_res_logits_min": logits.min(),
         "h_res_logits_max": logits.max(),
     }
+
+
+def gate_logits_extrema(
+    proj: torch.Tensor,
+    r: torch.Tensor,
+    alpha_pre: torch.Tensor,
+    alpha_post: torch.Tensor,
+    bias: torch.Tensor,
+    n: int,
+) -> dict[str, torch.Tensor]:
+    """Min/max of the *pre-sigmoid* ``H_pre`` / ``H_post`` logits (paper Eq. 7).
+
+    Keep in sync with ``HyperConnectionModule._compute_h``, which forms
+    ``h = r * proj * alpha + bias`` and slices ``[:n]`` / ``[n:2n]`` off it: if
+    the model changes how ``h`` is built, these four series go silently wrong.
+
+    Megatron's ``r`` is the reciprocal RMS produced by ``_projection_and_get_norm``
+    (the native path multiplies by it), unlike the fused kernel's reference which
+    divides by the RMS. This helper is only ever fed the native path's ``(proj, r)``
+    pair, so it follows the multiplication.
+    """
+    proj32 = proj.detach().float()
+    r32 = r.detach().float()
+    bias32 = bias.detach().float()
+    pre = r32 * proj32[..., :n] * alpha_pre.detach().float() + bias32[:n]
+    post = r32 * proj32[..., n : 2 * n] * alpha_post.detach().float() + bias32[n : 2 * n]
+    return {
+        "h_pre_logits_min": pre.min(),
+        "h_pre_logits_max": pre.max(),
+        "h_post_logits_min": post.min(),
+        "h_post_logits_max": post.max(),
+    }
+
+
+def mapping_param_stats(
+    alpha_pre: torch.Tensor,
+    alpha_post: torch.Tensor,
+    alpha_res: torch.Tensor,
+    bias: torch.Tensor,
+    n: int,
+) -> dict[str, torch.Tensor]:
+    """The static half of paper Eq. (7): the gating factors and the bias terms.
+
+    ``alpha_*`` are per-module scalars. ``bias`` is a single ``[n^2 + 2n]``
+    parameter whose slices are the paper's ``b^pre`` / ``b^post`` / ``b^res``, so
+    they are reported per slice rather than as one number. ``mean`` shows where
+    the slice sits (it starts at 0 and drifts), ``abs_max`` catches a single
+    runaway entry the mean would hide.
+
+    Step-level quantities: record once per optimizer step, not per microbatch.
+    """
+    alpha = {
+        "alpha_pre": alpha_pre,
+        "alpha_post": alpha_post,
+        "alpha_res": alpha_res,
+    }
+    stats = {name: value.detach().float().mean() for name, value in alpha.items()}
+
+    b = bias.detach().float()
+    slices = {
+        "pre": b[:n],
+        "post": b[n : 2 * n],
+        "res": b[2 * n :],
+    }
+    for name, part in slices.items():
+        stats[f"bias_{name}_mean"] = part.mean()
+        stats[f"bias_{name}_abs_max"] = part.abs().max()
+    return stats
 
 
 def h_post_structure_stats(h_post: torch.Tensor) -> dict[str, torch.Tensor]:

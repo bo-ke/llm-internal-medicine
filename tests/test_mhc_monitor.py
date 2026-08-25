@@ -22,6 +22,14 @@ training_logs = importlib.import_module("internal_medicine.core.training_logs").
 MHCHealthMonitor = mhc_monitor.MHCHealthMonitor
 
 
+def _fake_sinkhorn(input_logits, num_iterations=1, eps=1e-6):
+    """Stand-in for ``native_sinkhorn`` / ``fused_sinkhorn``: identity is enough.
+
+    Only the *input* matters here — that is the monitor's hook point.
+    """
+    return input_logits
+
+
 class FakeHC(nn.Module):
     """Stand-in for HyperConnectionModule exposing the three wrapped methods."""
 
@@ -36,15 +44,17 @@ class FakeHC(nn.Module):
         if h_res_logits is None:
             h_res_logits = torch.zeros(*h_pre.shape[:-1], n * n)
         self._h_res_logits = h_res_logits
+        # Instance attribute, exactly as the real module assigns it in __init__.
+        self._sinkhorn_op = _fake_sinkhorn
 
     def _compute_h(self, proj, r):
         return self._h_pre, self._h_post, self._h_res_logits
 
     def compute_mappings(self, x):
-        # Mirrors the real module: _compute_h yields the raw logits, the Sinkhorn
-        # projection then turns them into h_res. Going through self._compute_h is
-        # what lets the monitor's instance-attribute shadowing see the logits.
-        self._compute_h(None, None)
+        # Mirrors the real module: the raw logits reach _sinkhorn_op on both the
+        # fused and the unfused path, which is why the monitor wraps that call
+        # instead of _compute_h (the fused kernel skips _compute_h entirely).
+        self._sinkhorn_op(self._h_res_logits, 1, 1e-6)
         return self._h_pre, self._h_post, self._h_res
 
     def fused_h_res_h_post_bda(
@@ -303,7 +313,7 @@ class MHCLogitsTest(_MHCFixture, unittest.TestCase):
         monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
         self._prepare_and_attach(monitor, model)
 
-        _, _, captured = hc._compute_h(None, None)
+        captured = hc._sinkhorn_op(hc._h_res_logits, 1, 1e-6)
         weight = torch.tensor([[[2.0, -7.0, 4.0, 1.5]]])
         loss_scale = 16.0
         (captured * weight * loss_scale).sum().backward()
@@ -340,13 +350,13 @@ class MHCLogitsTest(_MHCFixture, unittest.TestCase):
         self._prepare_and_attach(monitor, model)
 
         with torch.no_grad():
-            hc._compute_h(None, None)
+            hc._sinkhorn_op(hc._h_res_logits, 1, 1e-6)
         min_key = "mhc_health/layer_0/attn_h_res_logits_grad_min"
         max_key = "mhc_health/layer_0/attn_h_res_logits_grad_max"
         self.assertEqual(monitor._gpu_cnt[min_key], 0)
         self.assertEqual(monitor._gpu_cnt[max_key], 0)
 
-        _, _, replay_logits = hc._compute_h(None, None)
+        replay_logits = hc._sinkhorn_op(hc._h_res_logits, 1, 1e-6)
         replay_logits.sum().backward()
         self.assertEqual(monitor._gpu_cnt[min_key], 1)
         self.assertEqual(monitor._gpu_cnt[max_key], 1)
@@ -354,6 +364,35 @@ class MHCLogitsTest(_MHCFixture, unittest.TestCase):
         latest = training_logs.get_latest(prefix="mhc_health")
         self.assertAlmostEqual(latest[min_key], 1.0, places=5)
         self.assertAlmostEqual(latest[max_key], 1.0, places=5)
+
+    def test_logits_recorded_on_fused_path_that_never_calls_compute_h(self):
+        # With use_fused_mhc, fused_proj_rms_compute_h produces the logits inside
+        # the kernel and compute_mappings never reaches _compute_h. The hook point
+        # is _sinkhorn_op's argument, so the four series must still land.
+        n, s, b = 2, 1, 1
+
+        class FusedFakeHC(FakeHC):
+            def _compute_h(self, proj, r):  # pragma: no cover - must never run
+                raise AssertionError("fused path must not call _compute_h")
+
+        hc = FusedFakeHC(
+            n=n,
+            h_pre=torch.full((s, b, n), 0.5),
+            h_post=torch.ones(s, b, n),
+            h_res=torch.eye(n).reshape(s, b, n, n),
+            h_res_logits=torch.tensor([[[-3.0, 5.0, 0.0, 1.0]]]),
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for key in ("mhc_health/layer_0/attn_h_res_logits_min", "mhc_health/global_attn_h_res_logits_min"):
+            self.assertAlmostEqual(latest[key], -3.0, places=5)
+        for key in ("mhc_health/layer_0/attn_h_res_logits_max", "mhc_health/global_attn_h_res_logits_max"):
+            self.assertAlmostEqual(latest[key], 5.0, places=5)
 
     def test_logits_extrema_are_recorded_and_reduce_by_extremum_across_layers(self):
         # layer_0 has zero logits; layer_1 spans [-104, 7.5]. The global series
@@ -595,11 +634,14 @@ class MHCTeardownTest(_MHCFixture, unittest.TestCase):
         self._prepare_and_attach(monitor, model)
         self.assertIsNot(hc.compute_mappings, original)
         self.assertIn("fused_h_res_h_post_bda", vars(hc))
+        self.assertIsNot(hc._sinkhorn_op, _fake_sinkhorn)
         monitor.remove_hooks()
         self.assertNotIn("fused_h_res_h_post_bda", vars(hc))
         # falls back to the (bound) class methods after deleting the instance attrs
         self.assertEqual(hc.compute_mappings.__func__, FakeHC.compute_mappings)
-        self.assertEqual(hc._compute_h.__func__, FakeHC._compute_h)
+        # _sinkhorn_op only ever lives on the instance, so it is restored by
+        # assignment rather than by falling back to a class attribute.
+        self.assertIs(hc._sinkhorn_op, _fake_sinkhorn)
         self.assertEqual(hc.fused_h_res_h_post_bda.__func__, FakeHC.fused_h_res_h_post_bda)
         self.assertEqual(monitor._wrapped, [])
         self.assertEqual(monitor._h_res_snapshot, {})

@@ -38,7 +38,7 @@ internal_medicine_monitors:
 
 `h_pre` 不在 `HyperConnectionModule.forward` 的返回中，普通 forward hook 看不到它。因此本 monitor **包裹
 （wrap）每个 mHC 模块的 `compute_mappings` 绑定方法**，直接捕获其真实返回的 `(h_pre, h_post, h_res)` —— 不重算。
-另外包 `_compute_h`（拿 Sinkhorn 之前的 `h_res` logits）和 `fused_h_res_h_post_bda`（拿子层输出，算分支/残差占比）。
+另外包 `_sinkhorn_op`（从其**入参**拿 Sinkhorn 之前的 `h_res` logits）和 `fused_h_res_h_post_bda`（拿子层输出，算分支/残差占比）。
 
 - `compute_mappings` 是普通 Python 方法（仅 `@nvtx_decorator`，非 `@torch.compile`），在 `_forward_normal` 中以
   `self.compute_mappings(...)` 调用，且**不被 checkpoint**，因此在 grad-enabled 的正向中恰好执行一次；实例属性
@@ -166,7 +166,7 @@ amax_gain_bwd = mean_t( max_j | Σ_i  h_res_ji | )      # h_res 的行和（back
 
 ### 迭代前 logits 范围
 
-直接统计 `_compute_h` 产出、进入 Sinkhorn 前的 raw residual-mixing logits `z`。这两条保留符号，不执行
+直接统计传入 `_sinkhorn_op`、即进入 Sinkhorn 前的 raw residual-mixing logits `z`。这两条保留符号，不执行
 softmax，因此不会受概率饱和到 0/1 的截断影响：
 
 | 指标 | 公式 | 诊断意义 |
@@ -180,7 +180,7 @@ softmax，因此不会受概率饱和到 0/1 的截断影响：
 
 ### 迭代前 logits 梯度
 
-对 `_compute_h` 产出、传入 Sinkhorn 的 raw `h_res` logits `z` 注册 tensor gradient hook，监控的是
+对传入 `_sinkhorn_op` 的 raw `h_res` logits `z` 注册 tensor gradient hook，监控的是
 `dL/dz`，不是 Sinkhorn 最终矩阵或循环中间 `M` 的梯度：
 
 | 指标 | 公式 | 诊断意义 |
@@ -296,10 +296,18 @@ prefix `F_q = T_q @ ... @ T_0`；逆序遍历构造当前 branch 到尾部的 su
 4. **MTP 层被排除。** MTP 层不在主干传播路径上，乘进链条没有物理意义。megatron 后端不需要这道过滤：MTP block
    不在 `decoder.layers` 里，discovery 根本走不到。
 
-两处后端差异：megatron 的 `h_res_logits*` 四条指标依赖 `_compute_h`，而 `config.use_fused_mhc` 会让
-`compute_mappings` 直接走 `fused_proj_rms_compute_h` 而跳过它——此时这四条累加器为空、不落盘（其余 12 条不受影响）；
-AMP 反除只在 fp16 且调用方传入 `grad_scaler` 时发生，bf16 下 megatron 本就不缩放，`finalize_scaled_grad_metrics()`
-是 no-op。
+一处后端差异：AMP 反除只在 fp16 且调用方传入 `grad_scaler` 时发生，bf16 下 megatron 本就不缩放，
+`finalize_scaled_grad_metrics()` 是 no-op。
+
+另有一处数值口径差异需要注意。两个后端的 `h_res_logits*` 都取自 `_sinkhorn_op` 的入参，所以**采集口径一致、
+16 条指标在两个后端都会落盘**（包括 megatron 开启 `use_fused_mhc` 时）。但 logits 由谁算出来在三种实现里不同：
+
+- paddlefleet 开 `use_fused_mhc`：只替换 `_proj_rms_op` / `_sinkhorn_op`，logits 仍由 native `_compute_h` 算出。
+- 旧版 megatron 开 `use_fused_mhc`：同上。
+- 新版 megatron 开 `use_fused_mhc`：`fused_proj_rms_compute_h` 把 `compute_h` 也吸进 kernel，logits 由 kernel 算出。
+
+因此新版 megatron + fused 的这四条与前两者**趋势可比、数值不可逐值比**。严格对齐验证应在两侧都关闭
+`use_fused_mhc`。
 
 作用域限制：复合只覆盖**本 rank 持有的层**。在 `sharding: stage1` 且无 PP 时，每张卡持有全部 Transformer 层，
 所以覆盖全网层范围。真开 PP 后它会退化成 stage 内语义（megatron 后端即如此，多 chunk 时按 `layer_offset` 排序，

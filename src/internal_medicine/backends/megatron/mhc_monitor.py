@@ -20,13 +20,24 @@ Forward hooks are not enough, so three bound methods are wrapped instead (see
 ``mhc_metrics`` for what each metric means):
 
 - ``compute_mappings`` — ``h_pre`` is not in ``forward``'s return value.
-- ``_compute_h``       — the mixing logits only exist before the Sinkhorn
-  projection. Note that, unlike PaddleFleet, Megatron's ``compute_mappings``
-  skips ``_compute_h`` entirely when ``config.use_fused_mhc`` selects
-  ``fused_proj_rms_compute_h``; the four ``h_res_logits*`` series are then
-  simply never recorded (their accumulators stay empty and are not emitted).
+- ``_sinkhorn_op``     — the mixing logits only exist before the Sinkhorn
+  projection, and this is the one call site that consumes them. ``_compute_h``
+  is *not* a usable hook point here: unlike PaddleFleet, Megatron's
+  ``compute_mappings`` skips ``_compute_h`` entirely when
+  ``config.use_fused_mhc`` selects ``fused_proj_rms_compute_h``, which produces
+  the logits inside the kernel instead. Both paths converge on the
+  ``_sinkhorn_op`` argument, so wrapping it records the logits the model
+  actually consumes on either path.
 - ``fused_h_res_h_post_bda`` — the only point where both update terms are
   visible.
+
+The fused kernel computes the logits itself, so on that path their values carry
+the kernel's numerics rather than the native reference's. The four
+``h_res_logits*`` series are therefore trend-comparable, but not value-for-value
+comparable, against a backend whose logits come from a native ``_compute_h``
+(PaddleFleet with fused mHC, or an older Megatron whose fused switch only swaps
+``_proj_rms_op`` / ``_sinkhorn_op``). Strict alignment runs should disable
+``use_fused_mhc`` on both sides.
 
 Hot-path discipline (no D2H sync, no hook-time collectives, schema fixed at
 registration): see ``.claude/skills/monitor-hook-perf-rules``.
@@ -212,10 +223,10 @@ class MHCHealthMonitor(TorchProbe):
             orig = mod.compute_mappings
             mod.compute_mappings = self._make_capture(orig, layer_idx, comp)
             self._wrapped.append((mod, "compute_mappings", orig))
-            orig_h = getattr(mod, "_compute_h", None)
-            if orig_h is not None:
-                mod._compute_h = self._make_logits_capture(orig_h, layer_idx, comp)
-                self._wrapped.append((mod, "_compute_h", orig_h))
+            orig_sinkhorn = getattr(mod, "_sinkhorn_op", None)
+            if orig_sinkhorn is not None:
+                mod._sinkhorn_op = self._make_sinkhorn_input_capture(orig_sinkhorn, layer_idx, comp)
+                self._wrapped.append((mod, "_sinkhorn_op", orig_sinkhorn))
             orig_bda = getattr(mod, "fused_h_res_h_post_bda", None)
             if orig_bda is None:
                 continue
@@ -239,6 +250,12 @@ class MHCHealthMonitor(TorchProbe):
         # and falls back to the class method; if that fails, we re-bind the
         # captured original.
         for mod, attr, orig in self._wrapped:
+            if not hasattr(type(mod), attr):
+                # ``_sinkhorn_op`` is assigned in ``__init__`` and exists only on
+                # the instance, so ``delattr`` would remove it outright instead of
+                # exposing a class-level fallback. Restore by assignment.
+                setattr(mod, attr, orig)
+                continue
             try:
                 delattr(mod, attr)
             except AttributeError:
@@ -378,45 +395,51 @@ class MHCHealthMonitor(TorchProbe):
 
         return wrapped
 
-    def _make_logits_capture(self, orig, layer_idx: int, component: str):
-        """Wrap ``_compute_h`` to record the saturation sentinel."""
+    def _make_sinkhorn_input_capture(self, orig, layer_idx: int, component: str):
+        """Wrap ``_sinkhorn_op`` to record the saturation sentinel from its input.
 
-        def wrapped(proj, r):
-            out = orig(proj, r)  # the real mappings the model consumes — returned unchanged
-            if not self._should_monitor():
-                return out
-            try:
-                _h_pre, _h_post, h_res_logits = out
-                if h_res_logits.requires_grad:
+        The first argument is the pre-projection mixing logits, i.e. the same
+        tensor ``_compute_h`` returns on the unfused path (modulo the ``view`` to
+        [s, b, n, n], which leaves element-wise extrema and their gradients
+        unchanged) and the kernel output on the fused path.
+        """
 
-                    def record_grad_extrema(grad):
-                        try:
-                            grad_fp32 = grad.detach().float()
-                            self.record_layer_metric(
-                                layer_idx,
-                                f"{component}_h_res_logits_grad_min",
-                                grad_fp32.min(),
-                            )
-                            self.record_layer_metric(
-                                layer_idx,
-                                f"{component}_h_res_logits_grad_max",
-                                grad_fp32.max(),
-                            )
-                            self._grad_metrics_finalized = False
-                        except Exception as e:
-                            if self.verbose:
-                                logger.error(f"[MHCMonitor] Error logits gradient layer {layer_idx}/{component}: {e}")
-                        # Returning None leaves the autograd gradient untouched.
-                        return None
+        def wrapped(h_res_logits, *args, **kwargs):
+            if self._should_monitor():
+                try:
+                    if h_res_logits.requires_grad:
 
-                    h_res_logits.register_hook(record_grad_extrema)
-                with torch.no_grad():
-                    for name, value in h_res_logits_extrema(h_res_logits).items():
-                        self.record_layer_metric(layer_idx, f"{component}_{name}", value)
-            except Exception as e:
-                if self.verbose:
-                    logger.error(f"[MHCMonitor] Error logits layer {layer_idx}/{component}: {e}")
-            return out
+                        def record_grad_extrema(grad):
+                            try:
+                                grad_fp32 = grad.detach().float()
+                                self.record_layer_metric(
+                                    layer_idx,
+                                    f"{component}_h_res_logits_grad_min",
+                                    grad_fp32.min(),
+                                )
+                                self.record_layer_metric(
+                                    layer_idx,
+                                    f"{component}_h_res_logits_grad_max",
+                                    grad_fp32.max(),
+                                )
+                                self._grad_metrics_finalized = False
+                            except Exception as e:
+                                if self.verbose:
+                                    logger.error(
+                                        f"[MHCMonitor] Error logits gradient layer {layer_idx}/{component}: {e}"
+                                    )
+                            # Returning None leaves the autograd gradient untouched.
+                            return None
+
+                        h_res_logits.register_hook(record_grad_extrema)
+                    with torch.no_grad():
+                        for name, value in h_res_logits_extrema(h_res_logits).items():
+                            self.record_layer_metric(layer_idx, f"{component}_{name}", value)
+                except Exception as e:
+                    if self.verbose:
+                        logger.error(f"[MHCMonitor] Error logits layer {layer_idx}/{component}: {e}")
+            # The real doubly-stochastic matrix the model consumes — unchanged.
+            return orig(h_res_logits, *args, **kwargs)
 
         return wrapped
 

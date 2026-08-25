@@ -60,6 +60,20 @@ class DistributionMetricsTest(unittest.TestCase):
         self.assertAlmostEqual(float(m["sparse_count"]), 0.0, places=6)
         self.assertAlmostEqual(float(m["sparsity"]), 0.0, places=6)
 
+    def test_fully_masked_sparsity_quantiles_are_finite(self):
+        # A uniform row leaves L == 0, so every row is masked out of Def 3.3.
+        # The quantile pick then lands on the +inf sort sentinel; it must be
+        # reported as 0 like the mean, because an inf would poison the running
+        # average of that key for the whole step.
+        logits = paddle.zeros([4, 8], dtype="float32")
+        m = mm_metrics.compute_distribution_metrics(logits, topk=2)
+
+        self.assertAlmostEqual(float(m["sparse_count"]), 0.0, places=6)
+        for suffix in ("p50", "p95", "p98"):
+            value = float(m[f"sparsity_{suffix}"])
+            self.assertTrue(math.isfinite(value), f"sparsity_{suffix} is not finite: {value}")
+            self.assertAlmostEqual(value, 0.0, places=6)
+
     def test_threshold_boundary_belongs_to_neither_set(self):
         # prob_eps == 1/V puts every entry of a uniform row exactly on eps.
         logits = paddle.zeros([1, 4], dtype="float32")

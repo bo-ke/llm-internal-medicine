@@ -88,6 +88,7 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         self.sparsity_ref_mode = sparsity_ref_mode
         self.tp_size = 1
         self.tp_group = None
+        self._tp_resolved = False
         self._hook_failed = False
 
     # ------------------------------------------------------------------
@@ -121,6 +122,14 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         return heads
 
     def _init_parallel_state(self) -> None:
+        """Resolve the TP group, recording whether the probe actually found one.
+
+        A silent failure here is not harmless: without a tp group
+        ``_gather_vocab`` becomes a no-op, so on a genuinely vocab-parallel head
+        every metric would be computed on a 1/tp shard -- a wrong softmax
+        normalizer, silently. The outcome is logged and surfaced in
+        ``register_hooks`` so a shard-local run is never mistaken for a global one.
+        """
         try:
             from paddlefleet.process_groups_config import ProcessGroupCollection
             from paddlefleet.utils import get_pg_size
@@ -128,8 +137,14 @@ class PaddleMultiMaxMonitor(PaddleProbe):
             pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
             self.tp_group = pg.tp
             self.tp_size = get_pg_size(pg.tp)
+            self._tp_resolved = True
         except Exception:
-            pass
+            logger.warning(
+                "[PaddleMultiMaxMonitor] Could not resolve the TP process group; assuming TP=1. "
+                "If this head is vocab-parallel, every metric would be computed on a shard "
+                "instead of the full vocab.",
+                exc_info=True,
+            )
 
     def register_hooks(self, model: nn.Layer):
         self._init_parallel_state()
@@ -158,9 +173,10 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         for tag, head in heads:
             self.hooks.append(head.register_forward_post_hook(self._make_head_hook(tag)))
         logger.info(
-            "[PaddleMultiMaxMonitor] Registered %d lm_head hook(s). TP=%d sample_tokens=%d topk=%d",
+            "[PaddleMultiMaxMonitor] Registered %d lm_head hook(s). TP=%d (%s) sample_tokens=%d topk=%d",
             len(heads),
             self.tp_size,
+            "resolved" if self._tp_resolved else "unresolved, assumed",
             self.sample_tokens,
             self.topk,
         )
@@ -184,10 +200,16 @@ class PaddleMultiMaxMonitor(PaddleProbe):
         Justified hook-time collective (Rule 2): vocab-parallel TP shards the
         last dim, and every metric here needs the *global* softmax normalizer,
         so a local shard cannot produce a correct entropy / top-k / sparsity
-        value. The payload is bounded by ``sample_tokens x vocab/tp`` (a few MB
-        at defaults), it fires only on monitored steps, and the head's rows are
+        value. It fires only on monitored steps, and the head's rows are
         identical across TP ranks because the parallel linear gathers the
         sequence-parallel input before projecting.
+
+        Sizing: the gathered tile is ``sample_tokens x vocab`` fp32, which at the
+        defaults (256 tokens, V ~ 200k) is ~200 MB -- plus the same again for the
+        shard list, and once more for the unmodulated baseline tile. Transient
+        peak inside ``compute_distribution_metrics`` is of the same order, so a
+        monitored step costs on the order of a GB. It scales linearly in
+        ``sample_tokens``: lower it on a memory-tight head stage.
         """
         if self.tp_size <= 1 or self.tp_group is None:
             return logits
@@ -307,8 +329,15 @@ class PaddleMultiMaxMonitor(PaddleProbe):
                     for name, value in metrics.items():
                         self.record_mean(self._global_key(tag + name), value)
             except Exception:
-                if self.verbose and not self._hook_failed:
-                    logger.exception("[PaddleMultiMaxMonitor] lm_head hook raised; this step contributes no metrics")
+                # Warn once even when quiet: a hook that raises stops recording
+                # every multimax key, and without this the monitor looks alive
+                # while silently emitting nothing. verbose only adds the traceback.
+                if not self._hook_failed:
+                    logger.warning(
+                        "[PaddleMultiMaxMonitor] lm_head hook raised; this step and any further "
+                        "failing step contribute no metrics",
+                        exc_info=self.verbose,
+                    )
                 self._hook_failed = True
 
         return hook_fn

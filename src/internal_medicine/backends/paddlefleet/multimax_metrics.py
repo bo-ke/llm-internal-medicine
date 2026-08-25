@@ -147,9 +147,14 @@ def _sparsity_log_ref(
         ref = ref.reshape([-1, ref.shape[-1]])
     ref_log_z = paddle.logsumexp(ref, axis=-1, keepdim=True)
     ref_eps = _relevance_threshold(ref_log_z, vocab_size, prob_eps, logit_eps)
-    tail = (ref < ref_eps).astype("float32")
-    n_tail = tail.sum(axis=-1, keepdim=True)
-    log_geo = ((ref - ref_log_z) * tail).sum(axis=-1, keepdim=True) / paddle.clip(n_tail, min=1.0)
+    # bool mask + where, not a materialized fp32 mask: at LM-head scale each
+    # full-size fp32 tile is ~200 MB (see _gather_vocab's sizing note).
+    tail = ref < ref_eps
+    n_tail = tail.sum(axis=-1, keepdim=True).astype("float32")
+    log_phi = ref - ref_log_z
+    log_geo = paddle.where(tail, log_phi, paddle.zeros_like(log_phi)).sum(axis=-1, keepdim=True) / paddle.clip(
+        n_tail, min=1.0
+    )
     # A baseline row with no tail at all (uniform reference) has no geometric
     # mean to take; fall back to the uniform probability for those rows only.
     return paddle.where(n_tail > 0, log_geo, paddle.full_like(log_geo, uniform))
@@ -184,7 +189,8 @@ def _summarize(
     """
     if weights is None:
         weights = paddle.ones_like(values)
-    total = paddle.clip(weights.sum(), min=1.0)
+    n_valid = weights.sum()
+    total = paddle.clip(n_valid, min=1.0)
     mean = (values * weights).sum() / total
 
     ordered = paddle.sort(paddle.where(weights > 0, values, paddle.full_like(values, float("inf"))))
@@ -195,7 +201,12 @@ def _summarize(
         # onto p50 when only a couple of rows survive the mask.
         rank = paddle.clip(paddle.ceil(q * total) - 1.0, min=0.0)
         idx = paddle.minimum(rank, total - 1.0).astype("int64").reshape([1])
-        quantiles[_quantile_suffix(q)] = paddle.take_along_axis(ordered, idx, axis=0).squeeze()
+        picked = paddle.take_along_axis(ordered, idx, axis=0).squeeze()
+        # With no valid row at all, `total` is clipped to 1 and the pick lands on
+        # the +inf sentinel; report 0 as the mean already does, because an inf
+        # entering record_mean poisons that key's running average for the step.
+        # paddle.where, not a 0/1 multiply: inf * 0 would be nan.
+        quantiles[_quantile_suffix(q)] = paddle.where(n_valid > 0, picked, paddle.zeros_like(picked))
     return mean, quantiles
 
 
@@ -247,15 +258,32 @@ def compute_distribution_metrics(
     # Entropy via H = log_z - E_p[x]: no separate log of the probabilities.
     entropy = log_z.squeeze(-1) - (p * x).sum(axis=-1)
 
+    # top-k before the Def 3.3 block so ``p`` (a full [rows, vocab] fp32 tile)
+    # can be released before the mask work allocates its own: at the LM-head
+    # scale each of these is ~200 MB, so their overlap is what sets the peak.
+    k = min(int(topk), width)
+    p_top = paddle.topk(p, k=k, axis=-1)[0]  # descending, p_top[:, 0] == p_max
+    topk_mass = p_top.sum(axis=-1)
+    del p
+
+    # Def 3.2 with eps = the k-th largest entry: the relevant set is the top-k
+    # minus the max, so this is literally "the average gap between top-1 and the
+    # other top-k entries", and its terms are comparable in magnitude to phi_max.
+    if k > 1:
+        mm_topk = 1.0 - (p_top[:, :1] - p_top[:, 1:].mean(axis=-1, keepdim=True)).squeeze(-1)
+    else:
+        mm_topk = paddle.ones_like(topk_mass)
+
     # Def 3.2's relevant set, kept only as an eps sanity check (see
     # relevant_count): the metric built on it was dropped, because with the
     # default eps = 1/V the set runs to ~1e3 entries whose probabilities are
     # orders of magnitude below phi_max, so (1/N)sum(phi_max - phi_n) collapses
     # onto phi_max and M becomes 1 - top1_prob (measured: the difference is
-    # pinned at +0.023..+0.026 across three checkpoints). The top-k form below
+    # pinned at +0.023..+0.026 across three checkpoints). The top-k form above
     # is the one that tracks the head's shape.
-    relevant = paddle.logical_and(x > eps, x < x_max).astype("float32")
-    n_relevant = relevant.sum(axis=-1)
+    # Summed as bool (1 byte/entry) rather than a materialized fp32 mask: only
+    # the count is used, and the fp32 cast would be a second full-size tile.
+    n_relevant = paddle.logical_and(x > eps, x < x_max).sum(axis=-1).astype("float32")
 
     # Def 3.3 -- exp((s - p_l)/s - 1) == exp(-p_l/s), evaluated in log space as
     # exp(-exp(x_l - log_z - log s)) so phi_min underflow never appears. ``s`` is
@@ -265,25 +293,16 @@ def compute_distribution_metrics(
     # belongs to neither set, so a uniform row (every entry at the threshold)
     # yields L == 0 and is dropped from the mean rather than scoring as
     # maximally sparse.
-    sparse = (x < eps).astype("float32")
-    n_sparse = sparse.sum(axis=-1)
+    sparse = x < eps
+    n_sparse = sparse.sum(axis=-1).astype("float32")
     log_s = _sparsity_log_ref(vocab_size, sparsity_ref, ref_logits, prob_eps, logit_eps, sparsity_ref_mode)
     ratio = paddle.clip(x - log_z - log_s, max=_EXP_CLAMP)
-    sparsity_terms = paddle.exp(-paddle.exp(ratio)) * sparse
-    sparsity = sparsity_terms.sum(axis=-1) / paddle.clip(n_sparse, min=1.0)
+    # where(mask, term, 0) instead of term * mask.astype("float32"): same value,
+    # one fewer full-size fp32 tile alive.
+    terms = paddle.exp(-paddle.exp(ratio))
+    del ratio
+    sparsity = paddle.where(sparse, terms, paddle.zeros_like(terms)).sum(axis=-1) / paddle.clip(n_sparse, min=1.0)
     sp_valid = (n_sparse > 0).astype("float32")
-
-    k = min(int(topk), width)
-    p_top = paddle.topk(p, k=k, axis=-1)[0]  # descending, p_top[:, 0] == p_max
-    topk_mass = p_top.sum(axis=-1)
-
-    # Def 3.2 with eps = the k-th largest entry: the relevant set is the top-k
-    # minus the max, so this is literally "the average gap between top-1 and the
-    # other top-k entries", and its terms are comparable in magnitude to phi_max.
-    if k > 1:
-        mm_topk = 1.0 - (p_top[:, :1] - p_top[:, 1:].mean(axis=-1, keepdim=True)).squeeze(-1)
-    else:
-        mm_topk = paddle.ones_like(topk_mass)
 
     # Every distribution metric is a token mean; each also reports p50/p95/p98
     # over the sampled tokens, which the viewer draws as a band plus a tail line.

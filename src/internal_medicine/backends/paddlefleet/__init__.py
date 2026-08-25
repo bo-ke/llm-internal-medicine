@@ -10,6 +10,7 @@ from .massive_activation_monitor import PaddleMassiveActivationMonitor, setup_ma
 from .mhc_monitor import PaddleMHCHealthMonitor, setup_mhc_monitor
 from .mlp_update_monitor import PaddleMLPUpdateMonitor, setup_mlp_update_monitor
 from .moe_monitor import PaddleMoEMonitor, setup_moe_monitor
+from .multimax_monitor import PaddleMultiMaxMonitor, setup_multimax_monitor
 from .qk_monitor import PaddleQKStatsMonitor, setup_qk_monitor
 from .vha_monitor import PaddleVHAHealthMonitor, setup_vha_monitor
 
@@ -24,6 +25,7 @@ _MONITOR_MAP = {
     "vha_health": setup_vha_monitor,
     "attn_update": setup_attn_update_monitor,
     "mlp_update": setup_mlp_update_monitor,
+    "multimax": setup_multimax_monitor,
 }
 
 _MODEL_MONITOR_ATTR = "_internal_medicine_paddlefleet_monitors"
@@ -137,4 +139,6 @@ __all__ = [
     "setup_attn_update_monitor",
     "PaddleMLPUpdateMonitor",
     "setup_mlp_update_monitor",
+    "PaddleMultiMaxMonitor",
+    "setup_multimax_monitor",
 ]

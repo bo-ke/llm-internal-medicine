@@ -293,4 +293,3 @@ def iter_monitor_layers(
         monitor_layers.append(_make(idx, layer, True))
 
     return monitor_layers
-

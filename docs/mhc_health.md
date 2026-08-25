@@ -38,7 +38,8 @@ internal_medicine_monitors:
 
 `h_pre` 不在 `HyperConnectionModule.forward` 的返回中，普通 forward hook 看不到它。因此本 monitor **包裹
 （wrap）每个 mHC 模块的 `compute_mappings` 绑定方法**，直接捕获其真实返回的 `(h_pre, h_post, h_res)` —— 不重算。
-另外包 `_compute_h`（拿 Sinkhorn 之前的 `h_res` logits）和 `fused_h_res_h_post_bda`（拿子层输出，算分支/残差占比）。
+另外包 `_sinkhorn_op`（从其**入参**拿 Sinkhorn 之前的 `h_res` logits）、`_compute_h`（从其**入参** `(proj, r)`
+重建 `h_pre` / `h_post` 的 pre-sigmoid logits）和 `fused_h_res_h_post_bda`（拿子层输出，算分支/残差占比）。
 
 - `compute_mappings` 是普通 Python 方法（仅 `@nvtx_decorator`，非 `@torch.compile`），在 `_forward_normal` 中以
   `self.compute_mappings(...)` 调用，且**不被 checkpoint**，因此在 grad-enabled 的正向中恰好执行一次；实例属性
@@ -63,7 +64,7 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 
 ## 监控指标
 
-每个 hc 模块产出 29 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 16 个），指标名以
+每个 hc 模块产出 29 个指标（megatron 与 paddlefleet 两个后端同 schema），指标名以
 `attn_` / `mlp_` 前缀区分。`branch_residual_share_max`、`h_res_logits_max`、`h_res_logits_grad_max`、
 `composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、`bias_{pre,post,res}_abs_max` 取极大值，
 `h_res_logits_min`、`h_res_logits_grad_min` 与 `h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值
@@ -123,7 +124,7 @@ key 数量：`n = 4`、43 层、2 模块 = 2064 条逐层序列，是本 monitor
 两者都高，才说明每个 token 的总门量也在明显变化。反过来，`h_post_token_std -> 0` 仍允许不同 token 在 stream 间
 重新分配相同总门量，因此不能据此断言门控已完全失去输入区分能力。
 
-### 结构指标（paddlefleet 独有）
+### 结构指标
 
 `h_post_mean` / `h_post_std` 把 token 轴和 stream 轴一起池化，因此「n 个流一起变弱」与「n-1 个流死掉、
 剩一个扛全部」在均值上不可分；`branch_residual_share` 则回答 `h_post_mean` 回答不了的问题：门变小可能被
@@ -166,7 +167,7 @@ amax_gain_bwd = mean_t( max_j | Σ_i  h_res_ji | )      # h_res 的行和（back
 
 ### 迭代前 logits 范围
 
-直接统计 `_compute_h` 产出、进入 Sinkhorn 前的 raw residual-mixing logits `z`。这两条保留符号，不执行
+直接统计传入 `_sinkhorn_op`、即进入 Sinkhorn 前的 raw residual-mixing logits `z`。这两条保留符号，不执行
 softmax，因此不会受概率饱和到 0/1 的截断影响：
 
 | 指标 | 公式 | 诊断意义 |
@@ -180,7 +181,7 @@ softmax，因此不会受概率饱和到 0/1 的截断影响：
 
 ### 迭代前 logits 梯度
 
-对 `_compute_h` 产出、传入 Sinkhorn 的 raw `h_res` logits `z` 注册 tensor gradient hook，监控的是
+对传入 `_sinkhorn_op` 的 raw `h_res` logits `z` 注册 tensor gradient hook，监控的是
 `dL/dz`，不是 Sinkhorn 最终矩阵或循环中间 `M` 的梯度：
 
 | 指标 | 公式 | 诊断意义 |
@@ -215,7 +216,8 @@ h_post_logits = r · proj[..., n:2n]  · α_post + b_post
 把所有饱和元素丢成 `±inf`，恰好丢掉这两条指标存在的意义。代价是与模型实现耦合：`_compute_h` 里
 `h` 的构成方式一旦改变，这四条会静默算错，改模型时必须同步。`H_post` 的因子 2 在 sigmoid 之外，不进 logit。
 
-调用方没有传 `proj` / `r` 时（stub、或未来绕过该签名的 fused 路径）这四个累加器保持为空，不写值。
+调用方没有传 `proj` / `r` 时（stub、或绕过该签名的 fused 路径）这四个累加器保持为空，不写值。新版 megatron 开
+`use_fused_mhc` 正是这种情况，见文末「后端差异」。
 
 ### Eq. (7) 静态参数（alpha / bias）
 
@@ -263,7 +265,7 @@ B_l = prod_{i=1}^{L-l} R_{L-i}
 应读 `||F_l||∞`，composite backward amplification 应读 `||B_l^T||∞ = ||B_l||1`。这里的 `l` 是每个顺序执行的
 residual branch；映射到 Transformer 时，attention 和 MLP 是交错的相邻 branch，不能拆成两条互不相干的链。
 
-#### 当前 PaddleFleet 实现
+#### 当前实现
 
 `apply_h_res` 的实际运算是 `mixed = h_resᵀ @ residual`，所以实现先对 token 求平均并转置，得到真正作用在
 流向量上的算子 `T_q = mean_token(h_res_q)ᵀ`。所有非 MTP branch 按物理执行顺序排列：
@@ -293,10 +295,31 @@ prefix `F_q = T_q @ ... @ T_0`；逆序遍历构造当前 branch 到尾部的 su
 3. **累乘发生在 microbatch 结算时**，快照按 `(layer_idx, attn-before-mlp)` 排序，不在 hook 里增量累乘。因此结果与
    hook 触发顺序无关；recompute 即使按反向层序重放，也会恢复成物理 branch 顺序。回归测试会故意逆序触发 hook，
    并用非交换矩阵分别核对正序 prefix 和逆序 suffix。
-4. **MTP 层被排除。** MTP 层不在主干传播路径上，乘进链条没有物理意义。
+4. **MTP 层被排除。** MTP 层不在主干传播路径上，乘进链条没有物理意义。megatron 后端不需要这道过滤：MTP block
+   不在 `decoder.layers` 里，discovery 根本走不到。
+
+一处后端差异：AMP 反除只在 fp16 且调用方传入 `grad_scaler` 时发生，bf16 下 megatron 本就不缩放，
+`finalize_scaled_grad_metrics()` 是 no-op。
+
+另有一处数值口径差异需要注意。两个后端的 `h_res_logits*`（11–14）都取自 `_sinkhorn_op` 的入参，所以**采集口径
+一致、这四条在两个后端都会落盘**（包括 megatron 开启 `use_fused_mhc` 时）。但 logits 由谁算出来在三种实现里不同：
+
+- paddlefleet 开 `use_fused_mhc`：只替换 `_proj_rms_op` / `_sinkhorn_op`，logits 仍由 native `_compute_h` 算出。
+- 旧版 megatron 开 `use_fused_mhc`：同上。
+- 新版 megatron 开 `use_fused_mhc`：`fused_proj_rms_compute_h` 把 `compute_h` 也吸进 kernel，logits 由 kernel 算出。
+
+因此新版 megatron + fused 的这四条与前两者**趋势可比、数值不可逐值比**。严格对齐验证应在两侧都关闭
+`use_fused_mhc`。
+
+还有一处只在新版 megatron + fused 下出现的缺口：`h_{pre,post}_logits_{min,max}` 这四条是从 `_compute_h` 的
+`(proj, r)` 入参重建出来的（`h = r · proj · α + b`，取 `[:n]` / `[n:2n]` 两段），而
+`fused_proj_rms_compute_h` 只返回 `(h_pre, h_post, h_res, r)`、不暴露 `proj`，在热路径上重做一遍投影 matmul
+又违反 hook 性能纪律。所以这四条在该路径下**累加器为空、不落盘**，而不是用别的量凑一个值上去。其余 25 条标量
+和全部逐元素序列不受影响。反推 sigmoid 也不可行：这四条正是饱和哨兵，一旦真的饱和，逆 sigmoid 就会溢出。
 
 作用域限制：复合只覆盖**本 rank 持有的层**。在 `sharding: stage1` 且无 PP 时，每张卡持有全部 Transformer 层，
-所以覆盖全网层范围。真开 PP 后它会退化成 stage 内语义，而我们既检测不到也修不了——`get_pipeline_model_parallel_rank`
+所以覆盖全网层范围。真开 PP 后它会退化成 stage 内语义（megatron 后端即如此，多 chunk 时按 `layer_offset` 排序，
+链条覆盖本 stage 持有的所有 chunk），而在 PaddleFleet 上我们既检测不到也修不了——`get_pipeline_model_parallel_rank`
 和 `get_pipeline_model_parallel_world_size` 在 PaddleFleet 里目前是 stub（无条件返回 0 / 1，
 `parallel_state.py:229`、`:246`）。要支持 PP 需要先等这两个函数实现，再补一次 flush 时的 all-gather；届时
 **collective 必须放在所有 per-layer `try/except` 之外**，否则单个 rank 吞异常会让整个 job 挂死而不是报错。

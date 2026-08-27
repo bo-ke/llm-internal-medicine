@@ -492,6 +492,13 @@ class PaddleMoEMonitor(PaddleProbe):
                 ]
             for m in gate_metrics + expert_metrics + act_metrics:
                 self.declare_layer_metric(layer_idx, m)
+            # Per-expert share curves: one metric element per routed expert.
+            # num_experts must come from static config here — a hook-time
+            # reduction would need a D2H sync to size the schema.
+            num_experts = int(getattr(getattr(moe_layer, "gate", None), "num_experts", 0) or 0)
+            if num_experts > 0:
+                for m in ("expert_token_share", "expert_weight_share"):
+                    self.declare_layer_vector(layer_idx, m, num_experts)
 
         self.allocate_buffers()
 
@@ -805,6 +812,7 @@ class PaddleMoEMonitor(PaddleProbe):
                 for prefix, mass in (("assignment_load", assignment), ("gate_mass", gate_mass)):
                     for name, value in _distribution_metrics(mass).items():
                         self.record_layer_metric(layer_idx, f"{prefix}_{name}", value)
+                self._record_expert_shares(layer_idx, assignment, outputs)
 
                 if (
                     k < num_experts
@@ -890,6 +898,39 @@ class PaddleMoEMonitor(PaddleProbe):
         if shared_sigma is not None:
             self.record_layer_metric(layer_idx, "shared_gate_stable_rank", _stable_rank(shared_sigma))
             self.record_layer_metric(layer_idx, "shared_gate_singular_entropy", _singular_value_entropy(shared_sigma))
+
+    def _record_expert_shares(self, layer_idx, assignment, outputs):
+        """Per-expert share of this layer's routed load, in percent.
+
+        The per-layer ``assignment_load_*`` / ``gate_mass_*`` metrics answer
+        *how* skewed a layer is; these answer *which* expert is responsible and
+        whether it stays the same one across steps. One curve per expert, so a
+        hot expert and a dead expert are both identifiable by index.
+
+        - ``expert_token_share`` reuses the caller's ``assignment`` vector (the
+          hard-assignment count already summed for ``assignment_load_*``), so it
+          adds no kernel beyond the normalisation and is exactly consistent with
+          it: ``max(curves) == assignment_load_max_frac * 100``.
+        - ``expert_weight_share`` uses ``probs`` — the post-normalisation,
+          post-``routed_scaling_factor`` combine weight each expert's output
+          carries into the residual. That is deliberately *not* ``gate_mass``,
+          which omits the scaling factor: with a learnable
+          ``routed_scaling_factor_param`` the two diverge, and only ``probs``
+          tracks the magnitude actually reaching the residual. It is a proxy for
+          activation magnitude, not the thing itself — the true per-expert output
+          norm is unobservable under ``moe_expert_fusion``, where the fused MoE
+          node returns already-combined output with no per-expert segmentation.
+
+        A perfectly balanced layer sits at ``100 / num_experts`` on both. Neither
+        leaves the GPU and neither needs a hook-time collective: the cross-rank
+        mean over DP ranks equals the global share, because every rank routes the
+        same number of tokens.
+        """
+        self.record_layer_vector(layer_idx, "expert_token_share", assignment / assignment.sum().clip(min=1e-12) * 100.0)
+        probs = outputs[3] if isinstance(outputs, tuple | list) and len(outputs) > 3 else None
+        if isinstance(probs, paddle.Tensor):
+            weights = probs.detach().astype("float32").reshape([-1, probs.shape[-1]]).sum(axis=0)
+            self.record_layer_vector(layer_idx, "expert_weight_share", weights / weights.sum().clip(min=1e-12) * 100.0)
 
     def _collect_expert_sumsq(self, moe_layer):
         """Per-expert / shared-expert sums of squares for one MoE layer.

@@ -8,6 +8,9 @@ helpers for the ``mhc_health`` monitor, operating on the three mappings a
 - ``h_post`` [..., n]     — stream expansion gate (2 * sigmoid)
 - ``h_res``  [..., n, n]  — Sinkhorn doubly-stochastic residual-mixing matrix
 
+``gate_logits_extrema`` and ``mapping_param_stats`` reach one step further back,
+to the ``alpha`` / ``bias`` / pre-sigmoid-logit terms of paper Eq. (7).
+
 All functions return 0-dim GPU tensors and never sync the host (no ``.item()`` /
 ``.cpu()``), so they are safe on a forward hot path. See
 ``.claude/skills/monitor-hook-perf-rules``.
@@ -38,6 +41,68 @@ def h_res_logits_extrema(h_res_logits: paddle.Tensor) -> dict[str, paddle.Tensor
         "h_res_logits_min": logits.min(),
         "h_res_logits_max": logits.max(),
     }
+
+
+def gate_logits_extrema(
+    proj: paddle.Tensor,
+    r: paddle.Tensor,
+    alpha_pre: paddle.Tensor,
+    alpha_post: paddle.Tensor,
+    bias: paddle.Tensor,
+    n: int,
+) -> dict[str, paddle.Tensor]:
+    """Min/max of the *pre-sigmoid* ``H_pre`` / ``H_post`` logits (paper Eq. 7).
+
+    Keep in sync with ``HyperConnectionModule._compute_h``: if the model changes
+    how ``h`` is formed, these four series go silently wrong.
+    """
+    proj32 = proj.detach().astype("float32")
+    r32 = r.detach().astype("float32")
+    bias32 = bias.detach().astype("float32")
+    pre = r32 * proj32[..., :n] * alpha_pre.detach().astype("float32") + bias32[:n]
+    post = r32 * proj32[..., n : 2 * n] * alpha_post.detach().astype("float32") + bias32[n : 2 * n]
+    return {
+        "h_pre_logits_min": pre.min(),
+        "h_pre_logits_max": pre.max(),
+        "h_post_logits_min": post.min(),
+        "h_post_logits_max": post.max(),
+    }
+
+
+def mapping_param_stats(
+    alpha_pre: paddle.Tensor,
+    alpha_post: paddle.Tensor,
+    alpha_res: paddle.Tensor,
+    bias: paddle.Tensor,
+    n: int,
+) -> dict[str, paddle.Tensor]:
+    """The static half of paper Eq. (7): the gating factors and the bias terms.
+
+    ``alpha_*`` are per-module scalars. ``bias`` is a single ``[n^2 + 2n]``
+    parameter whose slices are the paper's ``b^pre`` / ``b^post`` / ``b^res``, so
+    they are reported per slice rather than as one number. ``mean`` shows where
+    the slice sits (it starts at 0 and drifts), ``abs_max`` catches a single
+    runaway entry the mean would hide.
+
+    Step-level quantities: record once per optimizer step, not per microbatch.
+    """
+    alpha = {
+        "alpha_pre": alpha_pre,
+        "alpha_post": alpha_post,
+        "alpha_res": alpha_res,
+    }
+    stats = {name: value.detach().astype("float32").mean() for name, value in alpha.items()}
+
+    b = bias.detach().astype("float32")
+    slices = {
+        "pre": b[:n],
+        "post": b[n : 2 * n],
+        "res": b[2 * n :],
+    }
+    for name, part in slices.items():
+        stats[f"bias_{name}_mean"] = part.mean()
+        stats[f"bias_{name}_abs_max"] = part.abs().max()
+    return stats
 
 
 def gate_stats(h: paddle.Tensor) -> tuple[paddle.Tensor, paddle.Tensor]:

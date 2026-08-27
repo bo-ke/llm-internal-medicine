@@ -1,4 +1,5 @@
 import importlib
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -25,7 +26,7 @@ PaddleMHCHealthMonitor = mhc_monitor.PaddleMHCHealthMonitor
 class FakeHC(nn.Layer):
     """Stand-in for HyperConnectionModule exposing compute_mappings."""
 
-    def __init__(self, n, h_pre, h_post, h_res, h_res_logits=None):
+    def __init__(self, n, h_pre, h_post, h_res, h_res_logits=None, alpha=0.1, bias=None):
         super().__init__()
         self.n = n
         self._h_pre = h_pre
@@ -36,6 +37,12 @@ class FakeHC(nn.Layer):
         if h_res_logits is None:
             h_res_logits = paddle.zeros([*h_pre.shape[:-1], n * n])
         self._h_res_logits = h_res_logits
+        # Eq. (7) parameters, same layout as the real module: three scalar gating
+        # factors plus one [n^2 + 2n] bias whose slices are b_pre / b_post / b_res.
+        self.alpha_pre = paddle.full([1], alpha)
+        self.alpha_post = paddle.full([1], alpha)
+        self.alpha_res = paddle.full([1], alpha)
+        self.bias = paddle.zeros([n * n + 2 * n]) if bias is None else bias
 
     def _compute_h(self, proj, r):
         return self._h_pre, self._h_post, self._h_res_logits
@@ -177,6 +184,46 @@ class MHCMetricsTest(unittest.TestCase):
         self.assertAlmostEqual(float(stats["h_res_logits_min"]), -200.0, places=6)
         self.assertAlmostEqual(float(stats["h_res_logits_max"]), 7.5, places=6)
 
+    def test_gate_logits_extrema_matches_explicit_formula(self):
+        # pre  = r * proj[:n]     * alpha_pre  + b_pre  = 2*[1,-2]*0.5  + 0.25
+        # post = r * proj[n:2n]   * alpha_post + b_post = 2*[3,-4]*-1.0 + 1.0
+        n = 2
+        proj = paddle.to_tensor([[[1.0, -2.0, 3.0, -4.0, 0.0, 0.0, 0.0, 0.0]]], dtype="float32")
+        r = paddle.to_tensor([[[2.0]]], dtype="float32")
+        bias = paddle.to_tensor([0.25, 0.25, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], dtype="float32")
+        stats = mhc_metrics.gate_logits_extrema(proj, r, paddle.full([1], 0.5), paddle.full([1], -1.0), bias, n)
+        self.assertAlmostEqual(float(stats["h_pre_logits_min"]), -1.75, places=5)
+        self.assertAlmostEqual(float(stats["h_pre_logits_max"]), 1.25, places=5)
+        self.assertAlmostEqual(float(stats["h_post_logits_min"]), -5.0, places=5)
+        self.assertAlmostEqual(float(stats["h_post_logits_max"]), 9.0, places=5)
+
+    def test_gate_logits_survive_saturation_a_sigmoid_inverse_would_lose(self):
+        # A logit of -200 saturates h_pre to exactly 0 in fp32, so recovering it
+        # from the activated gate is impossible. Reading it pre-sigmoid must work.
+        n = 1
+        proj = paddle.to_tensor([[-200.0, 0.0, 0.0]], dtype="float32")
+        r = paddle.ones([1, 1], dtype="float32")
+        stats = mhc_metrics.gate_logits_extrema(proj, r, paddle.ones([1]), paddle.ones([1]), paddle.zeros([3]), n)
+        self.assertAlmostEqual(float(stats["h_pre_logits_min"]), -200.0, places=4)
+        self.assertAlmostEqual(float(paddle.nn.functional.sigmoid(proj[..., :n]).max()), 0.0, places=6)
+
+    def test_mapping_param_stats_slices_the_shared_bias(self):
+        # n = 2 -> bias is [b_pre(2), b_post(2), b_res(4)].
+        n = 2
+        bias = paddle.to_tensor([1.0, -3.0, 0.5, 0.5, 2.0, -8.0, 0.0, 0.0], dtype="float32")
+        stats = mhc_metrics.mapping_param_stats(
+            paddle.full([1], 0.1), paddle.full([1], 0.2), paddle.full([1], 0.3), bias, n
+        )
+        self.assertAlmostEqual(float(stats["alpha_pre"]), 0.1, places=6)
+        self.assertAlmostEqual(float(stats["alpha_post"]), 0.2, places=6)
+        self.assertAlmostEqual(float(stats["alpha_res"]), 0.3, places=6)
+        self.assertAlmostEqual(float(stats["bias_pre_mean"]), -1.0, places=6)
+        self.assertAlmostEqual(float(stats["bias_pre_abs_max"]), 3.0, places=6)
+        self.assertAlmostEqual(float(stats["bias_post_mean"]), 0.5, places=6)
+        self.assertAlmostEqual(float(stats["bias_post_abs_max"]), 0.5, places=6)
+        self.assertAlmostEqual(float(stats["bias_res_mean"]), -1.5, places=6)
+        self.assertAlmostEqual(float(stats["bias_res_abs_max"]), 8.0, places=6)
+
     def test_logits_extrema_are_detached_fp32_scalars(self):
         logits = paddle.to_tensor([[-3.0, 2.0]], dtype="float16")
         logits.stop_gradient = False
@@ -276,6 +323,62 @@ class MHCMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["mhc_health/global_attn_amax_gain_bwd"], 1.0, places=5)
         self.assertAlmostEqual(latest["mhc_health/global_attn_composite_amax_gain_fwd_max"], 1.5, places=5)
         self.assertAlmostEqual(latest["mhc_health/global_attn_composite_amax_gain_bwd_max"], 1.0, places=5)
+
+    def test_per_element_mapping_series_are_recorded_row_major(self):
+        # The n^2 + 2n per-element curves. An asymmetric h_res pins the layout:
+        # cell{i} is row-major over h_res *as compute_mappings returns it*, so a
+        # stray transpose (the orientation the composite product needs) would
+        # swap cell1 and cell2.
+        n, s, b = 2, 2, 3
+        h_res = paddle.to_tensor([[0.1, 0.2], [0.3, 0.4]]).reshape([1, 1, n, n]).expand([s, b, n, n])
+        hc = FakeHC(
+            n=n,
+            h_pre=paddle.to_tensor([0.25, 0.75]).reshape([1, 1, n]).expand([s, b, n]),
+            h_post=paddle.to_tensor([1.0, 2.0]).reshape([1, 1, n]).expand([s, b, n]),
+            h_res=paddle.assign(h_res),
+        )
+        model = _mhc_model([FakeLayer(attn=hc, mlp=hc)])
+
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            for i, expected in enumerate((0.1, 0.2, 0.3, 0.4)):
+                key = f"mhc_health/layer_0/{comp}_h_res_cell{i}"
+                self.assertIn(key, latest)
+                self.assertAlmostEqual(latest[key], expected, places=5)
+            for j, (pre, post) in enumerate(((0.25, 1.0), (0.75, 2.0))):
+                self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_pre_idx{j}"], pre, places=5)
+                self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_idx{j}"], post, places=5)
+
+        # Vector metrics must not spawn `global_*` keys: the mean of one cell over
+        # layers has no reading, and the flush-time derivation would emit it.
+        self.assertNotIn("mhc_health/global_attn_h_res_cell0", latest)
+        # The composite product still reads the transposed operator, unchanged by
+        # sharing the token-mean reduce with the new series.
+        self.assertIn("mhc_health/layer_0/attn_composite_amax_gain_fwd_max", latest)
+
+    def test_per_element_series_count_matches_n(self):
+        n, s, b = 4, 2, 3
+        model = _mhc_model([self._identity_layer(n, s, b)])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        # Exact `<tag><digits>` suffixes, not a substring test: `_h_pre_s` would
+        # also catch the scalar `h_pre_std`, which is what the `idx` tag avoids.
+        elem_re = re.compile(r"_(?:h_res_cell|h_pre_idx|h_post_idx)\d+$")
+        for comp in ("attn", "mlp"):
+            for tag, expected in (("h_res_cell", n * n), ("h_pre_idx", n), ("h_post_idx", n)):
+                found = [k for k in latest if re.search(rf"/{comp}_{tag}\d+$", k)]
+                self.assertEqual(len(found), expected, tag)
+        # 2 components x (n^2 + 2n) = 48 new per-layer keys at n=4.
+        self.assertEqual(len([k for k in latest if elem_re.search(k)]), 48)
 
     def test_logits_gradient_extrema_are_unscaled_without_changing_backward(self):
         n, s, b = 2, 1, 1
@@ -384,6 +487,118 @@ class MHCMonitorTest(unittest.TestCase):
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_res_logits_max"], 0.0, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/layer_1/{comp}_h_res_logits_max"], 7.5, places=5)
             self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_h_res_logits_max"], 7.5, places=5)
+
+    def test_gate_logits_are_recorded_from_compute_h_arguments(self):
+        # alpha = 0.1, bias = 0, r = 1 -> logits are proj/10 on the pre and post
+        # slices: pre [1, -2], post [3, -4].
+        n, s, b = 2, 1, 1
+        layer = self._identity_layer(n, s, b)
+        model = _mhc_model([layer])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+
+        proj = paddle.to_tensor([[[10.0, -20.0, 30.0, -40.0, 0.0, 0.0, 0.0, 0.0]]], dtype="float32")
+        r = paddle.ones([s, b, 1], dtype="float32")
+        for _, _, mod in targets:
+            mod._compute_h(proj, r)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_pre_logits_min"], -2.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_pre_logits_max"], 1.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_logits_min"], -4.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_logits_max"], 3.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_h_pre_logits_min"], -2.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_h_post_logits_max"], 3.0, places=5)
+
+    def test_gate_logits_skipped_when_compute_h_gets_no_proj(self):
+        # The stub call path (proj=r=None) must not raise and must leave the four
+        # accumulators empty rather than writing a bogus value.
+        n, s, b = 2, 1, 1
+        model = _mhc_model([self._identity_layer(n, s, b)])
+        monitor = PaddleMHCHealthMonitor()
+        targets = self._prepare_and_attach(monitor, model)
+        for _, _, mod in targets:
+            mod._compute_h(None, None)
+        self.assertEqual(monitor._gpu_cnt["mhc_health/layer_0/attn_h_pre_logits_min"], 0)
+        monitor.step()
+        self.assertNotIn("mhc_health/layer_0/attn_h_pre_logits_min", training_logs.get_latest(prefix="mhc_health"))
+
+    def test_mapping_param_metrics_are_recorded_once_per_step(self):
+        n, s, b = 2, 1, 1
+        bias = paddle.to_tensor([1.0, -3.0, 0.5, 0.5, 2.0, -8.0, 0.0, 0.0], dtype="float32")
+
+        def make_hc():
+            return FakeHC(
+                n=n,
+                h_pre=paddle.full([s, b, n], 0.5),
+                h_post=paddle.ones([s, b, n]),
+                h_res=paddle.eye(n).reshape([1, 1, n, n]).expand([s, b, n, n]),
+                alpha=0.25,
+                bias=bias,
+            )
+
+        model = _mhc_model([FakeLayer(attn=make_hc(), mlp=make_hc())])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+
+        # Two microbatches: the parameters are step-level, so they must still be
+        # recorded exactly once, and a second finalize must be a no-op.
+        self._drive(targets, x_dim=n * 8)
+        self._drive(targets, x_dim=n * 8)
+        monitor.finalize_param_metrics()
+        monitor.finalize_param_metrics()
+        self.assertEqual(monitor._gpu_cnt["mhc_health/layer_0/attn_alpha_pre"], 1)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            for key in ("alpha_pre", "alpha_post", "alpha_res"):
+                self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_{key}"], 0.25, places=6)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_bias_pre_mean"], -1.0, places=6)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_bias_pre_abs_max"], 3.0, places=6)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_bias_post_mean"], 0.5, places=6)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_bias_res_mean"], -1.5, places=6)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_bias_res_abs_max"], 8.0, places=6)
+            self.assertAlmostEqual(latest[f"mhc_health/global_{comp}_alpha_res"], 0.25, places=6)
+
+    def test_mapping_param_metrics_read_before_the_optimizer_update(self):
+        # `on_optimizer_begin` fires before optimizer.step(), so the value logged
+        # for this step must be the one its forward used, not the updated one.
+        n, s, b = 2, 1, 1
+
+        def make_hc():
+            return FakeHC(
+                n=n,
+                h_pre=paddle.full([s, b, n], 0.5),
+                h_post=paddle.ones([s, b, n]),
+                h_res=paddle.eye(n).reshape([1, 1, n, n]).expand([s, b, n, n]),
+                alpha=0.25,
+            )
+
+        model = _mhc_model([FakeLayer(attn=make_hc(), mlp=make_hc())])
+        monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = self._prepare_and_attach(monitor, model)
+
+        self._drive(targets, x_dim=n * 8)
+        monitor.finalize_scaled_grad_metrics()  # on_optimizer_begin
+        for _, _, mod in targets:  # optimizer.step() moves the parameters
+            mod.alpha_pre = paddle.full([1], 9.0)
+        monitor.step()  # on_step_end, i.e. after the update
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_alpha_pre"], 0.25, places=6)
+
+    def test_mapping_param_metrics_skipped_on_unmonitored_step(self):
+        # No forward ran, so the parameter series must not emit a lone sample the
+        # activation series has no counterpart for.
+        n, s, b = 2, 1, 1
+        model = _mhc_model([self._identity_layer(n, s, b)])
+        monitor = PaddleMHCHealthMonitor()
+        self._prepare_and_attach(monitor, model)
+        monitor.step()
+        self.assertNotIn("mhc_health/layer_0/attn_alpha_pre", training_logs.get_latest(prefix="mhc_health"))
 
     def test_composite_is_built_in_layer_order_not_call_order(self):
         # Regression test for what retired the previous composite metric: it was
@@ -506,9 +721,7 @@ class MHCMonitorTest(unittest.TestCase):
 
         latest = training_logs.get_latest(prefix="mhc_health")
         for comp in ("attn", "mlp"):
-            self.assertAlmostEqual(
-                latest[f"mhc_health/layer_0/{comp}_composite_amax_gain_fwd_max"], 1.0, places=5
-            )
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_composite_amax_gain_fwd_max"], 1.0, places=5)
             self.assertNotIn(f"mhc_health/layer_1/{comp}_composite_amax_gain_fwd_max", latest)
 
     def test_composite_snapshot_is_cleared_each_step(self):
@@ -542,18 +755,10 @@ class MHCMonitorTest(unittest.TestCase):
         monitor.step()
 
         latest = training_logs.get_latest(prefix="mhc_health")
-        self.assertAlmostEqual(
-            latest["mhc_health/layer_0/attn_composite_amax_gain_fwd_max"], 3.0, places=5
-        )
-        self.assertAlmostEqual(
-            latest["mhc_health/layer_0/mlp_composite_amax_gain_fwd_max"], 9.0, places=5
-        )
-        self.assertAlmostEqual(
-            latest["mhc_health/layer_0/attn_composite_amax_gain_bwd_max"], 9.0, places=5
-        )
-        self.assertAlmostEqual(
-            latest["mhc_health/layer_0/mlp_composite_amax_gain_bwd_max"], 3.0, places=5
-        )
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_composite_amax_gain_fwd_max"], 3.0, places=5)
+        self.assertAlmostEqual(latest["mhc_health/layer_0/mlp_composite_amax_gain_fwd_max"], 9.0, places=5)
+        self.assertAlmostEqual(latest["mhc_health/layer_0/attn_composite_amax_gain_bwd_max"], 9.0, places=5)
+        self.assertAlmostEqual(latest["mhc_health/layer_0/mlp_composite_amax_gain_bwd_max"], 3.0, places=5)
 
     def test_branch_residual_share_is_recorded_from_bda(self):
         n, s, b, c = 4, 2, 3, 6

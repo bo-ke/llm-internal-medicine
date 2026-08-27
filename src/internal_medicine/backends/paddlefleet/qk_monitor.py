@@ -11,7 +11,7 @@ import paddle
 import paddle.nn as nn
 
 from .base import PaddleProbe
-from .layer_discovery import MLA_RATIO, MQA_RATIO, get_decoder_layers, iter_monitor_layers
+from .layer_discovery import MLA_RATIO, MQA_RATIO, get_decoder_layers, is_kda_layer, iter_monitor_layers
 
 logger = logging.getLogger(__name__)
 
@@ -731,6 +731,10 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
     def _find_attention_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer, object]]:
         def has_attention(layer):
+            # KDA layers are excluded on purpose: they are linear attention, so
+            # there are no QK logits, no softmax and no ``core_attention`` to hook.
+            if is_kda_layer(layer):
+                return False
             return hasattr(layer, "self_attn") or hasattr(layer, "self_attention")
 
         layers = get_decoder_layers(model)

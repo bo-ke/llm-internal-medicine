@@ -15,6 +15,7 @@ AVAILABLE_MONITORS = {
         "vha_health",
         "attn_update",
         "mlp_update",
+        "kda_health",
     ],
 }
 

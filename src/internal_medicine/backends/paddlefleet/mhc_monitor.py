@@ -108,6 +108,7 @@ _PARAM_METRICS = (
     "bias_res_abs_max",
 )
 
+
 def _vector_metric_specs(n: int) -> tuple[tuple[str, str, int], ...]:
     """``(metric_name, elem_tag, size)`` for the per-element mapping series."""
     return (("h_res", "cell", n * n), ("h_pre", "idx", n), ("h_post", "idx", n))

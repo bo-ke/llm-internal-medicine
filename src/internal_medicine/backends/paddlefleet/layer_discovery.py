@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +18,12 @@ class MonitorLayer:
     is_mtp: bool = False
     # Attention kind tag for stacks that mix kinds across layers. Which config
     # field describes the mix decides the value space (see classify_attn_type):
+    #   - KDA hybrid stack                 -> ``"kda"`` on the linear-attention
+    #     layers, ``"mla"`` / ``"global"`` on the interleaved global ones
     #   - ``csa_compress_ratios`` present  -> ``"mla"`` / ``"mqa"`` /
     #     ``"window"`` / ``"csa"`` / ``"hca"``
     #   - ``sliding_window`` present       -> ``"swa"`` / ``"full"``
-    #   - neither                          -> ``None`` (homogeneous stack; keeps
+    #   - none of the above                -> ``None`` (homogeneous stack; keeps
     #     the legacy untagged metric keys)
     # Monitors prepend this to the metric name so statistics of different
     # attention kinds never mix in one chart.
@@ -50,6 +52,21 @@ _RATIO_KINDS = {
     WINDOW_RATIO: "window",
     HCA_RATIO: "hca",
 }
+
+# Both names are required because GDN (``gated_delta_net``, a selectable
+# ``attention_layer_type``) shares ``A_log`` / ``dt_bias`` / ``conv1d`` /
+# ``in_proj`` with KDA and must not match.
+_KDA_ATTRS = ("f_b_proj", "gate_lower_bound")
+
+
+def is_kda_layer(layer) -> bool:
+    """True when this layer's token mixer is Kimi Delta Attention."""
+    attn = get_attention_module(layer)
+    if attn is None:
+        return False
+    # ``hasattr``, not truthiness: ``gate_lower_bound=None`` is a valid config
+    # (it selects the unbounded softplus gate).
+    return all(hasattr(attn, name) for name in _KDA_ATTRS)
 
 
 def _flatten_model_chunks(model) -> list[object] | None:
@@ -160,12 +177,17 @@ def _compress_ratio_meta(attn) -> tuple[str, int | None, int | None, bool] | Non
 def attn_meta(layer) -> tuple[str | None, int | None, int | None, bool]:
     """Return ``(attn_type, compress_ratio, window_size, has_indexer)``.
 
-    Ratio-described stacks are classified from ``compress_ratio``; otherwise the
-    ``is_swa`` flag is used (see :func:`classify_attn_type`).
+    KDA layers are recognised by class; ratio-described stacks are classified
+    from ``compress_ratio``; otherwise the ``is_swa`` flag is used (see
+    :func:`classify_attn_type`).
     """
     attn = get_attention_module(layer)
     if attn is None:
         return (None, None, None, False)
+    if is_kda_layer(layer):
+        # KDA has no softmax logits, no compress ratio and no window; the tag is
+        # the only piece of metadata that applies.
+        return ("kda", None, None, False)
     by_ratio = _compress_ratio_meta(attn)
     if by_ratio is not None:
         return by_ratio
@@ -178,22 +200,30 @@ def attn_meta(layer) -> tuple[str | None, int | None, int | None, bool]:
 def classify_attn_type(layer) -> str | None:
     """Classify a transformer layer's attention kind.
 
-    Which config field describes the layer mix decides the value space; the two
+    Which config field describes the layer mix decides the value space; the
     mechanisms are independent and never both apply:
 
-    1. ``csa_compress_ratios`` (flagged by
+    1. **KDA hybrid stacks** (Kimi-Linear / Kimi-K3): a layer whose token mixer
+       is Kimi Delta Attention (see :func:`is_kda_layer`) is tagged ``"kda"``. The interleaved global
+       layers get their tag from :func:`iter_monitor_layers`, which is the only
+       place that sees the whole stack — ``"mla"`` for ``MQALatentAttention``,
+       ``"global"`` for anything else. Neither of the two mechanisms below fires
+       on these stacks (no ``csa_compress_ratios``, no ``sliding_window``), so
+       without this rule every layer would come back ``None`` and KDA metrics
+       would share one chart with the global layers'.
+    2. ``csa_compress_ratios`` (flagged by
        ``experimental_attention_variant="dsv4_hybrid"``): the per-layer kind
        implied by the ratio — ``"mla"`` (-2), ``"mqa"`` (-1), ``"window"`` (0),
        ``"csa"`` (2..127), ``"hca"`` (128). ``is_swa`` is useless here because
        it is derived from ``config.sliding_window``, which these configs do not
        set, so every layer would look like ``"full"``.
-    2. ``config.sliding_window`` (+ ``window_attn_skip_freq``): the ``is_swa``
+    3. ``config.sliding_window`` (+ ``window_attn_skip_freq``): the ``is_swa``
        flag that ``Attention.__init__`` computes per layer → ``"swa"`` /
        ``"full"``.
 
-    Returns ``None`` when neither field is present (homogeneous stack), which
-    callers treat as "do not tag metrics with attention kind" so those runs keep
-    their existing metric key layout.
+    Returns ``None`` when none of them apply (homogeneous stack), which callers
+    treat as "do not tag metrics with attention kind" so those runs keep their
+    existing metric key layout.
     """
     return attn_meta(layer)[0]
 
@@ -234,6 +264,41 @@ def _absolute_mtp_idx(wrapper, layer, mtp_local_idx: int) -> int | None:
     if not isinstance(local, int) or local < 0:
         local = mtp_local_idx
     return num_hidden_layers + local
+
+
+def _global_layer_tag(layer) -> str:
+    """Tag for a non-KDA attention layer inside a KDA hybrid stack.
+
+    KDA hybrids pair ``KimiDeltaAttention`` with ``MQALatentAttention`` for the
+    periodic global layers (``gpt_layer_specs.py``), so name that case ``"mla"``.
+    Anything else gets the neutral ``"global"`` rather than a guess.
+    """
+    attn = get_attention_module(layer)
+    return "mla" if type(attn).__name__ == "MQALatentAttention" else "global"
+
+
+def _retag_kda_hybrid(monitor_layers: list[MonitorLayer], all_layers: list[object]) -> list[MonitorLayer]:
+    """Give the global layers of a KDA hybrid stack an explicit tag.
+
+    ``attn_meta`` only sees one layer, so it cannot tell a global layer of a KDA
+    hybrid (which must be tagged, or its metrics share a chart with the KDA
+    layers') from a layer of a homogeneous stack (which must stay untagged, or
+    existing runs lose their metric keys). This is the only place that sees the
+    whole stack, so the stack-level decision is made here. No-op unless the stack
+    contains at least one KDA layer.
+
+    Detection scans ``all_layers``, not the matched subset: a monitor that
+    deliberately excludes KDA layers from its own predicate (``qk_stats`` has no
+    logits to read there) must still tag its global layers the same way every
+    other monitor does, or the same physical layer would carry different metric
+    keys depending on which monitor emitted them.
+    """
+    if not any(is_kda_layer(layer) for layer in all_layers):
+        return monitor_layers
+    return [
+        item if item.attn_type is not None else replace(item, attn_type=_global_layer_tag(item.layer))
+        for item in monitor_layers
+    ]
 
 
 def iter_monitor_layers(
@@ -292,5 +357,4 @@ def iter_monitor_layers(
             continue
         monitor_layers.append(_make(idx, layer, True))
 
-    return monitor_layers
-
+    return _retag_kda_hybrid(monitor_layers, layers)

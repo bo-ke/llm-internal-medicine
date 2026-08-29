@@ -113,7 +113,7 @@ class FamilySelectionTest(unittest.TestCase):
                 continue
             (kept if selection.allows(sub) else dropped).add(mf.classify(monitor, sub)[0])
         self.assertEqual(dropped, {"mix"})
-        self.assertEqual(kept, {"gate", "gain", "param", "share"})
+        self.assertEqual(kept, {"gate", "stream", "cell", "gain", "param", "share"})
 
     def test_excluding_several_families_at_once(self):
         selection = mf.parse_exclude("moe_health", "expert+act")
@@ -172,6 +172,74 @@ class FamilySelectionTest(unittest.TestCase):
     def test_a_known_but_unused_monitor_is_accepted(self):
         """One exclusion string may be shared by configs enabling different monitors."""
         mf.validate_exclusions(mf.parse_exclusions("moe_health:expert"), {"moe_health": None, "qk_stats": None})
+
+
+class DebugOnlyFamiliesTest(unittest.TestCase):
+    def test_mhc_per_unit_slices_are_their_own_families(self):
+        """The per-cell / per-stream curves must not fall into their aggregates.
+
+        This split is the whole point of the production default: `h_res_cell{i}`
+        and `h_{pre,post}_idx{i}` are one curve per structural unit, while
+        `h_res_logits_max` / `h_post_mean` are one per layer and are what the
+        diagnosis layer reads.
+        """
+        self.assertEqual(mf.classify("mhc_health", "attn_h_res_cell0"), ("cell", "attn"))
+        self.assertEqual(mf.classify("mhc_health", "attn_h_res_logits_max"), ("mix", "attn"))
+        self.assertEqual(mf.classify("mhc_health", "mlp_h_pre_idx3"), ("stream", "mlp"))
+        self.assertEqual(mf.classify("mhc_health", "mlp_h_post_idx3"), ("stream", "mlp"))
+        self.assertEqual(mf.classify("mhc_health", "mlp_h_post_mean"), ("gate", "mlp"))
+        # `global_` aggregates have no index and so stay with the aggregates.
+        self.assertEqual(mf.classify("mhc_health", "global_attn_h_post_token_std")[0], "gate")
+
+    def test_the_debug_only_set_is_pinned(self):
+        """Changing what a production run stops collecting must be a visible diff."""
+        self.assertEqual(
+            {monitor: set(families) for monitor, families in mf.DEBUG_ONLY_FAMILIES.items()},
+            {"moe_health": {"expert"}, "mhc_health": {"cell", "stream"}},
+        )
+
+    def test_every_debug_only_family_is_a_declared_family(self):
+        """A stale name here would silently switch nothing off in production."""
+        for monitor, families in mf.DEBUG_ONLY_FAMILIES.items():
+            selection = mf.parse_exclude(monitor, list(families))
+            self.assertEqual(selection.excluded, frozenset(families))
+
+    def test_debug_mode_collects_everything(self):
+        self.assertEqual(mf.exclusions_for(True), {})
+
+    def test_production_drops_the_debug_only_families(self):
+        self.assertEqual(
+            mf.exclusions_for(False),
+            {monitor: list(families) for monitor, families in mf.DEBUG_ONLY_FAMILIES.items()},
+        )
+
+    def test_the_returned_mapping_is_the_callers_to_mutate(self):
+        """Backends merge per-monitor options into it; the constant must survive."""
+        excluded = mf.exclusions_for(False)
+        excluded["moe_health"].append("router")
+        excluded["qk_stats"] = ["sink"]
+        self.assertEqual(mf.DEBUG_ONLY_FAMILIES["moe_health"], ("expert",))
+        self.assertNotIn("qk_stats", mf.DEBUG_ONLY_FAMILIES)
+
+    def test_production_exclusions_pass_backend_validation(self):
+        """The default must never be the thing that fails a run at startup."""
+        known = {monitor: None for monitor in mf.METRIC_TAXONOMY}
+        mf.validate_exclusions(mf.exclusions_for(False), known, backend="paddlefleet")
+
+    def test_the_debug_only_families_are_the_ones_that_grow_per_unit(self):
+        """The selection criterion, checked against real keys rather than asserted.
+
+        Indices are normalised out of the corpus, so this counts *distinct key
+        shapes*, not the per-step key count — enough to show these families carry
+        the per-expert / per-cell fan-out.
+        """
+        counts = {}
+        for monitor, sub in corpus_entries():
+            family, _component = mf.classify(monitor, sub)
+            counts[(monitor, family)] = counts.get((monitor, family), 0) + 1
+        for monitor, families in mf.DEBUG_ONLY_FAMILIES.items():
+            for family in families:
+                self.assertGreater(counts.get((monitor, family), 0), 0, f"{monitor}:{family} matches no real key")
 
 
 if __name__ == "__main__":

@@ -798,7 +798,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 
 | Monitor | 族 |
 |---------|-----|
-| `mhc_health` | `gate` 门控强度 / `mix` 混合矩阵 / `gain` 增益放大 / `param` 可学习参数 / `share` 残差占比 |
+| `mhc_health` | `gate` 门控强度（逐层聚合）/ `stream` 按流门控值 `h_{pre,post}_idx{i}` / `mix` 混合矩阵（逐层聚合）/ `cell` 混合矩阵元素 `h_res_cell{i}` / `gain` 增益放大 / `param` 可学习参数 / `share` 残差占比 |
 | `qk_stats` | `sink` sink head / `logit` logits 量级 / `entropy` 注意力熵 / `qkv` q/k/v 范数 |
 | `massive_act` | `channel` 通道量级分布 / `outlier` 超大通道计数 / `module` 各模块输出量级 / `norm` 归一化后表示 / `overall` 整体激活量级 |
 | `ape_health` | `softmax` 位置 softmax 形状 / `coverage` 位置覆盖 / `scale` 量级与数值健康 |
@@ -816,15 +816,33 @@ setup_monitors(
 )
 ```
 
-PaddleFormers YAML 里用独立的一项（不塞进 `internal_medicine_monitors`）：
+单个 monitor 也可以直接传 `exclude_families=["mix"]`。只提供排除式、不提供白名单：白名单会把分类表的遗漏变成静默漏采（新族不在名单里 → 不采集，且无人察觉），而排除式下同样的遗漏只是「payload 没省下来」。想「只看某几族」就填它的补集。
+
+### 线上默认与 debug 模式 (debug_mode)
+
+训练侧不暴露族名字符串，只有一个布尔开关：**默认（`debug_mode=False`）排除按结构单元膨胀的族**，`debug_mode=True` 才全采。这个集合是代码里的常量 `DEBUG_ONLY_FAMILIES`：
+
+| Monitor | 默认排除的族 | 内容 | 膨胀方式 |
+|---------|------------|------|---------|
+| `moe_health` | `expert` | `expert_{token,weight}_share_e{i}` | 每专家一条 |
+| `mhc_health` | `cell` | `{attn,mlp}_h_res_cell{i}` | 每层每个混合矩阵元素一条 |
+| `mhc_health` | `stream` | `{attn,mlp}_h_{pre,post}_idx{i}` | 每层每个输入流一条 |
+
+在 43 层 mHC + MoE 的配置上，这三族占每步 3732 个 key 里的 1392 个（37.3%）——同比例地占跨 rank 聚合的 payload 和落盘的 jsonl。其余族的 key 数只随层数变化。
+
+关键是这三族**恰好是诊断层不读的部分**：诊断看的是逐层聚合量（`h_res_logits_max`、`h_post_mean`、`h_post_stream_concentration` 等），它们留在 `mix` / `gate` 里照常采集。所以线上默认只省 payload，不损失任何诊断深度——这也正是把 `mix` / `gate` 各拆成「逐层聚合」和「按单元展开」两族的原因。
 
 ```yaml
 internal_medicine_monitors: "qk_stats,moe_health,massive_act,mhc_health,vha_health"
 internal_medicine_monitor_interval: 200
-internal_medicine_exclude_families: "mhc_health:mix, moe_health:expert+act"
+internal_medicine_debug_mode: false   # true = 连按专家/按 cell/按流的族一起采
 ```
 
-单个 monitor 也可以直接传 `exclude_families=["mix"]`。只提供排除式、不提供白名单：白名单会把分类表的遗漏变成静默漏采（新族不在名单里 → 不采集，且无人察觉），而排除式下同样的遗漏只是「payload 没省下来」。想「只看某几族」就填它的补集。
+```python
+from internal_medicine.core.metric_families import exclusions_for
+
+setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode=False))
+```
 
 ---
 

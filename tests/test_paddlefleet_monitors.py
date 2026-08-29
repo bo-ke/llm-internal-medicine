@@ -3143,3 +3143,11 @@ class MetricFamilySelectionTest(unittest.TestCase):
             SimpleNamespace(layers=[]), monitor_dict=monitor_dict, exclude_families="expert+act"
         )
         self.assertEqual(monitor_dict["moe_health"].family_selection.excluded, frozenset({"expert", "act"}))
+
+    def test_setup_monitors_rejects_a_misspelled_monitor_name(self):
+        """Otherwise the loop simply never matches it and nothing is switched off."""
+        metric_families = importlib.import_module("internal_medicine.core.metric_families")
+        with self.assertRaises(metric_families.UnknownMonitorError):
+            paddlefleet_backend.setup_monitors(
+                SimpleNamespace(), monitors=["moe_health"], exclude_families="moe:expert"
+            )

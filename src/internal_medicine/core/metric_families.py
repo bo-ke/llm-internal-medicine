@@ -29,12 +29,14 @@ __all__ = [
     "METRIC_TAXONOMY",
     "FAMILY_OTHER",
     "UnknownFamilyError",
+    "UnknownMonitorError",
     "classify",
     "components_of",
     "families_of",
     "parse_exclude",
     "parse_exclusions",
     "strip_prefixes",
+    "validate_exclusions",
     "FamilySelection",
 ]
 
@@ -236,8 +238,8 @@ def parse_exclusions(spec) -> dict[str, list[str]]:
 
     A monitor written without a ``:`` part, or an absent/empty spec, yields no
     entry — i.e. nothing is switched off and behaviour is exactly what it was
-    before families existed. Family names are validated later, per monitor, by
-    ``parse_exclude``; monitor names are the registry's business.
+    before families existed. Names are not checked here: only the backend knows
+    its monitor registry, so both validations happen in ``validate_exclusions``.
     """
     if not spec:
         return {}
@@ -250,3 +252,33 @@ def parse_exclusions(spec) -> dict[str, list[str]]:
         if name and families:
             excluded.setdefault(name, []).extend(families)
     return excluded
+
+
+class UnknownMonitorError(ValueError):
+    """A config excluded families from a monitor the backend does not have."""
+
+
+def validate_exclusions(excluded, known_monitors, backend: str = "") -> None:
+    """Fail the run on a monitor name the backend never heard of.
+
+    Family names are already fail-closed inside ``parse_exclude``, but a
+    misspelled *monitor* name would otherwise be fail-open: the backend's setup
+    loop only injects ``exclude_families`` for names it recognises, so
+    ``"moe:expert"`` silently switches nothing off. The only symptom is a payload
+    that did not shrink. Both backends therefore call this right after parsing,
+    which also moves family validation ahead of their per-monitor
+    ``try/except Exception`` — inside it, a family typo would degrade into a
+    logged "failed to setup" instead of stopping the run.
+
+    A name the backend knows but this run did not enable passes silently: the
+    exclusion is simply inert, and sharing one exclusion string across configs
+    that enable different monitors is legitimate.
+    """
+    label = f"[InternalMedicine/{backend}] " if backend else ""
+    unknown = sorted(name for name in excluded if name not in known_monitors)
+    if unknown:
+        raise UnknownMonitorError(
+            f"{label}exclude_families names unknown monitors {unknown!r}; known monitors are {sorted(known_monitors)!r}"
+        )
+    for name, families in excluded.items():
+        parse_exclude(name, families)

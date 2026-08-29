@@ -157,6 +157,22 @@ class FamilySelectionTest(unittest.TestCase):
             {"mhc_health": ["mix", "gain", "param"]},
         )
 
+    def test_a_misspelled_monitor_name_raises_instead_of_switching_nothing_off(self):
+        """The fail-open half: the backend loop would just never match "moe"."""
+        with self.assertRaises(mf.UnknownMonitorError) as caught:
+            mf.validate_exclusions(mf.parse_exclusions("moe:expert"), {"moe_health": None}, backend="paddlefleet")
+        self.assertIn("moe", str(caught.exception))
+        self.assertIn("moe_health", str(caught.exception))  # the message lists what is valid
+
+    def test_validate_exclusions_also_checks_family_names(self):
+        """So a family typo raises before the backends' per-monitor try/except."""
+        with self.assertRaises(mf.UnknownFamilyError):
+            mf.validate_exclusions(mf.parse_exclusions("moe_health:experts"), {"moe_health": None})
+
+    def test_a_known_but_unused_monitor_is_accepted(self):
+        """One exclusion string may be shared by configs enabling different monitors."""
+        mf.validate_exclusions(mf.parse_exclusions("moe_health:expert"), {"moe_health": None, "qk_stats": None})
+
 
 if __name__ == "__main__":
     unittest.main()

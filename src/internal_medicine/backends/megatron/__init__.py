@@ -2,7 +2,7 @@
 
 import logging
 
-from ...core.metric_families import parse_exclusions
+from ...core.metric_families import parse_exclusions, validate_exclusions
 from .base import TorchProbe
 from .gather import install_gather_fn
 from .massive_activation_monitor import MassiveActivationMonitor, setup_massive_activation_monitor
@@ -35,6 +35,7 @@ def setup_monitors(
     install_gather_fn()
     hook_timing_enabled = bool(kwargs.pop("hook_timing_enabled", False))
     excluded = exclude_families if isinstance(exclude_families, dict) else parse_exclusions(exclude_families)
+    validate_exclusions(excluded, {**_MONITOR_MAP, **_ALWAYS_ON_MONITORS}, backend="megatron")
 
     if monitors is None:
         monitors = ["all"]

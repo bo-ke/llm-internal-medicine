@@ -2,7 +2,7 @@
 
 import logging
 
-from ...core.metric_families import parse_exclusions
+from ...core.metric_families import parse_exclusions, validate_exclusions
 from .ape_monitor import PaddleAPEHealthMonitor, setup_ape_monitor
 from .attn_update_monitor import PaddleAttnUpdateMonitor, setup_attn_update_monitor
 from .base import PaddleProbe
@@ -74,8 +74,8 @@ def setup_monitors(
     ``exclude_families`` names metric families to switch off, either as a spec
     string (``"mhc_health:mix, moe_health:expert+act"``) or as an already-parsed
     ``{monitor: [family, ...]}`` mapping. Families not named stay on, so omitting
-    it reproduces the previous behaviour exactly. Unknown family names raise from
-    the monitor's constructor — see ``core.metric_families``.
+    it reproduces the previous behaviour exactly. An unknown monitor or family
+    name raises here, before any monitor is built — see ``core.metric_families``.
     """
     install_gather_fn()
 
@@ -85,6 +85,7 @@ def setup_monitors(
     if monitor_dict is None:
         monitor_dict = {}
     excluded = exclude_families if isinstance(exclude_families, dict) else parse_exclusions(exclude_families)
+    validate_exclusions(excluded, _MONITOR_MAP, backend="paddlefleet")
 
     model_monitor_dict = getattr(model, _MODEL_MONITOR_ATTR, None)
     if model_monitor_dict is None:

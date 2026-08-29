@@ -153,6 +153,53 @@ class CoreMonitoringTest(unittest.TestCase):
     def test_paddlefleet_registry_lists_massive_activation_monitor(self):
         self.assertIn("massive_act", AVAILABLE_MONITORS["paddlefleet"])
 
+    def test_sampled_this_step_marks_exactly_the_steps_the_hooks_recorded(self):
+        """The flag is what a trainer callback gates its cross-rank gather on.
+
+        It has to agree with `_should_monitor()` as seen *inside* the hooks —
+        i.e. the pre-increment `step_count` — or the callback either drops
+        metrics or pays for an empty collective.
+        """
+        for interval in (1, 2, 3, 5, 200):
+            probe = DummyProbe(monitor_interval=interval)
+            recorded, flagged = [], []
+            for global_step in range(1, 4 * interval + 2):
+                if probe._should_monitor():  # forward: hooks see step_count pre-increment
+                    recorded.append(global_step)
+                probe.step()  # on_step_end
+                if probe.sampled_this_step:  # on_log
+                    flagged.append(global_step)
+            self.assertEqual(recorded, flagged, f"interval={interval}")
+            self.assertEqual(recorded[0], 1, f"interval={interval}")
+
+    def test_sampled_this_step_survives_a_resume_at_an_unaligned_step(self):
+        """`step_count` restarts at 0 on resume while `global_step` does not.
+
+        Deriving the phase from `global_step % interval` drifts (and silently
+        drops every sampled step); the flag cannot, because it only ever reads
+        `step_count`.
+        """
+        interval = 200
+        for resume_at in (0, 300, 5050, 999):
+            probe = DummyProbe(monitor_interval=interval)
+            recorded, flagged, by_global_step = [], [], []
+            for global_step in range(resume_at + 1, resume_at + 1 + 3 * interval):
+                if probe._should_monitor():
+                    recorded.append(global_step)
+                probe.step()
+                if probe.sampled_this_step:
+                    flagged.append(global_step)
+                if global_step % interval == 1:
+                    by_global_step.append(global_step)
+            self.assertEqual(recorded, flagged, f"resume_at={resume_at}")
+            if resume_at % interval:
+                self.assertNotEqual(recorded, by_global_step, f"resume_at={resume_at}")
+
+    def test_sampled_this_step_is_false_when_monitoring_is_disabled(self):
+        probe = DummyProbe(monitor_interval=0)
+        probe.step()
+        self.assertFalse(probe.sampled_this_step)
+
 
 if __name__ == "__main__":
     unittest.main()

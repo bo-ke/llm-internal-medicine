@@ -759,6 +759,23 @@ from internal_medicine import training_logs
 | 包含 `_min` 或以 `/min` 结尾 | `np.min(all_ranks)` |
 | 其他 | `np.mean(all_ranks)` |
 
+**`monitor_interval > 1` 时不要每步都调用**：`gather_and_aggregate()` 是全 world 的
+集合通信，只有采样步才可能产出指标，其余步跑的是一次空的 `all_gather_object`
+（6144 卡实测 872 ms/步）。调用方应当先问 `monitor.sampled_this_step`——它由
+`step()` 在自增前锁存，是"刚结束这一步的 hook 有没有采样"的唯一权威答案：
+
+```python
+if any(m.sampled_this_step for m in monitor_dict.values()):
+    aggregated = training_logs.gather_and_aggregate()
+```
+
+**不要**用调用方自己的步数取模去推这个相位（`global_step % interval == 1`）。
+`step_count` 是进程内变量、续训从 0 重开，而 `global_step` 从 checkpoint 恢复；
+两者相位一旦错开（resume 步不是 `monitor_interval` 整数倍时必然错开），门控会
+静默挡掉全部采样步。同时注意：这个判断决定要不要进集合通信，**条件必须全 rank
+一致**，`sampled_this_step` 只依赖各 rank 同步推进的 `step_count`，本地指标是否
+为空则不满足这个要求（历史上据此早返回导致过 PP 死锁）。
+
 注意: QK Stats Monitor 不在 hook 内做 TP `all_reduce`/`all_gather`，避免在 attention 热路径插入通信；跨 rank 聚合统一交给 `gather_and_aggregate()`。MassiveAct 会先对 TP 内 per-channel maxima 做 `MAX all_reduce`（通道维被 TP 切分时这是正确性所需），再依赖 `gather_and_aggregate()` 做跨 rank 聚合；MoE/PLE 同样依赖 `gather_and_aggregate()` 统一处理。
 
 ### 通用配置参数

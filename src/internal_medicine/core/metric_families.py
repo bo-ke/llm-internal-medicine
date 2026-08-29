@@ -27,11 +27,13 @@ import re
 
 __all__ = [
     "METRIC_TAXONOMY",
+    "DEBUG_ONLY_FAMILIES",
     "FAMILY_OTHER",
     "UnknownFamilyError",
     "UnknownMonitorError",
     "classify",
     "components_of",
+    "exclusions_for",
     "families_of",
     "parse_exclude",
     "parse_exclusions",
@@ -54,8 +56,12 @@ _VHA_BRANCH_RE = re.compile(r"^(?:main|sparse)_(?P<base>.+)$")
 METRIC_TAXONOMY: dict[str, dict] = {
     "mhc_health": {
         "components": ("attn", "mlp"),
+        # `stream` and `cell` must precede `gate` / `mix`: they are the per-unit
+        # slices of those same quantities and would otherwise be swallowed.
         "families": (
+            ("stream", "按流门控值 h_pre / h_post_idx", r"^h_(pre|post)_idx\d"),
             ("gate", "门控强度 h_pre / h_post", r"^h_(pre|post)(_|$)"),
+            ("cell", "混合矩阵元素 h_res_cell", r"^h_res_cell\d"),
             ("mix", "混合矩阵 h_res", r"^h_res(_|$)"),
             ("gain", "增益放大 amax / composite", r"amax_gain"),
             ("param", "可学习参数 α / bias", r"^(alpha|bias)_"),
@@ -194,6 +200,40 @@ class FamilySelection:
 
 class UnknownFamilyError(ValueError):
     """A config named a family the monitor does not declare."""
+
+
+# Families kept out of a production run and collected only under debug mode.
+#
+# The criterion is *how a family's key count grows*, not how interesting it is:
+# each family below emits one curve per structural unit — per expert, per
+# hyper-connection cell, per input stream — so its footprint scales with depth x
+# expert count while every other family stays constant. On a 43-layer mHC + MoE
+# run these three are 1392 of 3732 keys per step (37.3%), the same share of the
+# cross-rank payload and of the jsonl on disk.
+#
+# They are also exactly the families the diagnosis layer never reads: it works
+# off the per-layer aggregates (`h_res_logits_max`, `h_post_mean`, ...), which
+# stay on. So this default costs payload and nothing else — the reason `mix` and
+# `gate` are split into an aggregate half and a per-unit half at all.
+#
+# Deliberately a code-side constant rather than a config string: the switch that
+# selects it carries one bit, so there is nothing to get wrong in a yaml file,
+# and changing what "debug" means becomes a reviewable diff.
+DEBUG_ONLY_FAMILIES: dict[str, tuple[str, ...]] = {
+    "moe_health": ("expert",),
+    "mhc_health": ("cell", "stream"),
+}
+
+
+def exclusions_for(debug_mode: bool) -> dict[str, list[str]]:
+    """``{monitor: [family, ...]}`` to switch off for this run.
+
+    ``debug_mode=True`` collects everything; the production default drops
+    ``DEBUG_ONLY_FAMILIES``. Returns a fresh dict so callers may mutate it.
+    """
+    if debug_mode:
+        return {}
+    return {monitor: list(families) for monitor, families in DEBUG_ONLY_FAMILIES.items()}
 
 
 def _split_names(value) -> list[str]:

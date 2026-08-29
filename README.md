@@ -217,11 +217,9 @@ PaddleFleet 后端还会直接从每次 router forward 的实际选择结果输�
 
 > **注**: 指标 27-28 (`expert_*_share`) 是**每层每专家一条曲线**的向量指标 (256 专家的
 > 18 层模型 = 9216 个键), 只在 `log_per_layer=true` 时输出, 且不派生 `global_*`。
-> **默认关闭**, 按需打开:
-> `setup_monitors(model, moe_health={"log_per_expert_share": True})`。
 > 键数是 `2 × num_experts` / 层 (512 专家 = 1024 键/层, 对比同层标量的 ~56 个),
-> 会主导 `gather_and_aggregate()` 跨全 world `all_gather_object` 的 pickle payload,
-> 数千卡规模下这部分开销显著, 因此只在排查具体是哪个专家不均衡时打开。
+> 但它们在 flush 时已在 GPU 上按 DP(+CP) 组归约完毕并 `mark_pre_aggregated`,
+> 逐元素键不进 `gather_and_aggregate()` 的 payload, 因此不再随卡数放大通信量。
 > 它们与 `assignment_load_*` / `gate_mass_*` 互补: 后者回答一层「有多不均衡」,
 > 前者回答「是哪个专家造成的、是否长期是同一个」。
 >

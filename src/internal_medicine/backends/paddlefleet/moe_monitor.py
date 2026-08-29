@@ -401,18 +401,10 @@ class PaddleMoEMonitor(PaddleProbe):
         "router_margin_min",
     }
 
-    def __init__(
-        self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False, log_per_expert_share=False
-    ):
+    def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
-        # Per-expert share curves emit one key per expert per layer, so they dominate
-        # the payload gather_and_aggregate pickles across the whole world (E=512 x 2
-        # metrics = 1024 keys/layer against ~56 scalars). Off by default: the scalar
-        # assignment_load_* / gate_mass_* family already answers "how imbalanced",
-        # and these answer "which expert" — only needed when drilling into a hotspot.
-        self.log_per_expert_share = log_per_expert_share
         self._patched_gates = []
         self._patched_moe_layers = []
         self._expert_norm_layers = []
@@ -504,7 +496,7 @@ class PaddleMoEMonitor(PaddleProbe):
             # num_experts must come from static config here — a hook-time
             # reduction would need a D2H sync to size the schema.
             num_experts = int(getattr(getattr(moe_layer, "gate", None), "num_experts", 0) or 0)
-            if self.log_per_expert_share and num_experts > 0:
+            if num_experts > 0:
                 for m in ("expert_token_share", "expert_weight_share"):
                     self.declare_layer_vector(layer_idx, m, num_experts)
 
@@ -933,13 +925,7 @@ class PaddleMoEMonitor(PaddleProbe):
         leaves the GPU and neither needs a hook-time collective: the cross-rank
         mean over DP ranks equals the global share, because every rank routes the
         same number of tokens.
-
-        No-op unless ``log_per_expert_share`` is set: the keys are not declared in
-        that case, so recording would be dropped anyway — returning here also skips
-        the normalisation kernels.
         """
-        if not self.log_per_expert_share:
-            return
         self.record_layer_vector(layer_idx, "expert_token_share", assignment / assignment.sum().clip(min=1e-12) * 100.0)
         probs = outputs[3] if isinstance(outputs, tuple | list) and len(outputs) > 3 else None
         if isinstance(probs, paddle.Tensor):
@@ -1047,14 +1033,12 @@ def setup_moe_monitor(
     monitor_interval=1,
     verbose=False,
     monitor_dict=None,
-    log_per_expert_share=False,
 ):
     monitor = PaddleMoEMonitor(
         log_per_layer=log_per_layer,
         log_global=log_global,
         monitor_interval=monitor_interval,
         verbose=verbose,
-        log_per_expert_share=log_per_expert_share,
     )
     monitor.register_hooks(model)
     logger.info(f"[PaddleMoEMonitor] Setup complete. Monitoring {len(monitor.hooks)} hooks.")

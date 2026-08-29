@@ -139,7 +139,12 @@ def main():
         tensor[f"probe/layer_{owned_layer}/metric_0"],
         owned_layer * 100.0 + 0.01 * mean_of_ranks,
     )
-    check(results, "peak_max is the stage maximum", tensor[f"probe/layer_{owned_layer}/peak_max"], 1000.0 - stage * dp_size)
+    check(
+        results,
+        "peak_max is the stage maximum",
+        tensor[f"probe/layer_{owned_layer}/peak_max"],
+        1000.0 - stage * dp_size,
+    )
     check(
         results,
         "floor_min is the stage minimum",
@@ -176,7 +181,12 @@ def main():
     else:
         results.append(("world-wide schema absorbed the key", not training_logs._tensor_path_disabled, 1, 1))
     check(results, "rank-unique key value is right either way", fallback.get("probe/rank0_only", float("nan")), 42.0)
-    check(results, "shared keys still correct after the mismatch", fallback["probe/global_metric_0"], 7.0 + (world - 1) / 2)
+    check(
+        results,
+        "shared keys still correct after the mismatch",
+        fallback["probe/global_metric_0"],
+        7.0 + (world - 1) / 2,
+    )
 
     failures = [r for r in results if not r[1]]
     print(

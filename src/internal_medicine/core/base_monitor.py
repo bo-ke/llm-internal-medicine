@@ -36,6 +36,7 @@ class Probe(ABC):
         self.verbose = verbose
         self.hooks = []
         self.step_count = 0
+        self.sampled_this_step = False
         self.pp_rank = 0
         self._global_accum: dict[str, float] = {}
         self._global_metric_counts: dict[str, int] = {}
@@ -50,6 +51,15 @@ class Probe(ABC):
         self.hooks = []
 
     def step(self):
+        # Latch *before* the increment: the hooks that ran during this step's
+        # forward saw the pre-increment ``step_count``, so this is the answer to
+        # "did this step sample anything?". A trainer callback that wants to skip
+        # the cross-rank gather on non-sampling steps must read this instead of
+        # re-deriving the phase from its own global step counter — that counter
+        # resumes from a checkpoint while ``step_count`` restarts at 0, and the
+        # two drift apart whenever the resume step is not a multiple of
+        # ``monitor_interval``.
+        self.sampled_this_step = self._interval_reached()
         self.step_count += 1
         self._flush_buffers()
         if self.log_global and self._global_accum:
@@ -62,10 +72,19 @@ class Probe(ABC):
         """
         return None
 
-    def _should_monitor(self) -> bool:
+    def _interval_reached(self) -> bool:
+        """Whether ``step_count`` puts this step on the sampling interval.
+
+        The single owner of the sampling phase. ``_should_monitor`` adds
+        backend-specific conditions on top; ``step`` latches this one alone so
+        the flag stays a pure function of the step counter.
+        """
         if not self.monitor_interval:
             return False
         return self.step_count % self.monitor_interval == 0
+
+    def _should_monitor(self) -> bool:
+        return self._interval_reached()
 
     # ------------------------------------------------------------------
     # Legacy CPU-float API

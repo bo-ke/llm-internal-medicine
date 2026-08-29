@@ -82,6 +82,150 @@ class CoreMonitoringTest(unittest.TestCase):
         self.assertEqual(calls, [{}], "gather_fn must be called even with no local metrics")
         self.assertEqual(aggregated, {"dummy/layer_0/mean": 4.0})
 
+    def test_pre_aggregated_keys_skip_the_gather_payload(self):
+        """Device-reduced keys must not be pickled per rank, but must still be returned.
+
+        Vector metrics emit one key per element (512 experts x 43 layers), so leaving
+        them in the ``all_gather_object`` dict dominates the payload while every rank
+        already agrees on the value.
+        """
+        calls = []
+
+        def fake_gather(local_metrics):
+            calls.append(dict(local_metrics))
+            return [local_metrics, {"dummy/layer_0/mean": 4.0}]
+
+        training_logs.update(**{"dummy/layer_0/mean": 2.0, "dummy/layer_0/share_e0": 7.0})
+        training_logs.mark_pre_aggregated(["dummy/layer_0/share_e0"])
+        training_logs.set_gather_fn(fake_gather)
+        try:
+            aggregated = training_logs.gather_and_aggregate()
+        finally:
+            training_logs.set_gather_fn(None)
+            training_logs._pre_aggregated_keys.clear()
+
+        self.assertEqual(calls, [{"dummy/layer_0/mean": 2.0}], "pre-aggregated key must be excluded")
+        self.assertEqual(aggregated["dummy/layer_0/mean"], 3.0)
+        self.assertEqual(aggregated["dummy/layer_0/share_e0"], 7.0, "value must survive as-is")
+
+    def _install_two_rank_reduce(self, other_metrics):
+        """Fake the fixed-schema reduce against one more rank holding ``other_metrics``.
+
+        Decodes the vectors with the schema training_logs just froze, so the test
+        also pins the layout (offsets of the resync flag and the two checksums).
+        """
+
+        def schema_sync_fn(local_keys):
+            return [list(local_keys), sorted(other_metrics)]
+
+        def reduce_fn(sum_vec, max_vec, min_vec):
+            # The fixed-size (length, checksum) probe: both ranks agree, so MAX
+            # and MIN of it come back identical.
+            if not sum_vec:
+                return [], list(max_vec), list(min_vec)
+            mean_keys = training_logs._schema_mean
+            width = len(mean_keys)
+            sums = list(sum_vec[:width])
+            mask = list(sum_vec[width:])
+            for i, k in enumerate(mean_keys):
+                if k in other_metrics:
+                    sums[i] += other_metrics[k]
+                    mask[i] += 1.0
+            maxes = list(max_vec)
+            for i, k in enumerate(training_logs._schema_max):
+                if k in other_metrics:
+                    maxes[1 + i] = max(maxes[1 + i], other_metrics[k])
+            mins = list(min_vec)
+            for i, k in enumerate(training_logs._schema_min):
+                if k in other_metrics:
+                    mins[i] = min(mins[i], other_metrics[k])
+            return sums + mask, maxes, mins
+
+        training_logs.set_schema_sync_fn(schema_sync_fn)
+        training_logs.set_reduce_fn(reduce_fn)
+
+    def _clear_aggregation_fns(self):
+        training_logs.set_reduce_fn(None)
+        training_logs.set_schema_sync_fn(None)
+        training_logs.set_gather_fn(None)
+
+    def test_tensor_path_matches_the_legacy_gather_path(self):
+        """The fixed-schema reduce must reproduce all_gather_object numerically.
+
+        mean stays an unweighted mean over the ranks holding the key (the presence
+        mask, not an observation count), and max/min keys present on only one rank
+        must survive instead of collapsing to +-inf.
+        """
+        local = {"dummy/layer_0/mean": 2.0, "dummy/layer_0/peak_max": 5.0, "dummy/layer_0/floor_min": 3.0}
+        other = {"dummy/layer_0/mean": 4.0, "dummy/layer_0/peak_max": 1.0, "dummy/layer_1/mean": 9.0}
+
+        training_logs.update(**local)
+        try:
+            training_logs.set_gather_fn(lambda m: [dict(m), dict(other)])
+            legacy = training_logs.gather_and_aggregate()
+
+            self._install_two_rank_reduce(other)
+            tensor = training_logs.gather_and_aggregate()
+        finally:
+            self._clear_aggregation_fns()
+
+        self.assertEqual(set(tensor), set(legacy))
+        for k in legacy:
+            self.assertAlmostEqual(tensor[k], legacy[k], places=12, msg=k)
+        self.assertAlmostEqual(tensor["dummy/layer_0/mean"], 3.0, places=12)
+        self.assertAlmostEqual(tensor["dummy/layer_1/mean"], 9.0, places=12, msg="single-rank key keeps its value")
+        self.assertAlmostEqual(tensor["dummy/layer_0/peak_max"], 5.0, places=12)
+        self.assertAlmostEqual(tensor["dummy/layer_0/floor_min"], 3.0, places=12)
+
+    def test_tensor_path_rebuilds_the_schema_for_a_late_key(self):
+        """A key appearing after the schema froze triggers one collective rebuild."""
+        training_logs.update(**{"dummy/layer_0/mean": 2.0})
+        rebuilds = []
+        try:
+            self._install_two_rank_reduce({"dummy/layer_0/mean": 4.0})
+            inner = training_logs._schema_sync_fn
+
+            def counting_sync(local_keys):
+                rebuilds.append(sorted(local_keys))
+                return inner(local_keys)
+
+            training_logs._schema_sync_fn = counting_sync
+            training_logs.gather_and_aggregate()
+            self.assertEqual(len(rebuilds), 1)
+
+            # optim-style key written after the first aggregation.
+            training_logs.update(**{"optim/update_rms": 8.0})
+            aggregated = training_logs.gather_and_aggregate()
+            disabled = training_logs._tensor_path_disabled
+        finally:
+            self._clear_aggregation_fns()
+
+        self.assertEqual(len(rebuilds), 2, "the resync flag must trigger exactly one rebuild")
+        self.assertAlmostEqual(aggregated["optim/update_rms"], 8.0, places=12)
+        self.assertFalse(disabled)
+
+    def test_tensor_path_falls_back_when_schemas_disagree(self):
+        """A schema mismatch must be caught by the fixed-size probe, not by hanging.
+
+        Two ranks with different schemas build payload vectors of different lengths;
+        a mismatched all_reduce hangs, so the probe has to catch it first.
+        """
+        training_logs.update(**{"dummy/layer_0/mean": 2.0})
+        try:
+            training_logs.set_gather_fn(lambda m: [dict(m), {"dummy/layer_9/mean": 6.0}])
+            training_logs.set_schema_sync_fn(lambda keys: [list(keys)])
+            # Only the probe is answered, and with a checksum the other rank does
+            # not share: MAX and MIN of it diverge.
+            training_logs.set_reduce_fn(lambda s, mx, mn: ([], [mx[0], mx[1] + 1.0], list(mn)))
+            aggregated = training_logs.gather_and_aggregate()
+            disabled = training_logs._tensor_path_disabled
+        finally:
+            self._clear_aggregation_fns()
+
+        self.assertTrue(disabled, "must latch off after a mismatch")
+        self.assertAlmostEqual(aggregated["dummy/layer_0/mean"], 2.0, places=12)
+        self.assertAlmostEqual(aggregated["dummy/layer_9/mean"], 6.0, places=12, msg="legacy path took over")
+
     def test_log_flags_are_respected(self):
         probe = DummyProbe(log_per_layer=False, log_global=True)
         probe._record_metrics(0, {"mean": 2.0})

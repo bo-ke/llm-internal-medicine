@@ -217,6 +217,11 @@ PaddleFleet 后端还会直接从每次 router forward 的实际选择结果输�
 
 > **注**: 指标 27-28 (`expert_*_share`) 是**每层每专家一条曲线**的向量指标 (256 专家的
 > 18 层模型 = 9216 个键), 只在 `log_per_layer=true` 时输出, 且不派生 `global_*`。
+> **默认关闭**, 按需打开:
+> `setup_monitors(model, moe_health={"log_per_expert_share": True})`。
+> 键数是 `2 × num_experts` / 层 (512 专家 = 1024 键/层, 对比同层标量的 ~56 个),
+> 会主导 `gather_and_aggregate()` 跨全 world `all_gather_object` 的 pickle payload,
+> 数千卡规模下这部分开销显著, 因此只在排查具体是哪个专家不均衡时打开。
 > 它们与 `assignment_load_*` / `gate_mass_*` 互补: 后者回答一层「有多不均衡」,
 > 前者回答「是哪个专家造成的、是否长期是同一个」。
 >
@@ -749,7 +754,7 @@ from internal_medicine import training_logs
 
 ### 跨卡聚合
 
-`training_logs.gather_and_aggregate()` 通过 `dist.all_gather_object` 收集所有 rank 的指标，然后按键名规则聚合：
+`training_logs.gather_and_aggregate()` 按键名规则做跨 rank 聚合：
 
 | 键名模式 | 聚合方式 |
 |----------|----------|
@@ -759,9 +764,21 @@ from internal_medicine import training_logs
 | 包含 `_min` 或以 `/min` 结尾 | `np.min(all_ranks)` |
 | 其他 | `np.mean(all_ranks)` |
 
+**通信实现**: 主路径是**固定 schema 的 tensor all_reduce**（SUM / MAX / MIN 各一次），
+上线量是 `O(全局 key 数)`，与卡数无关；4096 卡实测从 `all_gather_object` 的 43.7 s CPU
+降到 132 KB 通信 + 1.4 ms Python 开销。schema 在启动时于 **PP 组内** all_gather 一次得到
+（同一 PP stage 的各 rank 声明相同的 key）。每次 reduce 前有一次定长的
+`(schema 长度, crc32)` 探针：若各 rank 的 schema 不一致就打 warning 并永久回退到
+`all_gather_object`——**不猜、不 hang**。向量指标（`expert_*_share_eK` 等）更进一步，
+在 flush 时就在 GPU 上按 DP(+CP) 组归约完毕，逐元素 key 完全不进聚合路径。
+
+多卡正确性验证见 `tests/manual_verify_tensor_aggregate.py`（PP=1/2/4/8 × 8 卡，
+比对新旧两条路径逐 key 的一致性）。
+
 **`monitor_interval > 1` 时不要每步都调用**：`gather_and_aggregate()` 是全 world 的
-集合通信，只有采样步才可能产出指标，其余步跑的是一次空的 `all_gather_object`
-（6144 卡实测 872 ms/步）。调用方应当先问 `monitor.sampled_this_step`——它由
+集合通信，只有采样步才可能产出指标，其余步跑的是一次空通信（`all_gather_object`
+路径下 6144 卡实测 872 ms/步；换成 tensor all_reduce 后便宜很多，但仍是一次全局
+同步）。调用方应当先问 `monitor.sampled_this_step`——它由
 `step()` 在自增前锁存，是"刚结束这一步的 hook 有没有采样"的唯一权威答案：
 
 ```python

@@ -509,7 +509,7 @@ class PaddleMoEMonitorTest(unittest.TestCase):
 
     def test_expert_shares_come_from_assignment_and_probs(self):
         """assignment -> token share, probs -> combine-weight share, both in percent."""
-        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False, log_per_expert_share=True)
         monitor.declare_layer_vector(0, "expert_token_share", 3)
         monitor.declare_layer_vector(0, "expert_weight_share", 3)
         monitor.allocate_buffers()
@@ -534,7 +534,7 @@ class PaddleMoEMonitorTest(unittest.TestCase):
 
     def test_expert_token_share_survives_missing_probs(self):
         """A gate that returns no combine weights still yields the token share."""
-        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False, log_per_expert_share=True)
         monitor.declare_layer_vector(0, "expert_token_share", 2)
         monitor.declare_layer_vector(0, "expert_weight_share", 2)
         monitor.allocate_buffers()
@@ -546,6 +546,86 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e0"], 75.0, places=4)
         self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e1"], 25.0, places=4)
         self.assertNotIn("moe_health/layer_0/expert_weight_share_e0", latest)
+
+    def test_per_expert_share_recording_is_off_by_default(self):
+        """The curves are opt-in: 2 x num_experts keys/layer dominate the gather payload."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        self.assertFalse(monitor.log_per_expert_share)
+        monitor.declare_layer_vector(0, "expert_token_share", 2)
+        monitor.allocate_buffers()
+
+        monitor._record_expert_shares(0, paddle.to_tensor([3.0, 1.0]), (None, None, None))
+        monitor.step()
+
+        self.assertEqual(training_logs.get_latest(prefix="moe_health"), {})
+
+    def test_per_expert_share_declaration_follows_the_flag(self):
+        """register_hooks declares the vectors only when the flag is on."""
+
+        class Gate(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.num_experts = 4
+
+        class TransformerLayer(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layer_idx = 0
+                self.mlp = nn.Layer()
+                self.mlp.gate = Gate()
+
+        class Model(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.LayerList([TransformerLayer()])
+
+        off = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        off.register_hooks(Model())
+        self.assertEqual(off._vector_keys, {})
+
+        on = PaddleMoEMonitor(log_per_layer=True, log_global=False, log_per_expert_share=True)
+        on.register_hooks(Model())
+        self.assertEqual(
+            set(on._vector_keys),
+            {"moe_health/layer_0/expert_token_share", "moe_health/layer_0/expert_weight_share"},
+        )
+        self.assertEqual(on._vector_keys["moe_health/layer_0/expert_token_share"], 4)
+
+    def test_vector_elem_keys_are_marked_pre_aggregated(self):
+        """allocate_buffers keeps the per-element keys out of the gather payload.
+
+        Their cross-rank reduction happens on device in _flush_gpu_buffer, so pickling
+        one copy per rank through all_gather_object would be pure overhead.
+        """
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False, log_per_expert_share=True)
+        monitor.declare_layer_vector(0, "expert_token_share", 3)
+        monitor.declare_layer_metric(0, "router_entropy")
+        try:
+            monitor.allocate_buffers()
+
+            for i in range(3):
+                self.assertIn(f"moe_health/layer_0/expert_token_share_e{i}", training_logs._pre_aggregated_keys)
+            self.assertNotIn("moe_health/layer_0/router_entropy", training_logs._pre_aggregated_keys)
+        finally:
+            training_logs._pre_aggregated_keys.clear()
+
+    def test_vector_reduction_is_a_noop_without_a_process_group(self):
+        """Single-card / no DP group: fall back to the rank-local vector mean."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False, log_per_expert_share=True)
+        monitor.declare_layer_vector(0, "expert_token_share", 2)
+        try:
+            monitor.allocate_buffers()
+            self.assertIsNone(monitor._vector_reduce_group())
+
+            monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([20.0, 80.0]))
+            monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([40.0, 60.0]))
+            monitor.step()
+
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e0"], 30.0, places=4)
+            self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e1"], 70.0, places=4)
+        finally:
+            training_logs._pre_aggregated_keys.clear()
 
     def test_gpu_buffer_multi_layer_global_aggregation(self):
         """Global metrics are derived from layer accumulators at flush time."""

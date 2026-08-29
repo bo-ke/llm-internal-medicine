@@ -455,43 +455,55 @@ Layer 1: Hook 内部通信
   原则: 除正确性必需外，hook hot path 避免 NCCL collective
 
 Layer 2: 全局聚合 (gather_and_aggregate)
-  └── dist.all_gather_object(info_list, all_metrics)
-  范围: world_size（全部卡，跨节点）
+  ├── 主路径: 固定 schema 的 tensor all_reduce（SUM / MAX / MIN）
+  │   数据量: O(全局 key 数)，与卡数无关
+  └── 回退路径: dist.all_gather_object，数据量 O(key 数 × 卡数)
   频率: 每 log_interval 步
-  数据量: ~90 KB/rank (pickle 序列化的 Python dict)
 ```
 
-### 5.2 开销估算（以 80 层 MoE+PLE 模型，512 卡为例）
+### 5.2 两条路径的实测成本
 
-| 通信 | 频率 | 单次数据量 | 每步总通信量 | 影响 |
-|------|------|-----------|-------------|------|
-| QK hook 内通信 | — | 0 | 0 | 无；QK 主要成本是额外 QK stats 计算 |
-| PLE hook 内通信 | — | 0 | 0 | 无 |
-| MoE hook 内通信 | — | 0 | 0 | 无 |
-| `gather_and_aggregate` | 每 log_interval 步 | 90 KB × 512 rank | ~45 MB | **主要开销** |
+按 43 层模型、每层 197 个标量指标（PP=4 → 每 rank 11 层 ≈ 2167 个 key）实测：
 
-### 5.3 `gather_and_aggregate` 的特点
+**回退路径 `all_gather_object`**（723 KB/rank pickle，含 per-expert 向量时）：
+
+| world_size | payload | 反序列化 | 聚合循环 | CPU 合计 |
+|---|---|---|---|---|
+| 512 | 362 MB | 1.15 s | 2.96 s | **4.1 s** |
+| 4096 | 2.9 GB | 9.3 s | 34.5 s | **43.7 s** |
+
+去掉 per-expert 向量后（111 KB/rank）4096 卡仍是 **5.4 s**，其中聚合循环占 4.3 s。
+注意 payload 是每个 rank 都要驻留的，几千卡下本身就是 OOM 风险。
+
+**主路径 tensor all_reduce**：全局 8471 个 key → 16943 个 float64 = **132 KB 上线量，与卡数无关**；
+Python 侧（填向量 + 拆结果）实测 **1.4 ms/flush**。三次 all_reduce 在这个尺寸下是延迟主导，
+随卡数只有对数增长。
+
+### 5.3 主路径的机制
 
 ```python
-# 使用 dist.all_gather_object — CPU 侧序列化通信
-dist.all_gather_object(info_list, all_metrics)  # Gloo backend, pickle
+# 定长 float64 向量，缺失位用 0 / -inf / +inf 填充
+# SUM: [mean 值 (M)] + [presence mask (M)]
+# MAX: [resync flag] + [max 值 (X)]
+# MIN: [min 值 (I)]
 ```
 
 | 特性 | 说明 |
 |------|------|
-| 通信后端 | Gloo (CPU)，**不是** NCCL (GPU) |
-| 序列化 | Python pickle，有编解码开销 |
-| 同步模型 | 全局 barrier — 所有 rank 必须同时参与 |
-| 数据量 | ~90 KB/rank 级别，带宽不是瓶颈 |
-| 真正的开销 | **同步等待** — 最慢 rank 决定所有人的等待时间 |
+| schema 来源 | 启动时在 **PP 组内** all_gather key 列表（组宽 = pp_size，一次性） |
+| 数值语义 | 除以 presence mask ⇒ 与旧路径逐位一致的「持有该 key 的 rank 等权平均」 |
+| 一致性保护 | 每次 reduce 前先做一次定长 (schema 长度, crc32) 探针 |
+| 不一致时 | 打 warning 并永久回退到 `all_gather_object`，不猜、不 hang |
+| 迟到的 key | resync flag 让所有 rank 一致地重建一次 schema 并重算 |
+| 向量指标 | 在 flush 时于 GPU 上按 DP(+CP) 组归约，逐元素 key 直接不进聚合路径 |
 
-### 5.4 优化空间
+关键不变量：**所有分支都由已归约的量决定**，因此各 rank 的判断与 collective 序列必然一致。
 
-当前设计的通信开销在 `log_interval ≥ 10` 时完全可以接受。进一步优化方向：
+### 5.4 剩余优化空间
 
-1. **DP group 内聚合替代全局聚合**: PLE/MoE 指标在各 DP rank 上是对称的，只需 DP group 内取均值即可，无需跨 TP/PP group
-2. **NCCL 替代 Gloo**: 将 dict 预编码为 tensor，走 NCCL all_reduce 而非 all_gather_object
-3. **异步聚合**: 在下一步训练的 forward 开始时异步触发上一步的聚合
+1. **mHC 的 76 标量/层** 现在是 payload 里的第一名（197 中的 39%），可以审一遍哪些真的需要每层出
+2. **异步聚合**: 在下一步 forward 开始时才取上一步的聚合结果，用来吃掉 straggler 抖动
+3. 已完成: per-expert 向量移出 pickle 路径、标量走固定 schema tensor all_reduce
 
 ---
 

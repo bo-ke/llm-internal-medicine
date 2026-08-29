@@ -45,8 +45,10 @@ class PaddleAPEHealthMonitor(PaddleProbe):
         monitor_interval: int = 1,
         verbose: bool = False,
         sample_layers: list[int] | None = None,
+        exclude_families=None,
     ):
         super().__init__(
+            exclude_families=exclude_families,
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,
@@ -141,8 +143,10 @@ def setup_ape_monitor(
     verbose: bool = False,
     sample_layers: list[int] | None = None,
     monitor_dict: dict | None = None,
+    exclude_families=None,
 ):
     monitor = PaddleAPEHealthMonitor(
+        exclude_families=exclude_families,
         log_per_layer=log_per_layer,
         log_global=log_global,
         monitor_interval=monitor_interval,

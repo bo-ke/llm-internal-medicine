@@ -2,6 +2,7 @@
 
 import logging
 
+from ...core.metric_families import parse_exclusions, validate_exclusions
 from .ape_monitor import PaddleAPEHealthMonitor, setup_ape_monitor
 from .attn_update_monitor import PaddleAttnUpdateMonitor, setup_attn_update_monitor
 from .base import PaddleProbe
@@ -65,8 +66,17 @@ def _normalize_monitor_names(monitors):
     return list(dict.fromkeys(names))
 
 
-def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
-    """Setup all requested monitors on a PaddleFleet model."""
+def setup_monitors(
+    model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, exclude_families=None, **kwargs
+):
+    """Setup all requested monitors on a PaddleFleet model.
+
+    ``exclude_families`` names metric families to switch off, either as a spec
+    string (``"mhc_health:mix, moe_health:expert+act"``) or as an already-parsed
+    ``{monitor: [family, ...]}`` mapping. Families not named stay on, so omitting
+    it reproduces the previous behaviour exactly. An unknown monitor or family
+    name raises here, before any monitor is built — see ``core.metric_families``.
+    """
     install_gather_fn()
 
     monitors = _normalize_monitor_names(monitors)
@@ -74,6 +84,8 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
         monitors = list(_MONITOR_MAP.keys())
     if monitor_dict is None:
         monitor_dict = {}
+    excluded = exclude_families if isinstance(exclude_families, dict) else parse_exclusions(exclude_families)
+    validate_exclusions(excluded, _MONITOR_MAP, backend="paddlefleet")
 
     model_monitor_dict = getattr(model, _MODEL_MONITOR_ATTR, None)
     if model_monitor_dict is None:
@@ -85,6 +97,8 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
             logger.warning(f"[InternalMedicine/paddlefleet] Unknown monitor: {name}, skipping")
             continue
         options = kwargs.get(name, {})
+        if name in excluded and "exclude_families" not in options:
+            options = {**options, "exclude_families": excluded[name]}
         expected_config = _monitor_config(monitor_interval, verbose, options)
         existing_monitor = model_monitor_dict.get(name)
         if existing_monitor is not None:

@@ -37,10 +37,20 @@ class TorchProbe(Probe):
     """
 
     def __init__(
-        self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False, hook_timing_enabled=False
+        self,
+        log_per_layer=True,
+        log_global=True,
+        monitor_interval=1,
+        verbose=False,
+        hook_timing_enabled=False,
+        exclude_families=None,
     ):
         super().__init__(
-            log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
+            log_per_layer=log_per_layer,
+            log_global=log_global,
+            monitor_interval=monitor_interval,
+            verbose=verbose,
+            exclude_families=exclude_families,
         )
         self._mean_keys: set[str] = set()
         self._max_keys: set[str] = set()
@@ -188,7 +198,9 @@ class TorchProbe(Probe):
         return f"{self.METRIC_PREFIX}/global_{metric_name}"
 
     def _should_disable_explicit_key(self, key: str) -> bool:
-        return key.startswith(f"{self.METRIC_PREFIX}/global_") and not self.log_global
+        if key.startswith(f"{self.METRIC_PREFIX}/global_") and not self.log_global:
+            return True
+        return not self.family_allows(key)
 
     def declare_layer_metric(self, layer_idx: int, metric_name: str) -> None:
         """Declare a per-layer key. The matching global key is derived from
@@ -197,6 +209,11 @@ class TorchProbe(Probe):
         if not (self.log_per_layer or self.log_global):
             return
         layer_key = self._layer_key(layer_idx, metric_name)
+        if not self.family_allows(layer_key):
+            # Registered as disabled rather than merely skipped: record_* looks the
+            # key up here to stay a cheap no-op instead of a KeyError.
+            self._disabled_keys.add(layer_key)
+            return
         global_key = self._global_key(metric_name)
         all_declared = self._mean_keys | self._max_keys | self._min_keys
         assert global_key not in all_declared, (

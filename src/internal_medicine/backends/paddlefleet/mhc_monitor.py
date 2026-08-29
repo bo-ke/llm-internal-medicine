@@ -187,10 +187,12 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         log_global: bool = True,
         monitor_interval: int = 1,
         verbose: bool = False,
+        exclude_families=None,
     ):
         self.MAX_AGGREGATED = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _MAX_METRICS}
         self.MIN_AGGREGATED = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _MIN_METRICS}
         super().__init__(
+            exclude_families=exclude_families,
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,
@@ -629,6 +631,7 @@ def setup_mhc_monitor(
     monitor_interval: int = 1,
     verbose: bool = False,
     monitor_dict: dict | None = None,
+    exclude_families=None,
 ):
     """Enable the mHC health monitor. No-op on any non-mHC model.
 
@@ -641,6 +644,7 @@ def setup_mhc_monitor(
         return model
 
     monitor = PaddleMHCHealthMonitor(
+        exclude_families=exclude_families,
         log_per_layer=log_per_layer,
         log_global=log_global,
         monitor_interval=monitor_interval,

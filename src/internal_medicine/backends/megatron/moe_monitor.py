@@ -76,9 +76,16 @@ class MoESpecialistMonitor(TorchProbe):
     MIN_AGGREGATED = {"score_sum_min", "expert_norm_min"}
 
     def __init__(
-        self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False, hook_timing_enabled=False
+        self,
+        log_per_layer=True,
+        log_global=True,
+        monitor_interval=1,
+        verbose=False,
+        hook_timing_enabled=False,
+        exclude_families=None,
     ):
         super().__init__(
+            exclude_families=exclude_families,
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,
@@ -523,8 +530,10 @@ def setup_moe_monitor(
     verbose=False,
     hook_timing_enabled=False,
     monitor_dict=None,
+    exclude_families=None,
 ):
     monitor = MoESpecialistMonitor(
+        exclude_families=exclude_families,
         log_per_layer=log_per_layer,
         log_global=log_global,
         monitor_interval=monitor_interval,

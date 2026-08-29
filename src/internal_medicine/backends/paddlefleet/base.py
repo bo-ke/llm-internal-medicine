@@ -23,9 +23,20 @@ class PaddleProbe(Probe):
     fires until ``step()`` does a single batched flush.
     """
 
-    def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
+    def __init__(
+        self,
+        log_per_layer=True,
+        log_global=True,
+        monitor_interval=1,
+        verbose=False,
+        exclude_families=None,
+    ):
         super().__init__(
-            log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
+            log_per_layer=log_per_layer,
+            log_global=log_global,
+            monitor_interval=monitor_interval,
+            verbose=verbose,
+            exclude_families=exclude_families,
         )
         self._mean_keys: set[str] = set()  # 需要求平均的 metric keys
         self._max_keys: set[str] = set()  # 需要取最大值的 metric keys
@@ -162,7 +173,9 @@ class PaddleProbe(Probe):
         return f"{self.METRIC_PREFIX}/global_{metric_name}"
 
     def _should_disable_explicit_key(self, key: str) -> bool:
-        return key.startswith(f"{self.METRIC_PREFIX}/global_") and not self.log_global
+        if key.startswith(f"{self.METRIC_PREFIX}/global_") and not self.log_global:
+            return True
+        return not self.family_allows(key)
 
     def declare_layer_metric(self, layer_idx: int, metric_name: str, attn_type: str | None = None) -> None:
         """声明一个 per-layer 指标。
@@ -181,6 +194,11 @@ class PaddleProbe(Probe):
             return
         layer_key = self._layer_key(layer_idx, metric_name, attn_type=attn_type)
         global_key = self._global_key(metric_name, attn_type=attn_type)
+        if not self.family_allows(layer_key):
+            # Registered as disabled rather than merely skipped: record_* looks the
+            # key up here to stay a cheap no-op instead of a KeyError.
+            self._disabled_keys.add(layer_key)
+            return
         all_declared = self._mean_keys | self._max_keys | self._min_keys
         assert global_key not in all_declared
         # 根据类级别聚合规则选择 declare 方式 (基于原始 metric_name，attn_type 不改变聚合语义)
@@ -236,6 +254,9 @@ class PaddleProbe(Probe):
         if not self.log_per_layer:
             return
         key = self._layer_key(layer_idx, metric_name)
+        if not self.family_allows(key):
+            # No buffer is allocated, so record_layer_vector already no-ops on it.
+            return
         assert key not in self._vector_keys, f"declare_layer_vector({key!r}) declared twice"
         size = int(size)
         assert size > 0

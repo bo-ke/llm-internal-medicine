@@ -500,9 +500,14 @@ class PaddleQKStatsMonitor(PaddleProbe):
         verbose=False,
         sink_head_threshold: float = 0.3,
         row_stride: int = 1,
+        exclude_families=None,
     ):
         super().__init__(
-            log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
+            exclude_families=exclude_families,
+            log_per_layer=log_per_layer,
+            log_global=log_global,
+            monitor_interval=monitor_interval,
+            verbose=verbose,
         )
         self.causal = causal
         self.tp_size = 1
@@ -892,8 +897,10 @@ def setup_qk_monitor(
     sink_head_threshold: float = 0.3,
     row_stride: int = 1,
     monitor_dict=None,
+    exclude_families=None,
 ):
     monitor = PaddleQKStatsMonitor(
+        exclude_families=exclude_families,
         causal=causal,
         log_per_layer=log_per_layer,
         log_global=log_global,

@@ -3004,3 +3004,150 @@ class PaddleMLPUpdateMonitorTest(unittest.TestCase):
         """The yaml switch resolves through _MONITOR_MAP."""
         self.assertIn("mlp_update", paddlefleet_backend._MONITOR_MAP)
         self.assertIs(paddlefleet_backend._MONITOR_MAP["mlp_update"], mlp_update_module.setup_mlp_update_monitor)
+
+
+class MetricFamilySelectionTest(unittest.TestCase):
+    """Family selection has to bite at declare time, not at record or flush time.
+
+    The schema must be complete before ``allocate_buffers``, and a key filtered
+    any later would still cost its GPU accumulator and its slot in the cross-rank
+    reduction — the whole point is to make those smaller.
+    """
+
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def test_excluded_families_never_reach_the_schema(self):
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, exclude_families="balance+norm")
+        monitor.declare_layer_metric(0, "router_entropy")
+        monitor.declare_layer_metric(0, "gate_mass_max_min_ratio")
+        monitor.declare_layer_metric(0, "expert_norm_mean")
+
+        declared = monitor._mean_keys | monitor._max_keys | monitor._min_keys
+        self.assertIn("moe_health/layer_0/router_entropy", declared)
+        self.assertNotIn("moe_health/layer_0/gate_mass_max_min_ratio", declared)
+        self.assertNotIn("moe_health/layer_0/expert_norm_mean", declared)
+        # No global group either: a global is derived from its layer keys.
+        self.assertEqual(list(monitor._layer_metric_groups), ["moe_health/global_router_entropy"])
+
+    def test_recording_a_filtered_key_is_a_silent_no_op(self):
+        """Monitors keep calling record_* unconditionally; it must not raise."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, exclude_families="norm")
+        monitor.declare_layer_metric(0, "router_entropy")
+        monitor.declare_layer_metric(0, "expert_norm_mean")
+        monitor.allocate_buffers()
+
+        monitor.record_layer_metric(0, "router_entropy", paddle.to_tensor(1.5))
+        monitor.record_layer_metric(0, "expert_norm_mean", paddle.to_tensor(9.0))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/router_entropy"], 1.5, places=5)
+        self.assertNotIn("moe_health/layer_0/expert_norm_mean", latest)
+
+    def test_vector_families_are_filtered_too(self):
+        """Per-expert vectors are the biggest family; they must be switchable."""
+        off = PaddleMoEMonitor(log_per_layer=True, log_global=False, exclude_families="expert")
+        off.declare_layer_vector(0, "expert_token_share", 4)
+        off.allocate_buffers()
+        self.assertEqual(off._vector_keys, {})
+        # record on an undeclared vector already no-ops via the missing buffer
+        off.record_layer_vector(0, "expert_token_share", paddle.to_tensor([1.0, 2.0, 3.0, 4.0]))
+        off.step()
+        self.assertEqual(training_logs.get_latest(prefix="moe_health"), {})
+
+        training_logs.reset()
+        on = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        on.declare_layer_vector(0, "expert_token_share", 4)
+        self.assertEqual(on._vector_keys, {"moe_health/layer_0/expert_token_share": 4})
+
+    def test_explicit_declare_paths_are_filtered(self):
+        """declare_mean/max/min are the other way monitors register keys."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, exclude_families="norm")
+        monitor.declare_mean("moe_health/global_router_entropy")
+        monitor.declare_mean("moe_health/global_expert_norm_mean")
+        self.assertIn("moe_health/global_router_entropy", monitor._mean_keys)
+        self.assertNotIn("moe_health/global_expert_norm_mean", monitor._mean_keys)
+        self.assertIn("moe_health/global_expert_norm_mean", monitor._disabled_keys)
+
+    def test_the_default_declares_exactly_what_it_used_to(self):
+        """Nothing excluded must be byte-identical to the old behaviour."""
+        names = ("router_entropy", "gate_mass_max_min_ratio", "expert_norm_mean", "shared_frac")
+        for exclude in (None, "none"):
+            monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, exclude_families=exclude)
+            for name in names:
+                monitor.declare_layer_metric(0, name)
+            declared = monitor._mean_keys | monitor._max_keys | monitor._min_keys
+            for name in names:
+                self.assertIn(f"moe_health/layer_0/{name}", declared, f"exclude={exclude!r}")
+            self.assertEqual(monitor._disabled_keys, set(), f"exclude={exclude!r}")
+
+    def test_an_unknown_family_name_raises_at_construction(self):
+        metric_families = importlib.import_module("internal_medicine.core.metric_families")
+        with self.assertRaises(metric_families.UnknownFamilyError):
+            PaddleMoEMonitor(log_per_layer=True, log_global=True, exclude_families="routerr")
+
+    def test_setup_monitors_routes_the_spec_string_to_the_right_monitor(self):
+        """`"mhc_health:mix, moe_health:expert"` must reach each monitor separately."""
+        seen = {}
+        original = dict(paddlefleet_backend._MONITOR_MAP)
+
+        def make(name):
+            def setup(_model, monitor_dict=None, exclude_families=None, **_kwargs):
+                seen[name] = exclude_families
+                monitor_dict[name] = DummyMonitor()
+
+            return setup
+
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP.update({n: make(n) for n in ("mhc_health", "moe_health", "qk_stats")})
+        try:
+            paddlefleet_backend.setup_monitors(
+                SimpleNamespace(),
+                monitors=["mhc_health", "moe_health", "qk_stats"],
+                exclude_families="mhc_health:mix, moe_health:expert+act",
+            )
+        finally:
+            paddlefleet_backend._MONITOR_MAP.clear()
+            paddlefleet_backend._MONITOR_MAP.update(original)
+
+        self.assertEqual(seen["mhc_health"], ["mix"])
+        self.assertEqual(seen["moe_health"], ["expert", "act"])
+        # Not named in the spec: stays None, i.e. collects everything.
+        self.assertIsNone(seen["qk_stats"])
+
+    def test_setup_monitors_without_the_option_changes_nothing(self):
+        seen = {}
+        original = dict(paddlefleet_backend._MONITOR_MAP)
+
+        def setup(_model, monitor_dict=None, exclude_families=None, **_kwargs):
+            seen["moe_health"] = exclude_families
+            monitor_dict["moe_health"] = DummyMonitor()
+
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP.update({"moe_health": setup})
+        try:
+            paddlefleet_backend.setup_monitors(SimpleNamespace(), monitors=["moe_health"])
+        finally:
+            paddlefleet_backend._MONITOR_MAP.clear()
+            paddlefleet_backend._MONITOR_MAP.update(original)
+        self.assertIsNone(seen["moe_health"])
+
+    def test_setup_moe_monitor_forwards_the_exclusion_to_the_monitor(self):
+        """End to end through the real setup function, not a stub."""
+        monitor_dict = {}
+        moe_monitor_module.setup_moe_monitor(
+            SimpleNamespace(layers=[]), monitor_dict=monitor_dict, exclude_families="expert+act"
+        )
+        self.assertEqual(monitor_dict["moe_health"].family_selection.excluded, frozenset({"expert", "act"}))
+
+    def test_setup_monitors_rejects_a_misspelled_monitor_name(self):
+        """Otherwise the loop simply never matches it and nothing is switched off."""
+        metric_families = importlib.import_module("internal_medicine.core.metric_families")
+        with self.assertRaises(metric_families.UnknownMonitorError):
+            paddlefleet_backend.setup_monitors(
+                SimpleNamespace(), monitors=["moe_health"], exclude_families="moe:expert"
+            )

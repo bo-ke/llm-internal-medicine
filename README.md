@@ -792,6 +792,40 @@ if any(m.sampled_this_step for m in monitor_dict.values()):
 
 NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer 会按日志间隔输出各 hook 的累计耗时和平均耗时；该开关只做 Python 侧计时，不会额外插入 CUDA 同步。
 
+### 指标族粒度控制 (exclude_families)
+
+每个 monitor 内部的指标按**族 (family)** 分组——和在线可视化 `tools/internal_medicine` 的分组同源（`core/metric_families.py` 的 `METRIC_TAXONOMY`）。可以按「模块:族」关掉不关心的族，被关掉的族**不进 schema、不参与跨 rank 聚合**，因此既省通信也省显存。
+
+| Monitor | 族 |
+|---------|-----|
+| `mhc_health` | `gate` 门控强度 / `mix` 混合矩阵 / `gain` 增益放大 / `param` 可学习参数 / `share` 残差占比 |
+| `qk_stats` | `sink` sink head / `logit` logits 量级 / `entropy` 注意力熵 / `qkv` q/k/v 范数 |
+| `massive_act` | `channel` 通道量级分布 / `outlier` 超大通道计数 / `module` 各模块输出量级 / `norm` 归一化后表示 / `overall` 整体激活量级 |
+| `ape_health` | `softmax` 位置 softmax 形状 / `coverage` 位置覆盖 / `scale` 量级与数值健康 |
+| `vha_health` | `mix` postmix 混合矩阵 / `gain` postmix 增益与扰动 / `head` 头间一致性 |
+| `moe_health` | `router` 路由打分质量 / `balance` 负载均衡 / `norm` 专家范数与 bias / `spectrum` gate 谱性质 / `act` 激活量级 / `shared` 共享 vs 路由 / `expert` 按专家分布 |
+
+语义是**排除优先**：没声明的族默认全开，所以不配置这个参数时行为与以前逐字节一致；分类表若有遗漏，那条指标不属于任何排除集合，仍会被采集（fail-open）。反过来，族名写错会在启动时直接抛 `UnknownFamilyError`（fail-closed）——否则唯一的症状是「payload 没变小」，太难发现。
+
+```python
+setup_monitors(
+    model,
+    monitors=["moe_health", "mhc_health"],
+    monitor_interval=50,
+    exclude_families="mhc_health:mix, moe_health:expert+act",
+)
+```
+
+PaddleFormers YAML 里用独立的一项（不塞进 `internal_medicine_monitors`）：
+
+```yaml
+internal_medicine_monitors: "qk_stats,moe_health,massive_act,mhc_health,vha_health"
+internal_medicine_monitor_interval: 200
+internal_medicine_exclude_families: "mhc_health:mix, moe_health:expert+act"
+```
+
+单个 monitor 也可以直接传 `exclude_families=["mix"]`。只提供排除式、不提供白名单：白名单会把分类表的遗漏变成静默漏采（新族不在名单里 → 不采集，且无人察觉），而排除式下同样的遗漏只是「payload 没省下来」。想「只看某几族」就填它的补集。
+
 ---
 
 ## 附录: 完整指标速查表

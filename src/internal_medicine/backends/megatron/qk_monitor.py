@@ -47,11 +47,9 @@ class QKStatsMonitor(TorchProbe):
         hook_timing_enabled: bool = False,
         sink_head_threshold: float = 0.3,
         exclude_families=None,
-        families=None,
     ):
         super().__init__(
             exclude_families=exclude_families,
-            families=families,
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,

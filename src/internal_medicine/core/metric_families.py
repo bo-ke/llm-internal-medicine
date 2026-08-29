@@ -34,7 +34,6 @@ __all__ = [
     "families_of",
     "parse_exclude",
     "parse_exclusions",
-    "parse_families",
     "strip_prefixes",
     "FamilySelection",
 ]
@@ -230,22 +229,6 @@ def parse_exclude(monitor: str, exclude) -> FamilySelection:
         return FamilySelection(monitor)
     _validate(monitor, names, "excluding")
     return FamilySelection(monitor, names)
-
-
-def parse_families(monitor: str, families) -> FamilySelection:
-    """Build a selection from the families to *keep* — the inverse of the above.
-
-    Kept for callers that genuinely want a whitelist (a focused debugging run,
-    mostly). Expressed as an exclusion so there is only one code path in
-    ``allows``.
-    """
-    if families is None:
-        return FamilySelection(monitor)
-    names = _split_names(families)
-    if not names or names == ["all"]:
-        return FamilySelection(monitor)
-    _validate(monitor, names, "narrowing to")
-    return FamilySelection(monitor, set(families_of(monitor)) - set(names))
 
 
 def parse_exclusions(spec) -> dict[str, list[str]]:

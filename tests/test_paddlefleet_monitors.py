@@ -3085,23 +3085,10 @@ class MetricFamilySelectionTest(unittest.TestCase):
                 self.assertIn(f"moe_health/layer_0/{name}", declared, f"exclude={exclude!r}")
             self.assertEqual(monitor._disabled_keys, set(), f"exclude={exclude!r}")
 
-    def test_the_whitelist_form_still_works_for_a_focused_run(self):
-        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, families="router")
-        monitor.declare_layer_metric(0, "router_entropy")
-        monitor.declare_layer_metric(0, "expert_norm_mean")
-        declared = monitor._mean_keys | monitor._max_keys | monitor._min_keys
-        self.assertIn("moe_health/layer_0/router_entropy", declared)
-        self.assertNotIn("moe_health/layer_0/expert_norm_mean", declared)
-
     def test_an_unknown_family_name_raises_at_construction(self):
         metric_families = importlib.import_module("internal_medicine.core.metric_families")
         with self.assertRaises(metric_families.UnknownFamilyError):
             PaddleMoEMonitor(log_per_layer=True, log_global=True, exclude_families="routerr")
-
-    def test_asking_for_both_forms_at_once_is_rejected(self):
-        """They would contradict each other; better to fail than to pick one."""
-        with self.assertRaises(ValueError):
-            PaddleMoEMonitor(log_per_layer=True, log_global=True, families="router", exclude_families="norm")
 
     def test_setup_monitors_routes_the_spec_string_to_the_right_monitor(self):
         """`"mhc_health:mix, moe_health:expert"` must reach each monitor separately."""

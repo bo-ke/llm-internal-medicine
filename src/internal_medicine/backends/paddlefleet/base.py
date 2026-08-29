@@ -30,7 +30,6 @@ class PaddleProbe(Probe):
         monitor_interval=1,
         verbose=False,
         exclude_families=None,
-        families=None,
     ):
         super().__init__(
             log_per_layer=log_per_layer,
@@ -38,7 +37,6 @@ class PaddleProbe(Probe):
             monitor_interval=monitor_interval,
             verbose=verbose,
             exclude_families=exclude_families,
-            families=families,
         )
         self._mean_keys: set[str] = set()  # 需要求平均的 metric keys
         self._max_keys: set[str] = set()  # 需要取最大值的 metric keys

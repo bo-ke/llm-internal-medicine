@@ -141,15 +141,6 @@ class FamilySelectionTest(unittest.TestCase):
         with self.assertRaises(mf.UnknownFamilyError):
             mf.parse_exclude("kda_health", "whatever")
 
-    def test_the_whitelist_form_is_the_exact_complement(self):
-        """`families=` is kept for focused runs; it must agree with the exclusion form."""
-        keep = mf.parse_families("mhc_health", "gate+param")
-        self.assertEqual(keep.excluded, frozenset({"mix", "gain", "share"}))
-        drop = mf.parse_exclude("mhc_health", "mix+gain+share")
-        for monitor, sub in corpus_entries():
-            if monitor == "mhc_health":
-                self.assertEqual(keep.allows(sub), drop.allows(sub), sub)
-
     def test_parse_exclusions_reads_the_config_string(self):
         self.assertEqual(
             mf.parse_exclusions("mhc_health:mix, moe_health:expert+act"),

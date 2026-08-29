@@ -824,7 +824,7 @@ internal_medicine_monitor_interval: 200
 internal_medicine_exclude_families: "mhc_health:mix, moe_health:expert+act"
 ```
 
-单个 monitor 也可以直接传 `exclude_families=["mix"]`；确实想用白名单时传 `families=["gate", "share"]`（内部换算成它的补集），两者不能同时给。
+单个 monitor 也可以直接传 `exclude_families=["mix"]`。只提供排除式、不提供白名单：白名单会把分类表的遗漏变成静默漏采（新族不在名单里 → 不采集，且无人察觉），而排除式下同样的遗漏只是「payload 没省下来」。想「只看某几族」就填它的补集。
 
 ---
 

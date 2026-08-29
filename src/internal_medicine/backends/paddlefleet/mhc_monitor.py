@@ -188,13 +188,11 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         monitor_interval: int = 1,
         verbose: bool = False,
         exclude_families=None,
-        families=None,
     ):
         self.MAX_AGGREGATED = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _MAX_METRICS}
         self.MIN_AGGREGATED = {f"{comp}_{m}" for comp, _ in _COMPONENTS for m in _MIN_METRICS}
         super().__init__(
             exclude_families=exclude_families,
-            families=families,
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,

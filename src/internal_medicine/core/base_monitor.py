@@ -9,7 +9,7 @@ not migrated.
 
 from abc import ABC, abstractmethod
 
-from .metric_families import parse_exclude, parse_families
+from .metric_families import parse_exclude
 from .training_logs import training_logs
 
 
@@ -37,26 +37,18 @@ class Probe(ABC):
         monitor_interval=1,
         verbose=False,
         exclude_families=None,
-        families=None,
     ):
         self.log_per_layer = log_per_layer
         self.log_global = log_global
         self.monitor_interval = monitor_interval
         self.verbose = verbose
-        # ``exclude_families`` is the configured path: name the families to switch
-        # off, everything else stays on, so a config that never heard of families
-        # behaves exactly as before. ``families`` is the whitelist inverse, for a
-        # focused debugging run. An unknown family name raises here, at setup,
-        # rather than quietly changing what is collected.
-        if exclude_families is not None and families is not None:
-            raise ValueError(
-                f"{self.METRIC_PREFIX}: pass either exclude_families or families, not both "
-                f"(got exclude={exclude_families!r}, keep={families!r})"
-            )
-        if families is not None:
-            self.family_selection = parse_families(self.METRIC_PREFIX, families)
-        else:
-            self.family_selection = parse_exclude(self.METRIC_PREFIX, exclude_families)
+        # Name the families to switch off; everything else stays on, so a config
+        # that never heard of families behaves exactly as before. Only exclusion
+        # is offered: a whitelist would turn a taxonomy hole into a silently
+        # dropped metric, while an unlisted family under exclusion is merely a
+        # payload that did not shrink. An unknown family name raises here, at
+        # setup, rather than quietly changing what is collected.
+        self.family_selection = parse_exclude(self.METRIC_PREFIX, exclude_families)
         self.hooks = []
         self.step_count = 0
         self.sampled_this_step = False

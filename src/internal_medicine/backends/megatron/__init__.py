@@ -2,6 +2,7 @@
 
 import logging
 
+from ...core.metric_families import parse_exclusions
 from .base import TorchProbe
 from .gather import install_gather_fn
 from .massive_activation_monitor import MassiveActivationMonitor, setup_massive_activation_monitor
@@ -24,10 +25,16 @@ _MONITOR_MAP = {
 _ALWAYS_ON_MONITORS = {"optim": setup_optim_update_monitor}
 
 
-def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
-    """Setup all requested monitors on a Megatron model."""
+def setup_monitors(
+    model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, exclude_families=None, **kwargs
+):
+    """Setup all requested monitors on a Megatron model.
+
+    ``exclude_families``: see the paddlefleet backend's ``setup_monitors``.
+    """
     install_gather_fn()
     hook_timing_enabled = bool(kwargs.pop("hook_timing_enabled", False))
+    excluded = exclude_families if isinstance(exclude_families, dict) else parse_exclusions(exclude_families)
 
     if monitors is None:
         monitors = ["all"]
@@ -41,6 +48,9 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
         if setup_fn is None:
             logger.warning(f"[InternalMedicine/megatron] Unknown monitor: {name}, skipping")
             continue
+        options = kwargs.get(name, {})
+        if name in excluded and "exclude_families" not in options:
+            options = {**options, "exclude_families": excluded[name]}
         try:
             setup_fn(
                 model,
@@ -48,7 +58,7 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
                 monitor_interval=monitor_interval,
                 verbose=verbose,
                 hook_timing_enabled=hook_timing_enabled,
-                **kwargs.get(name, {}),
+                **options,
             )
             logger.info(f"[InternalMedicine/megatron] Enabled monitor: {name}")
         except Exception as e:

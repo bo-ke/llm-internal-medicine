@@ -46,8 +46,12 @@ class QKStatsMonitor(TorchProbe):
         verbose: bool = False,
         hook_timing_enabled: bool = False,
         sink_head_threshold: float = 0.3,
+        exclude_families=None,
+        families=None,
     ):
         super().__init__(
+            exclude_families=exclude_families,
+            families=families,
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,
@@ -217,8 +221,10 @@ def setup_qk_monitor(
     sink_head_threshold: float = 0.3,
     hook_timing_enabled: bool = False,
     monitor_dict: dict | None = None,
+    exclude_families=None,
 ) -> nn.Module:
     monitor = QKStatsMonitor(
+        exclude_families=exclude_families,
         causal=causal,
         use_triton=use_triton,
         log_per_layer=log_per_layer,

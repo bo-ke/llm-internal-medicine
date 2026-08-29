@@ -401,9 +401,22 @@ class PaddleMoEMonitor(PaddleProbe):
         "router_margin_min",
     }
 
-    def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
+    def __init__(
+        self,
+        log_per_layer=True,
+        log_global=True,
+        monitor_interval=1,
+        verbose=False,
+        exclude_families=None,
+        families=None,
+    ):
         super().__init__(
-            log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
+            exclude_families=exclude_families,
+            families=families,
+            log_per_layer=log_per_layer,
+            log_global=log_global,
+            monitor_interval=monitor_interval,
+            verbose=verbose,
         )
         self._patched_gates = []
         self._patched_moe_layers = []
@@ -1033,8 +1046,10 @@ def setup_moe_monitor(
     monitor_interval=1,
     verbose=False,
     monitor_dict=None,
+    exclude_families=None,
 ):
     monitor = PaddleMoEMonitor(
+        exclude_families=exclude_families,
         log_per_layer=log_per_layer,
         log_global=log_global,
         monitor_interval=monitor_interval,

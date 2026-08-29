@@ -71,8 +71,12 @@ class MassiveActivationMonitor(TorchProbe):
         log_logit_lens_cross_entropy: bool = False,
         log_hidden_spectral_entropy: bool = False,
         hook_timing_enabled: bool = False,
+        exclude_families=None,
+        families=None,
     ):
         super().__init__(
+            exclude_families=exclude_families,
+            families=families,
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,
@@ -628,8 +632,10 @@ def setup_massive_activation_monitor(
     log_hidden_spectral_entropy: bool = False,
     hook_timing_enabled: bool = False,
     monitor_dict: dict | None = None,
+    exclude_families=None,
 ):
     monitor = MassiveActivationMonitor(
+        exclude_families=exclude_families,
         log_per_layer=log_per_layer,
         log_global=log_global,
         monitor_interval=monitor_interval,

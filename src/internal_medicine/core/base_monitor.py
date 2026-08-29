@@ -9,6 +9,7 @@ not migrated.
 
 from abc import ABC, abstractmethod
 
+from .metric_families import parse_exclude, parse_families
 from .training_logs import training_logs
 
 
@@ -29,11 +30,33 @@ class Probe(ABC):
     MAX_AGGREGATED: set[str] = set()
     MIN_AGGREGATED: set[str] = set()
 
-    def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
+    def __init__(
+        self,
+        log_per_layer=True,
+        log_global=True,
+        monitor_interval=1,
+        verbose=False,
+        exclude_families=None,
+        families=None,
+    ):
         self.log_per_layer = log_per_layer
         self.log_global = log_global
         self.monitor_interval = monitor_interval
         self.verbose = verbose
+        # ``exclude_families`` is the configured path: name the families to switch
+        # off, everything else stays on, so a config that never heard of families
+        # behaves exactly as before. ``families`` is the whitelist inverse, for a
+        # focused debugging run. An unknown family name raises here, at setup,
+        # rather than quietly changing what is collected.
+        if exclude_families is not None and families is not None:
+            raise ValueError(
+                f"{self.METRIC_PREFIX}: pass either exclude_families or families, not both "
+                f"(got exclude={exclude_families!r}, keep={families!r})"
+            )
+        if families is not None:
+            self.family_selection = parse_families(self.METRIC_PREFIX, families)
+        else:
+            self.family_selection = parse_exclude(self.METRIC_PREFIX, exclude_families)
         self.hooks = []
         self.step_count = 0
         self.sampled_this_step = False
@@ -41,6 +64,34 @@ class Probe(ABC):
         self._global_accum: dict[str, float] = {}
         self._global_metric_counts: dict[str, int] = {}
         self._global_count: int = 0
+
+    def family_allows(self, key: str) -> bool:
+        """Whether ``key``'s metric family is selected for collection.
+
+        Takes a full key (``moe_health/layer_3/router_entropy``) so it can sit on
+        the single ``declare_*`` chokepoint every monitor already goes through —
+        no monitor needs to know families exist. Filtering has to happen here at
+        declaration and nowhere later: the schema must be complete before
+        ``allocate_buffers``, and a metric dropped at record time would still cost
+        its buffer and its slot in the cross-rank reduction.
+        """
+        if not self.family_selection.excluded:
+            return True
+        return self.family_selection.allows(self._metric_sub(key))
+
+    def _metric_sub(self, key: str) -> str:
+        """Full key → metric name, dropping the monitor prefix and layer segment.
+
+        ``global_`` is left in place; ``metric_families.classify`` strips it, so
+        a cross-layer aggregate stays in the same family as the per-layer curves.
+        """
+        prefix = f"{self.METRIC_PREFIX}/"
+        sub = key[len(prefix) :] if key.startswith(prefix) else key
+        if sub.startswith("layer_"):
+            _layer, _, rest = sub.partition("/")
+            if rest:
+                sub = rest
+        return sub
 
     @abstractmethod
     def register_hooks(self, model) -> None: ...

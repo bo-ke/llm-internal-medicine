@@ -95,8 +95,12 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         cosine_sample_pairs: int = 256,
         sample_layers: list[int] | None = None,
         absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
+        exclude_families=None,
+        families=None,
     ):
         super().__init__(
+            exclude_families=exclude_families,
+            families=families,
             log_per_layer=log_per_layer,
             log_global=log_global,
             monitor_interval=monitor_interval,
@@ -473,8 +477,10 @@ def setup_massive_activation_monitor(
     sample_layers: list[int] | None = None,
     absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
     monitor_dict: dict | None = None,
+    exclude_families=None,
 ):
     monitor = PaddleMassiveActivationMonitor(
+        exclude_families=exclude_families,
         log_per_layer=log_per_layer,
         log_global=log_global,
         monitor_interval=monitor_interval,

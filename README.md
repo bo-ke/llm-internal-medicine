@@ -428,9 +428,10 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 
 > 详细文档: [mhc_health.md](./docs/mhc_health.md)
 
-监控 mHC (Manifold-Constrained Hyper-Connections) 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`，
-以及 `x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)` 两项的相对大小。
-只在模型开启 mHC 层时生效，mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
+监控 hyper-connection 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`，
+以及 `x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)` 两项的相对大小。覆盖三种 HC 变体
+（mHC 双随机 / dHC 对角 / iHC 恒等；iHC 无 mixing logits，`h_res_logits_*` 系列不发）。
+HC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
 彻底 no-op。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 29 个指标，
 指标名以 `attn_` / `mlp_` 前缀区分；`branch_residual_share_max`、`h_res_logits_max`、
 `h_res_logits_grad_max`、`composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、

@@ -254,7 +254,9 @@ class PaddleProbe(Probe):
         if not self.log_per_layer:
             return
         key = self._layer_key(layer_idx, metric_name)
-        if not self.family_allows(key):
+        # 判族要用展开后的元素名：per-unit 族（cell / stream）只在 ``_{elem_tag}{i}``
+        # 后缀上才匹配得到，base name 会落到聚合族（mix / gate）而误判为保留。
+        if not self.family_allows(f"{key}_{elem_tag}0"):
             # No buffer is allocated, so record_layer_vector already no-ops on it.
             return
         assert key not in self._vector_keys, f"declare_layer_vector({key!r}) declared twice"

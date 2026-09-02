@@ -861,6 +861,53 @@ class MHCMonitorTest(unittest.TestCase):
         monitor.step()
 
 
+class MHCVectorFamilyExclusionTest(unittest.TestCase):
+    """`cell` / `stream` are per-unit families and must be droppable.
+
+    Regression: `declare_layer_vector` judged the family on the undecorated base
+    name, and `h_res` / `h_pre` / `h_post` classify as the *aggregate* families
+    (`mix` / `gate`) that production keeps. Only the expanded element names carry
+    `cell` / `stream`, so a non-debug run collected all 624 curves anyway.
+    """
+
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def _declare(self, exclude_families):
+        monitor = mhc_monitor.PaddleMHCHealthMonitor(
+            log_per_layer=True, log_global=False, exclude_families=exclude_families
+        )
+        for name, tag, size in mhc_monitor._vector_metric_specs(4):
+            monitor.declare_layer_vector(0, f"attn_{name}", size, elem_tag=tag)
+        return monitor
+
+    def test_cell_and_stream_vectors_are_dropped(self):
+        monitor = self._declare("cell+stream")
+        self.assertEqual(monitor._vector_keys, {})
+
+    def test_dropping_cell_alone_keeps_the_stream_vectors(self):
+        monitor = self._declare("cell")
+        self.assertEqual(
+            sorted(monitor._vector_keys),
+            [
+                "mhc_health/layer_0/attn_h_post",
+                "mhc_health/layer_0/attn_h_pre",
+            ],
+        )
+
+    def test_aggregate_families_do_not_drop_the_per_unit_vectors(self):
+        """`mix` / `gate` must not take `h_res` / `h_pre` down with them."""
+        monitor = self._declare("mix+gate")
+        self.assertEqual(len(monitor._vector_keys), 3)
+
+    def test_default_run_collects_everything(self):
+        monitor = self._declare(None)
+        self.assertEqual(len(monitor._vector_keys), 3)
+
+
 class MHCMonitorNoOpTest(unittest.TestCase):
     def setUp(self):
         training_logs.reset()

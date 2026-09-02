@@ -776,6 +776,13 @@ if any(m.sampled_this_step for m in monitor_dict.values()):
 一致**，`sampled_this_step` 只依赖各 rank 同步推进的 `step_count`，本地指标是否
 为空则不满足这个要求（历史上据此早返回导致过 PP 死锁）。
 
+从 checkpoint 续训时，如果要避免新进程 `step_count == 0` 导致恢复后的第一步
+必然采样，应在首个 forward 前对所有 monitor 调用 `skip_next_steps(1)`。该门控
+在 hook 做指标计算之前生效；被跳过的 step 仍推进本地 `step_count`，但不会 flush
+指标 buffer，`sampled_this_step` 也保持为 `False`，调用方因而可同时跳过跨卡聚合
+与日志输出。是否属于续训应由调用方使用已恢复的 Trainer state 判断，不应依赖
+历史指标文件是否存在。
+
 注意: QK Stats Monitor 不在 hook 内做 TP `all_reduce`/`all_gather`，避免在 attention 热路径插入通信；跨 rank 聚合统一交给 `gather_and_aggregate()`。MassiveAct 会先对 TP 内 per-channel maxima 做 `MAX all_reduce`（通道维被 TP 切分时这是正确性所需），再依赖 `gather_and_aggregate()` 做跨 rank 聚合；MoE/PLE 同样依赖 `gather_and_aggregate()` 统一处理。
 
 ### 通用配置参数

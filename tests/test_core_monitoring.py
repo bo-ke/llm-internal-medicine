@@ -3,6 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -199,6 +200,46 @@ class CoreMonitoringTest(unittest.TestCase):
         probe = DummyProbe(monitor_interval=0)
         probe.step()
         self.assertFalse(probe.sampled_this_step)
+
+    def test_skip_next_step_suppresses_hooks_and_sampled_flag_once(self):
+        probe = DummyProbe(monitor_interval=1)
+        probe._flush_buffers = Mock()
+        probe.skip_next_steps()
+
+        self.assertFalse(probe._should_monitor())
+        probe.step()
+        self.assertFalse(probe.sampled_this_step)
+        self.assertEqual(probe.step_count, 1)
+        probe._flush_buffers.assert_not_called()
+
+        self.assertTrue(probe._should_monitor())
+        probe.step()
+        self.assertTrue(probe.sampled_this_step)
+        probe._flush_buffers.assert_called_once_with()
+
+    def test_skip_next_step_preserves_process_local_interval_phase(self):
+        probe = DummyProbe(monitor_interval=5)
+        probe.skip_next_steps()
+        sampled_steps = []
+
+        for resumed_step in range(1, 8):
+            if probe._should_monitor():
+                sampled_steps.append(resumed_step)
+            probe.step()
+
+        self.assertEqual(sampled_steps, [6])
+
+    def test_skip_next_steps_consumes_exactly_requested_count(self):
+        probe = DummyProbe(monitor_interval=1)
+        probe.skip_next_steps(2)
+        sampled = []
+
+        for step in range(1, 5):
+            if probe._should_monitor():
+                sampled.append(step)
+            probe.step()
+
+        self.assertEqual(sampled, [3, 4])
 
 
 if __name__ == "__main__":

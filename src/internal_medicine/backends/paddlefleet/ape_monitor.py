@@ -108,8 +108,7 @@ class PaddleAPEHealthMonitor(PaddleProbe):
         self.allocate_buffers()
 
         for layer_idx, branch, compressor in targets:
-            hook = compressor.register_forward_pre_hook(self._make_ape_hook(layer_idx, branch))
-            self.hooks.append(hook)
+            self.attach_pre_hook(compressor, self._make_ape_hook(layer_idx, branch))
         logger.info("[PaddleAPEHealthMonitor] Registered %d APE hooks.", len(targets))
 
     def _make_ape_hook(self, layer_idx: int, branch: str):

@@ -601,20 +601,22 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
         self.allocate_buffers()
 
+        patched = 0
         for layer_idx, attn_module, item in attention_layers:
             is_sparse = self._is_sparse_layer(item)
             if is_sparse:
                 patch = self._patch_sparse_attn(layer_idx, attn_module, item)
                 if patch is not None:
                     self.hooks.append(patch)
+                    patched += 1
                     continue
             if hasattr(attn_module, "core_attention"):
-                hook = attn_module.core_attention.register_forward_pre_hook(
-                    self._make_compute_hook(layer_idx, item.attn_type, record_qkv_norms=not is_sparse)
+                self.attach_pre_hook(
+                    attn_module.core_attention,
+                    self._make_compute_hook(layer_idx, item.attn_type, record_qkv_norms=not is_sparse),
                 )
-                self.hooks.append(hook)
 
-        logger.info(f"[PaddleQKMonitor] Registered {len(self.hooks)} hooks.")
+        logger.info(f"[PaddleQKMonitor] Registered {patched + len(self._hook_specs)} hooks.")
 
     def _is_sparse_layer(self, item) -> bool:
         """True for layers whose core attention is window + compressed KV.

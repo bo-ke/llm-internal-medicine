@@ -197,38 +197,25 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         for item in monitor_layers:
             if self.sample_layers and item.idx not in self.sample_layers:
                 continue
-            hook = item.layer.register_forward_pre_hook(self._make_residual_hook(item.idx, item.attn_type))
-            self.hooks.append(hook)
+            self.attach_pre_hook(item.layer, self._make_residual_hook(item.idx, item.attn_type))
 
             attn = getattr(item.layer, "self_attn", None) or getattr(item.layer, "self_attention", None)
             if attn is not None:
-                self.hooks.append(
-                    attn.register_forward_post_hook(self._make_branch_output_hook(item.idx, "attn_out", item.attn_type))
-                )
+                self.attach_post_hook(attn, self._make_branch_output_hook(item.idx, "attn_out", item.attn_type))
 
             post_attn_boundary = getattr(item.layer, "mlp_hyper_connection", None)
             if post_attn_boundary is None:
                 post_attn_boundary = getattr(item.layer, "post_attention_layernorm", None)
             if post_attn_boundary is not None:
-                self.hooks.append(
-                    post_attn_boundary.register_forward_pre_hook(
-                        self._make_post_attn_residual_hook(item.idx, item.attn_type)
-                    )
-                )
+                self.attach_pre_hook(post_attn_boundary, self._make_post_attn_residual_hook(item.idx, item.attn_type))
 
             ffn = getattr(item.layer, "mlp", None) or getattr(item.layer, "moe", None)
             if ffn is not None:
-                self.hooks.append(
-                    ffn.register_forward_post_hook(
-                        self._make_branch_output_hook(item.idx, "ffn_or_moe_out", item.attn_type)
-                    )
-                )
+                self.attach_post_hook(ffn, self._make_branch_output_hook(item.idx, "ffn_or_moe_out", item.attn_type))
 
-            self.hooks.append(
-                item.layer.register_forward_post_hook(self._make_layer_output_hook(item.idx, item.attn_type))
-            )
+            self.attach_post_hook(item.layer, self._make_layer_output_hook(item.idx, item.attn_type))
 
-        logger.info(f"[MassiveActMonitor] Registered {len(self.hooks)} hooks across {registered} layers.")
+        logger.info(f"[MassiveActMonitor] Registered {len(self._hook_specs)} hooks across {registered} layers.")
 
     def _make_residual_hook(self, layer_idx: int, attn_type: str | None = None):
         def hook_fn(module, inputs):

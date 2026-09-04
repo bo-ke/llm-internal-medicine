@@ -106,19 +106,13 @@ class PaddleKDAHealthMonitor(PaddleProbe):
         self.allocate_buffers()
 
         for layer_idx, attn, attn_type in targets:
-            self.hooks.append(
-                attn.f_b_proj.register_forward_post_hook(self._make_decay_hook(layer_idx, attn, attn_type))
-            )
-            self.hooks.append(
-                attn.in_proj.register_forward_post_hook(self._make_in_proj_hook(layer_idx, attn, attn_type))
-            )
+            self.attach_post_hook(attn.f_b_proj, self._make_decay_hook(layer_idx, attn, attn_type))
+            self.attach_post_hook(attn.in_proj, self._make_in_proj_hook(layer_idx, attn, attn_type))
             if not attn.use_full_rank_gate:
                 # Low-rank output gate: it never passes through in_proj.
-                self.hooks.append(
-                    attn.g_b_proj.register_forward_post_hook(self._make_gate_hook(layer_idx, attn, attn_type))
-                )
+                self.attach_post_hook(attn.g_b_proj, self._make_gate_hook(layer_idx, attn, attn_type))
 
-        logger.info(f"[PaddleKDAMonitor] Registered {len(self.hooks)} hooks on {len(targets)} KDA layers.")
+        logger.info(f"[PaddleKDAMonitor] Registered {len(self._hook_specs)} hooks on {len(targets)} KDA layers.")
 
     # ------------------------------------------------------------------
     # Hooks (the hot path)

@@ -517,12 +517,10 @@ class PaddleMoEMonitor(PaddleProbe):
         for layer_idx, moe_layer in moe_layers:
             if hasattr(moe_layer, "gate"):
                 self._patch_gate_cache(moe_layer.gate)
-                hook = moe_layer.gate.register_forward_post_hook(self._make_gate_hook(layer_idx, moe_layer))
-                self.hooks.append(hook)
+                self.attach_post_hook(moe_layer.gate, self._make_gate_hook(layer_idx, moe_layer))
             # Shared expert activation hook
             if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
-                hook = moe_layer.shared_experts.register_forward_post_hook(self._make_shared_expert_hook(layer_idx))
-                self.hooks.append(hook)
+                self.attach_post_hook(moe_layer.shared_experts, self._make_shared_expert_hook(layer_idx))
             # Routed expert activation: patch _post_routed_output (called right
             # after routed experts, before adding shared output — no D2H).
             if hasattr(moe_layer, "_post_routed_output"):
@@ -533,7 +531,7 @@ class PaddleMoEMonitor(PaddleProbe):
             self._expert_norm_layers.append((layer_idx, moe_layer))
 
         logger.info(
-            f"[PaddleMoEMonitor] Registered {len(self.hooks)} gate hooks and "
+            f"[PaddleMoEMonitor] Registered {len(self._hook_specs)} gate hooks and "
             f"{len(self._expert_norm_layers)} expert-norm layers on {len(moe_layers)} MoE layers."
         )
 

@@ -50,6 +50,15 @@ class Probe(ABC):
         # setup, rather than quietly changing what is collected.
         self.family_selection = parse_exclude(self.METRIC_PREFIX, exclude_families)
         self.hooks = []
+        # Forward hooks are attached only for the steps that actually sample.
+        # ``nn.Layer.__call__`` takes a fast path that skips ``_dygraph_call_func``
+        # only while the layer has *no* forward hooks, so a permanently attached
+        # hook costs every microbatch of every step even when its body returns
+        # immediately. Keeping the specs here lets ``step()`` re-attach them just
+        # for the sampling step and drop them again afterwards.
+        self._hook_specs: list[tuple[object, str, object]] = []
+        self._armed_handles: list = []
+        self._hooks_armed = False
         self.step_count = 0
         self.sampled_this_step = False
         self._skip_steps_remaining = 0
@@ -89,10 +98,89 @@ class Probe(ABC):
     @abstractmethod
     def register_hooks(self, model) -> None: ...
 
+    # ------------------------------------------------------------------
+    # Hook attachment: declared once, armed only on sampling steps
+    # ------------------------------------------------------------------
+
+    def attach_post_hook(self, target, fn):
+        """Declare a forward *post* hook; attach it now if this step samples.
+
+        Monitors call this instead of ``target.register_forward_post_hook(fn)`` so
+        the probe owns the (target, fn) pair and can detach/re-attach across steps.
+        The metric schema is unaffected: ``declare_*`` still runs at registration,
+        before ``allocate_buffers``, so a disarmed step keeps its buffer slots and
+        the cross-rank schema stays identical on every rank.
+        """
+        return self._declare_hook(target, "post", fn)
+
+    def attach_pre_hook(self, target, fn):
+        """Declare a forward *pre* hook; attach it now if this step samples."""
+        return self._declare_hook(target, "pre", fn)
+
+    def _declare_hook(self, target, kind: str, fn):
+        self._hook_specs.append((target, kind, fn))
+        if self._hooks_armed:
+            handle = self._attach_one(target, kind, fn)
+            if handle is not None:
+                self._armed_handles.append(handle)
+                self.hooks.append(handle)
+            return handle
+        # Registration happens before the first step, so honour that step's phase
+        # rather than leaving the model hookless until the first ``step()``.
+        if self._interval_reached():
+            self.arm_hooks()
+        return None
+
+    @staticmethod
+    def _attach_one(target, kind: str, fn):
+        register = target.register_forward_pre_hook if kind == "pre" else target.register_forward_post_hook
+        return register(fn)
+
+    def arm_hooks(self) -> None:
+        """Attach every declared hook. Idempotent."""
+        if self._hooks_armed:
+            return
+        for target, kind, fn in self._hook_specs:
+            handle = self._attach_one(target, kind, fn)
+            if handle is not None:
+                self._armed_handles.append(handle)
+                # Mirrored into ``hooks`` so that list keeps meaning "everything
+                # currently installed on the model".
+                self.hooks.append(handle)
+        self._hooks_armed = True
+
+    def disarm_hooks(self) -> None:
+        """Detach every attached hook, keeping the specs for the next sampling step.
+
+        Only handles this class attached are touched. ``self.hooks`` may also hold
+        monkey-patch removers that some monitors install once and must keep for the
+        whole run; those are torn down by ``remove_hooks`` alone.
+        """
+        if not self._hooks_armed:
+            return
+        armed_ids = {id(handle) for handle in self._armed_handles}
+        for handle in self._armed_handles:
+            handle.remove()
+        self.hooks = [handle for handle in self.hooks if id(handle) not in armed_ids]
+        self._armed_handles = []
+        self._hooks_armed = False
+
+    def sync_hook_arming(self) -> None:
+        """Arm or disarm so the *upcoming* step matches its sampling phase."""
+        if not self._hook_specs:
+            return
+        if self._interval_reached():
+            self.arm_hooks()
+        else:
+            self.disarm_hooks()
+
     def remove_hooks(self):
+        """Tear down for good: detach everything and forget the specs."""
+        self.disarm_hooks()
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
+        self._hook_specs = []
 
     def step(self):
         # Latch *before* the increment: the hooks that ran during this step's
@@ -112,6 +200,9 @@ class Probe(ABC):
             self._flush_buffers()
             if self.log_global and self._global_accum:
                 self._flush_global_metrics()
+        # ``step_count`` now names the step that is about to run, so this decides
+        # whether that step keeps its hooks attached.
+        self.sync_hook_arming()
 
     def _flush_buffers(self) -> None:
         """Hook for backend-specific batched flush. Default: no-op.
@@ -142,6 +233,8 @@ class Probe(ABC):
         consuming the suppression, preserving the existing process-local phase.
         """
         self._skip_steps_remaining = max(self._skip_steps_remaining, max(0, int(count)))
+        # A suppressed step must not pay for attached hooks either.
+        self.sync_hook_arming()
 
     # ------------------------------------------------------------------
     # Legacy CPU-float API

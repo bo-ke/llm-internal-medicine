@@ -547,6 +547,42 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e1"], 25.0, places=4)
         self.assertNotIn("moe_health/layer_0/expert_weight_share_e0", latest)
 
+    def test_vector_elem_keys_are_marked_pre_aggregated(self):
+        """allocate_buffers keeps the per-element keys out of the gather payload.
+
+        Their cross-rank reduction happens on device in _flush_gpu_buffer, so pickling
+        one copy per rank through all_gather_object would be pure overhead.
+        """
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        monitor.declare_layer_vector(0, "expert_token_share", 3)
+        monitor.declare_layer_metric(0, "router_entropy")
+        try:
+            monitor.allocate_buffers()
+
+            for i in range(3):
+                self.assertIn(f"moe_health/layer_0/expert_token_share_e{i}", training_logs._pre_aggregated_keys)
+            self.assertNotIn("moe_health/layer_0/router_entropy", training_logs._pre_aggregated_keys)
+        finally:
+            training_logs._pre_aggregated_keys.clear()
+
+    def test_vector_reduction_is_a_noop_without_a_process_group(self):
+        """Single-card / no DP group: fall back to the rank-local vector mean."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=False)
+        monitor.declare_layer_vector(0, "expert_token_share", 2)
+        try:
+            monitor.allocate_buffers()
+            self.assertIsNone(monitor._vector_reduce_group())
+
+            monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([20.0, 80.0]))
+            monitor.record_layer_vector(0, "expert_token_share", paddle.to_tensor([40.0, 60.0]))
+            monitor.step()
+
+            latest = training_logs.get_latest(prefix="moe_health")
+            self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e0"], 30.0, places=4)
+            self.assertAlmostEqual(latest["moe_health/layer_0/expert_token_share_e1"], 70.0, places=4)
+        finally:
+            training_logs._pre_aggregated_keys.clear()
+
     def test_gpu_buffer_multi_layer_global_aggregation(self):
         """Global metrics are derived from layer accumulators at flush time."""
         monitor = PaddleMoEMonitor(log_per_layer=False, log_global=True)

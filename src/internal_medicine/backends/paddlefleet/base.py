@@ -51,6 +51,9 @@ class PaddleProbe(Probe):
         self._gpu_vec: dict[str, paddle.Tensor] = {}  # per-layer 向量累加器 [size]
         self._gpu_vec_cnt: dict[str, int] = {}
         self._vector_elem_keys: dict[str, list[str]] = {}  # 向量 key → 展开后的逐元素 key
+        # 向量指标的跨 rank 归约组，见 _vector_reduce_group()。None = 不归约（单卡/组不可用）。
+        self._vec_group = None
+        self._vec_group_resolved = False
         self._mtp_layer_ids: set[int] = set()
         self._buffers_allocated = False
 
@@ -117,6 +120,10 @@ class PaddleProbe(Probe):
         for k, size in self._vector_keys.items():
             self._gpu_vec[k] = paddle.zeros([size], dtype=dtype)
             self._gpu_vec_cnt[k] = 0
+        # 逐元素 key 的跨 rank 归约在 flush 时于 tensor 侧完成（见 _flush_gpu_buffer），
+        # 因此把它们从 gather_and_aggregate 的 all_gather_object payload 里摘掉
+        if self._vector_elem_keys:
+            training_logs.mark_pre_aggregated(key for elem_keys in self._vector_elem_keys.values() for key in elem_keys)
         self._buffers_allocated = True
         if self.verbose:
             logger.info(
@@ -280,6 +287,75 @@ class PaddleProbe(Probe):
             return True  # 显式 declare 的非逐层 key
         return self.log_per_layer
 
+    def _vector_reduce_group(self):
+        """向量指标的跨 rank 归约组：DP(+CP)，即持有相同层但看到不同 token 的那些 rank。
+
+        - TP rank 复算同一份路由，值本就相同，归约进来只是浪费；
+        - PP rank 持有不同的层，定长 collective 在它们之间形状都对不上，必然挂死；
+
+        所以 DP x CP 既是语义上正确的归约域，也是形状安全的那个。解析失败时返回
+        None，退化为「只信本 rank 的值」——向量指标本身在单 rank 上已是无偏估计
+        （整条归一化占比向量都在本 rank 上算全，跨 rank 平均只降噪）。
+        """
+        if self._vec_group_resolved:
+            return self._vec_group
+        self._vec_group_resolved = True
+        try:
+            import paddle.distributed as dist
+
+            if not dist.is_initialized():
+                return None
+            from paddlefleet.parallel_state import get_data_parallel_group
+
+            try:
+                self._vec_group = get_data_parallel_group(with_context_parallel=True)
+            except TypeError:  # 老版本签名里没有 with_context_parallel
+                self._vec_group = get_data_parallel_group()
+        except Exception as exc:
+            logger.warning(
+                f"[{self.METRIC_PREFIX}] 无法解析向量指标的 DP 归约组 ({exc}); "
+                f"逐元素曲线将只反映本 rank 的观测（噪声更大，但不影响标量指标）"
+            )
+            self._vec_group = None
+        return self._vec_group
+
+    def _vector_means_for_flush(self) -> dict[str, list[float]]:
+        """向量 key → 逐元素的全局均值（Python float）。
+
+        一次 collective 覆盖所有向量 key。形状只由 schema 决定（同一 PP stage 的各
+        rank 声明相同的层），刻意不按 ``cnt == 0`` 过滤 —— 否则各 rank 会带着不同
+        形状进同一个 collective 而挂死（同 tests/test_core_monitoring.py 里记录的
+        PP=4 死锁）。同组内各 rank 的 record 次数相同，故 SUM / nranks 等价于旧
+        路径「各 rank 均值再等权平均」的语义。
+
+        归约在 **float64** 上做，并单独走一次 D2H 而不与标量共用那次 concat：
+        旧路径是把 float32 的 per-rank 均值取回 Python 再用 float64 求平均，若这里
+        用 float32 归约，误差会随卡数累积（几千卡下相对误差可达 1e-6 量级），
+        单独用 float64 能把差异压回 float64 舍入水平。这是 step 边界的一次额外
+        D2H，不在 hook 热路径上。
+        """
+        order = list(self._vector_keys)
+        if not order:
+            return {}
+
+        flat = paddle.concat([(self._gpu_vec[k] / max(self._gpu_vec_cnt[k], 1)).astype("float64") for k in order])
+        group = self._vector_reduce_group()
+        if group is not None:
+            import paddle.distributed as dist
+
+            dist.all_reduce(flat, group=group)
+            flat = flat / float(group.nranks)
+
+        values = flat.cpu().tolist()
+        means: dict[str, list[float]] = {}
+        offset = 0
+        for k in order:
+            size = self._vector_keys[k]
+            if self._gpu_vec_cnt[k] > 0:
+                means[k] = values[offset : offset + size]
+            offset += size
+        return means
+
     def _flush_gpu_buffer(self) -> dict[str, float]:
         """单次批量 D2H：收集所有累加器 → 推导 global → concat→cpu→tolist → 重置。"""
         keys: list[str] = []
@@ -326,27 +402,19 @@ class PaddleProbe(Probe):
                     tensors.append(paddle.stack([self._gpu_acc[lk] for lk in active]).min())
                 keys.append(global_key)
 
-        # 5) 唯一 D2H 同步点：一次 concat → cpu → tolist（标量与向量共用）
-        vec_key_groups: list[list[str]] = []
-        vec_tensors: list[paddle.Tensor] = []
-        for k, elem_keys in self._vector_elem_keys.items():
-            cnt = self._gpu_vec_cnt[k]
-            if cnt == 0:
-                continue
-            vec_key_groups.append(elem_keys)
-            vec_tensors.append(self._gpu_vec[k] / cnt)
-
+        # 5) 标量的唯一 D2H 同步点：一次 concat → cpu → tolist
         out: dict[str, float] = {}
-        if tensors or vec_tensors:
-            flat = paddle.concat([t.reshape([-1]) for t in tensors] + vec_tensors)
-            vals = flat.cpu().tolist()
+        if tensors:
+            vals = paddle.concat([t.reshape([-1]) for t in tensors]).cpu().tolist()
             out = dict(zip(keys, vals, strict=False))
-            offset = len(keys)
-            for elem_keys in vec_key_groups:
-                out.update(zip(elem_keys, vals[offset : offset + len(elem_keys)], strict=False))
-                offset += len(elem_keys)
 
-        # 6) 重置所有累加器，为下一个 step 准备
+        # 6) 向量指标：float64 归约 + 自己的一次 D2H（见 _vector_means_for_flush）。
+        #    展开出来的逐元素 key 已是跨 rank 结果，不再进 all_gather_object
+        #    （allocate_buffers 里已 mark_pre_aggregated）。
+        for k, elements in self._vector_means_for_flush().items():
+            out.update(zip(self._vector_elem_keys[k], elements, strict=False))
+
+        # 7) 重置所有累加器，为下一个 step 准备
         for k in self._mean_keys:
             self._gpu_acc[k].zero_()
             self._gpu_cnt[k] = 0

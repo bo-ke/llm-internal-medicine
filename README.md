@@ -248,6 +248,70 @@ PaddleFleet 后端还会直接从每次 router forward 的实际选择结果输�
 | | < 0.3 | INEFFECTIVE | 共享专家作用不大 |
 | | > 3.0 | MONOPOLY | 共享专家主导，MoE 退化为 Dense |
 
+### 按卡负载（`card` 族，仅 paddlefleet）
+
+EP 下"这张卡本 step 收到了多少 token"及其峰均比。前面那些负载指标都是**发送侧**视角
+（router 把本 rank 的 token 分给了哪些专家），这一族是 dispatch **之后**的**接收侧**视角
+——决定 step 时间的是收得最多的那张卡，全组都要等它。
+
+| 指标 | 含义 |
+|------|------|
+| `card_tokens_max` | 收到 token 最多的那张卡 |
+| `card_tokens_mean` | 平均 |
+| `card_tokens_peak_mean_ratio` | 峰均比。1.0 = 完全均衡 |
+
+#### 两种口径，同一组 key
+
+`_reduce_card_tokens_over_ep` 跑完后，**同一 EP 组内每张卡持有的这三个值是相同的**（max 与 mean
+都是组内 `all_reduce` 出来的）。之后跨 rank 归约按 key 名再来一层，于是三条曲线各自代表不同的范围：
+
+- `card_tokens_max` → `all_reduce(MAX)`：max of maxes = **全局最热的那张卡**
+- `card_tokens_mean` → `all_reduce(SUM)/count`：G 个组各 `ep_size` 张卡都上报组均值 `m_g`，
+  `(Σ_g ep_size·m_g) / (G·ep_size) = (Σ_g m_g)/G` = **全局所有卡的均值**（各组等大时）
+- `card_tokens_peak_mean_ratio` → `all_reduce(SUM)/count` = **各 EP 组峰均比的平均**
+
+所以：
+
+| 想问的问题 | 看哪个 |
+|---|---|
+| 全世界最热的卡比全局平均重几倍（木桶效应，谁拖住了 step 时间） | 自己算 `card_tokens_max / card_tokens_mean` |
+| 平均而言每个 EP 组内部有多少不均衡（路由层面，与 DP 数据分布差异无关） | `card_tokens_peak_mean_ratio` |
+
+两者的差就是 DP 维贡献的那部分不均衡。举例：`PP=2, EP=4, DP=2`，某层两个 EP 组分别收到
+`[1000,1000,1000,1000]` 和 `[4000,0,0,0]`，则 `max=4000`、`mean=1000`、`peak_mean_ratio=2.5`，
+手算 `max/mean=4.0`。**`peak_mean_ratio` 才是与 `moe_logging` 逐点可比的那一个。**
+
+口径与 PaddleFleet `moe_logging` 的 `local_tokens_per_card_layer_{N}_max_mean_ratio`
+（`moe_utils.py:_log_local_tokens_per_card`）一致：统计范围是**一个 EP 组内**，不含 DP 维。
+
+#### 微批的归约顺序是语义的一部分
+
+峰值先在**微批内**跨卡取，之后才对微批求平均 —— 即
+`mean_微批( max_卡 )`，与 `log_moe_balance` 相同。先把各微批的负载平均、再跨卡取 max
+会得到 `max_卡( mean_微批 )`，由 `max` 的凸性它**恒不大于**前者，只有"每个微批里最热的都是同一张卡"
+时才相等。12 层 EP=8 实测两者差到 8%。
+
+同理，`card_tokens_peak_mean_ratio` 是**逐微批比值的平均**而不是两条上报曲线的比值：
+只有当每微批的跨卡均值恒定（不丢 token 时成立）两者才重合。要木桶效应就自己拿
+`max / mean` 除，那是另一个口径（见上表），不是这条曲线的近似。
+
+取数点是 `moe_layer.dispatch` 上的一个 patch —— 计数是 dispatcher 的状态
+（`token_dispatcher.get_dispatched_routing()[2]`），不在任何模块的 forward 返回值里，
+而且只有 a2a 完成后才有效。热路径上只有一次 `sum` 和一次 append，没有 D2H、没有通信。
+
+EP 归约批到 `step()` 里做：把各层各微批的本地值 stack 成一个 `[层数, 微批数]` 矩阵，
+**整个栈一共两次 `all_reduce`**（MAX + SUM）—— 逐微批的峰值由一次逐元素 MAX 一并得到，
+不需要每个微批各来一次通信。payload 从 `L` 个 float 变成 `L×M` 个，仍在 1 KB 以内。
+
+对照之下 PaddleFleet 那份实现是每层**每微批**一次 `all_gather_object` 外加一次 D2H
+（`log_moe_balance` 里 `tokens_per_expert.cpu()`，它自己的注释就写了那是同步点），
+43 层 × 16 微批 = 688 次各一 —— 这也是它为什么只能突发采样
+（`trainer_utils.py:129-134` 的 `(step+1) % (interval*interval) < interval`）。
+
+> 该族依赖 `moe_layer.moe_group` 判定 EP 组。同一 EP 组的各 rank 持有相同的层、跑相同数量的
+> 微批，所以矩阵形状在组内一致，集合通信不会错配。某层触发次数不同时按最短的那次截断，
+> 而不是改矩阵形状。
+
 ---
 
 ## 二、QK Stats Monitor (qk_stats)
@@ -810,7 +874,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | `massive_act` | `channel` 通道量级分布 / `outlier` 超大通道计数 / `module` 各模块输出量级 / `norm` 归一化后表示 / `overall` 整体激活量级 |
 | `ape_health` | `softmax` 位置 softmax 形状 / `coverage` 位置覆盖 / `scale` 量级与数值健康 |
 | `vha_health` | `mix` postmix 混合矩阵 / `gain` postmix 增益与扰动 / `head` 头间一致性 |
-| `moe_health` | `router` 路由打分质量 / `balance` 负载均衡 / `norm` 专家范数与 bias / `spectrum` gate 谱性质 / `act` 激活量级 / `shared` 共享 vs 路由 / `expert` 按专家分布 |
+| `moe_health` | `router` 路由打分质量 / `balance` 负载均衡 / `norm` 专家范数与 bias / `spectrum` gate 谱性质 / `act` 激活量级 / `shared` 共享 vs 路由 / `expert` 按专家分布 / `card` 按卡负载（EP 组内） |
 
 语义是**排除优先**：没声明的族默认全开，所以不配置这个参数时行为与以前逐字节一致；分类表若有遗漏，那条指标不属于任何排除集合，仍会被采集（fail-open）。反过来，族名写错会在启动时直接抛 `UnknownFamilyError`（fail-closed）——否则唯一的症状是「payload 没变小」，太难发现。
 

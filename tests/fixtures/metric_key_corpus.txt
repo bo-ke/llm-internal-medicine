@@ -468,3 +468,9 @@ vha_health/mla_main_postmix_u_fro
 vha_health/mla_main_postmix_uv_eff_rank
 vha_health/mla_main_postmix_uv_sigma_max
 vha_health/mla_main_postmix_v_fro
+moe_health/card_tokens_max
+moe_health/global_card_tokens_max
+moe_health/card_tokens_mean
+moe_health/global_card_tokens_mean
+moe_health/card_tokens_peak_mean_ratio
+moe_health/global_card_tokens_peak_mean_ratio

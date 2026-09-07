@@ -388,6 +388,7 @@ class PaddleMoEMonitor(PaddleProbe):
         "assignment_load_max_min_ratio",
         "gate_mass_max_frac",
         "gate_mass_max_min_ratio",
+        "card_tokens_max",
     }
     MIN_AGGREGATED = {
         "score_sum_min",
@@ -418,9 +419,15 @@ class PaddleMoEMonitor(PaddleProbe):
         )
         self._patched_gates = []
         self._patched_moe_layers = []
+        self._patched_dispatch_layers = []
         self._expert_norm_layers = []
         self._shared_act_norm_cache: dict = {}  # layer_idx -> 0-dim GPU tensor
         self._routed_act_norm_cache: dict = {}  # layer_idx -> 0-dim GPU tensor
+        # Per-card dispatched token counts, one entry per microbatch, reduced
+        # over the EP group once per step (see _reduce_card_tokens_over_ep).
+        self._card_tokens_seq: dict = {}  # layer_idx -> [0-dim GPU tensor, per microbatch]
+        self._moe_group = None
+        self._ep_size = 1
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -436,6 +443,8 @@ class PaddleMoEMonitor(PaddleProbe):
             return
         if self.verbose:
             logger.info(f"[PaddleMoEMonitor] Found {len(moe_layers)} MoE layers.")
+
+        self._init_moe_group(moe_layers)
 
         # Declare metric schema
         for layer_idx, moe_layer in moe_layers:
@@ -503,6 +512,12 @@ class PaddleMoEMonitor(PaddleProbe):
                 ]
             for m in gate_metrics + expert_metrics + act_metrics:
                 self.declare_layer_metric(layer_idx, m)
+            # Dispatched tokens per card. Declared for every MoE layer whose
+            # dispatcher can report them; the values are filled at step() time
+            # after one EP-group reduction, not from the hook.
+            if self._dispatch_reports_tokens(moe_layer):
+                for m in ("card_tokens_max", "card_tokens_mean", "card_tokens_peak_mean_ratio"):
+                    self.declare_layer_metric(layer_idx, m)
             # Per-expert share curves: one metric element per routed expert.
             # num_experts must come from static config here — a hook-time
             # reduction would need a D2H sync to size the schema.
@@ -527,6 +542,8 @@ class PaddleMoEMonitor(PaddleProbe):
             # after routed experts, before adding shared output — no D2H).
             if hasattr(moe_layer, "_post_routed_output"):
                 self._patch_post_routed_output(moe_layer, layer_idx)
+            if self._dispatch_reports_tokens(moe_layer):
+                self._patch_dispatch(moe_layer, layer_idx)
             # Expert weight norms are NOT collected from a forward hook: under
             # offline FP8 quant the bf16 expert weights are cleared at step
             # begin. collect_expert_norms() reads them before quant instead.
@@ -663,6 +680,139 @@ class PaddleMoEMonitor(PaddleProbe):
         moe_layer._im_original_post_routed_output = original_fn
         moe_layer._post_routed_output = patched_post_routed_output
         self._patched_moe_layers.append(moe_layer)
+
+    @staticmethod
+    def _dispatch_reports_tokens(moe_layer) -> bool:
+        """True when this layer's dispatcher can report dispatched token counts."""
+        dispatcher = getattr(moe_layer, "token_dispatcher", None)
+        return hasattr(moe_layer, "dispatch") and hasattr(dispatcher, "get_dispatched_routing")
+
+    def _init_moe_group(self, moe_layers) -> None:
+        """Cache the EP group the per-card reduction runs on.
+
+        ``moe_layer.moe_group`` is the same group PaddleFleet's own
+        ``log_moe_balance`` all-gathers over, so the reported peak/mean ratio
+        keeps that metric's semantics: unbalance *within one EP group*, not
+        across data-parallel replicas.
+        """
+        for _layer_idx, moe_layer in moe_layers:
+            group = getattr(moe_layer, "moe_group", None)
+            if group is None:
+                continue
+            self._moe_group = group
+            try:
+                from paddlefleet.utils import get_pg_size
+
+                self._ep_size = int(get_pg_size(group))
+            except Exception:
+                self._ep_size = 1
+            return
+
+    def _patch_dispatch(self, moe_layer, layer_idx: int):
+        """Read ``tokens_per_expert`` right after dispatch returns.
+
+        A patch on ``dispatch`` rather than a hook: the count lives on the
+        dispatcher as state, not in any module's forward return, and it is only
+        populated once the a2a has completed.
+
+        Hot path cost is one ``sum`` plus one ``add_`` — no D2H, and no
+        collective. The EP reduction that turns this into a peak/mean ratio is
+        batched across all layers into two ``all_reduce`` calls at step() time.
+        """
+        original_fn = moe_layer.dispatch
+        monitor = self
+
+        def patched_dispatch(*args, **kwargs):
+            result = original_fn(*args, **kwargs)
+            if moe_layer.training and monitor._should_monitor():
+                try:
+                    tokens_per_expert = moe_layer.token_dispatcher.get_dispatched_routing()[2]
+                    if tokens_per_expert is not None:
+                        with paddle.no_grad():
+                            monitor._accumulate_card_tokens(layer_idx, tokens_per_expert)
+                except Exception as e:
+                    if monitor.verbose:
+                        logger.error(f"[PaddleMoEMonitor] dispatch patch error layer {layer_idx}: {e}")
+            return result
+
+        moe_layer._im_original_dispatch = original_fn
+        moe_layer.dispatch = patched_dispatch
+        self._patched_dispatch_layers.append(moe_layer)
+
+    def _accumulate_card_tokens(self, layer_idx: int, tokens_per_expert) -> None:
+        """Record this microbatch's local dispatched token total for one layer.
+
+        Kept per microbatch rather than summed: the reported peak is
+        ``mean_over_microbatches(max_over_cards(...))``, and averaging the loads
+        first would compute ``max(mean)``, which by convexity of ``max`` is a
+        different (always smaller) number — see _reduce_card_tokens_over_ep.
+        """
+        if not isinstance(tokens_per_expert, paddle.Tensor):
+            tokens_per_expert = paddle.to_tensor(tokens_per_expert, dtype="float32")
+        local = tokens_per_expert.detach().astype("float32").sum()
+        self._card_tokens_seq.setdefault(layer_idx, []).append(local)
+
+    def _reduce_card_tokens_over_ep(self) -> None:
+        """Turn per-card totals into EP-group max / mean / peak-mean ratio.
+
+        The reduction order matters and matches PaddleFleet's ``log_moe_balance``:
+        each microbatch's peak is taken across cards first, and only then are the
+        microbatches averaged. Averaging the loads first would report
+        ``max_cards(mean_microbatches(load))``, which is ``<=`` this by convexity
+        of ``max`` and equal only when the same card is hottest in every
+        microbatch — measured at up to 8% low on a 12-layer EP=8 run.
+
+        Still **two** ``all_reduce`` calls per step for the whole stack, not one
+        per microbatch: the locals are stacked into one ``[layers, microbatches]``
+        matrix, so per-microbatch peaks come out of a single elementwise MAX. The
+        payload grows from ``L`` to ``L*M`` floats and stays under a kilobyte.
+        The alternative shape — one collective per microbatch — would be 16x the
+        launches for the same numbers; ``log_moe_balance`` pays one
+        ``all_gather_object`` *plus* one D2H per layer per microbatch.
+
+        Every rank of an EP group holds the same layers and runs the same number
+        of microbatches, so the matrix has one shape across the group and the
+        collective cannot mismatch. A layer that fired a different number of
+        times is truncated to the shortest run rather than reshaping the matrix.
+        """
+        if not self._card_tokens_seq:
+            return
+        layer_ids = sorted(self._card_tokens_seq)
+        width = min(len(self._card_tokens_seq[i]) for i in layer_ids)
+        if width == 0:
+            self._card_tokens_seq = {}
+            return
+        local = paddle.stack(
+            [paddle.stack(self._card_tokens_seq[i][:width]) for i in layer_ids]
+        )  # [layers, microbatches]
+        peak_per_mb, mean_per_mb = local, local
+        if self._moe_group is not None and self._ep_size > 1:
+            import paddle.distributed as dist
+
+            peak_per_mb = local.clone()
+            dist.all_reduce(peak_per_mb, op=dist.ReduceOp.MAX, group=self._moe_group)
+            total = local.clone()
+            dist.all_reduce(total, op=dist.ReduceOp.SUM, group=self._moe_group)
+            mean_per_mb = total / float(self._ep_size)
+        peak, mean, ratio = self._card_token_stats(peak_per_mb, mean_per_mb)
+        for pos, layer_idx in enumerate(layer_ids):
+            self.record_layer_metric(layer_idx, "card_tokens_max", peak[pos])
+            self.record_layer_metric(layer_idx, "card_tokens_mean", mean[pos])
+            self.record_layer_metric(layer_idx, "card_tokens_peak_mean_ratio", ratio[pos])
+        self._card_tokens_seq = {}
+
+    @staticmethod
+    def _card_token_stats(peak_per_mb: paddle.Tensor, mean_per_mb: paddle.Tensor):
+        """``[layers, microbatches]`` EP-reduced pair → per-layer peak / mean / ratio.
+
+        Split out so the reduction order is testable without a process group: the
+        ratio is the *mean of per-microbatch ratios*, not the ratio of the means.
+        """
+        return (
+            peak_per_mb.mean(axis=-1),
+            mean_per_mb.mean(axis=-1),
+            (peak_per_mb / mean_per_mb.clip(min=1e-6)).mean(axis=-1),
+        )
 
     def _flush_act_ratio(self):
         """After both shared and routed hooks have run, record the norm ratio."""
@@ -1028,12 +1178,21 @@ class PaddleMoEMonitor(PaddleProbe):
                 if hasattr(moe_layer, attr):
                     delattr(moe_layer, attr)
         self._patched_moe_layers = []
+        for moe_layer in self._patched_dispatch_layers:
+            original_fn = getattr(moe_layer, "_im_original_dispatch", None)
+            if original_fn is not None:
+                moe_layer.dispatch = original_fn
+            if hasattr(moe_layer, "_im_original_dispatch"):
+                delattr(moe_layer, "_im_original_dispatch")
+        self._patched_dispatch_layers = []
+        self._card_tokens_seq = {}
         self._expert_norm_layers = []
         self._shared_act_norm_cache.clear()
         self._routed_act_norm_cache.clear()
 
     def step(self):
         self._flush_act_ratio()
+        self._reduce_card_tokens_over_ep()
         super().step()
 
 

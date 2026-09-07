@@ -6,12 +6,44 @@ is the caller's responsibility.
 """
 
 import logging
+import zlib
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-__all__ = ("SmoothedValue", "TrainingLogs", "training_logs")
+__all__ = ("ReduceSchema", "SmoothedValue", "TrainingLogs", "training_logs")
+
+
+@dataclass(frozen=True)
+class ReduceSchema:
+    """One rank's metrics, split by how they reduce across ranks.
+
+    ``mean_keys`` / ``max_keys`` / ``min_keys`` are sorted so that two ranks
+    holding the same key set produce byte-identical layouts, which is what makes
+    the fingerprint below a usable agreement check.
+    """
+
+    values: dict
+    mean_keys: tuple[str, ...] = ()
+    max_keys: tuple[str, ...] = ()
+    min_keys: tuple[str, ...] = ()
+
+    @property
+    def fingerprint(self) -> int:
+        """Stable hash of the local key layout.
+
+        ``hash()`` is salted per process (PYTHONHASHSEED), so it would disagree
+        between ranks that hold identical keys and trigger a re-alignment every
+        step. CRC32 is stable across processes and interpreter runs.
+        """
+        blob = "\u0000".join(("M", *self.mean_keys, "X", *self.max_keys, "N", *self.min_keys))
+        return zlib.crc32(blob.encode()) & 0x7FFFFFFF
+
+    def all_keys(self) -> tuple[str, ...]:
+        return self.mean_keys + self.max_keys + self.min_keys
+
 
 MAX_AGGREGATED_SUFFIXES = (
     "topk_channel_norm",
@@ -96,6 +128,23 @@ class TrainingLogs:
         """Set the distributed gather function (backend provides this)."""
         self._gather_fn = fn
 
+    def set_reduce_fn(self, fn: Callable):
+        """Install a numeric cross-rank reducer, preferred over ``gather_fn``.
+
+        ``all_gather_object`` pickles the whole ``{key: value}`` dict, so its
+        payload — and the receive buffer, and the number of unpickle calls on
+        every rank — grows with world size: at 6144 ranks a 155 KB dict means
+        ~930 MB of traffic per rank and 6144 deserialisations, none of which the
+        GPU can overlap. The aggregation only ever needs mean/max/min, which a
+        reduction can do in one pass with a payload that does not depend on world
+        size at all. Backends that cannot reduce (or want the old semantics) just
+        leave this unset and keep using ``gather_fn``.
+
+        ``fn(schema) -> dict[str, float] | None`` receives a ``ReduceSchema`` and
+        returns the aggregated metrics, or None to fall back to the gather path.
+        """
+        self._reduce_fn = fn
+
     def update(self, **kwargs):
         for k, v in kwargs.items():
             self[k] = v
@@ -165,8 +214,14 @@ class TrainingLogs:
         self.meters.clear()
 
     def gather_and_aggregate(self):
-        """Gather metrics from all ranks and aggregate by naming convention."""
+        """Aggregate metrics across ranks, by reduction when the backend can."""
         all_metrics = self.get_latest()
+
+        reduce_fn = getattr(self, "_reduce_fn", None)
+        if reduce_fn is not None:
+            reduced = reduce_fn(self.build_reduce_schema(all_metrics))
+            if reduced is not None:
+                return reduced
 
         gather_fn = getattr(self, "_gather_fn", None)
         if gather_fn is None:
@@ -189,6 +244,28 @@ class TrainingLogs:
             else:
                 aggregated[k] = sum(values) / len(values)
         return aggregated
+
+    def build_reduce_schema(self, metrics: dict) -> ReduceSchema:
+        """Describe this rank's metrics for a numeric cross-rank reduction.
+
+        The mode split has to happen here, not in the backend: ``_is_max_metric``
+        and ``_is_min_metric`` are the single source of truth for how a key
+        reduces, and the gather path already agrees with them.
+        """
+        mean_keys, max_keys, min_keys = [], [], []
+        for key in metrics:
+            if self._is_max_metric(key):
+                max_keys.append(key)
+            elif self._is_min_metric(key):
+                min_keys.append(key)
+            else:
+                mean_keys.append(key)
+        return ReduceSchema(
+            values=metrics,
+            mean_keys=tuple(sorted(mean_keys)),
+            max_keys=tuple(sorted(max_keys)),
+            min_keys=tuple(sorted(min_keys)),
+        )
 
 
 training_logs = TrainingLogs()

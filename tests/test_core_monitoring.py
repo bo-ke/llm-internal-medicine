@@ -83,6 +83,61 @@ class CoreMonitoringTest(unittest.TestCase):
         self.assertEqual(calls, [{}], "gather_fn must be called even with no local metrics")
         self.assertEqual(aggregated, {"dummy/layer_0/mean": 4.0})
 
+    def test_reduce_path_is_preferred_and_matches_gather_semantics(self):
+        """The numeric reducer must agree with the object-gather it replaces."""
+        training_logs.update(**{"dummy/a_mean": 2.0, "dummy/b_max": 5.0, "dummy/c_min": 1.0})
+        captured = {}
+
+        def fake_reduce(schema):
+            captured["schema"] = schema
+            # Emulate a second rank: mean averages, max/min extend.
+            return {"dummy/a_mean": 3.0, "dummy/b_max": 9.0, "dummy/c_min": 0.5}
+
+        def fake_gather(_local):
+            raise AssertionError("gather_fn must not run when a reducer is installed")
+
+        training_logs.set_gather_fn(fake_gather)
+        training_logs.set_reduce_fn(fake_reduce)
+        try:
+            aggregated = training_logs.gather_and_aggregate()
+        finally:
+            training_logs.set_reduce_fn(None)
+            training_logs.set_gather_fn(None)
+
+        self.assertEqual(aggregated["dummy/a_mean"], 3.0)
+        self.assertEqual(aggregated["dummy/b_max"], 9.0)
+        self.assertEqual(aggregated["dummy/c_min"], 0.5)
+
+        schema = captured["schema"]
+        self.assertEqual(schema.max_keys, ("dummy/b_max",))
+        self.assertEqual(schema.min_keys, ("dummy/c_min",))
+        self.assertEqual(schema.mean_keys, ("dummy/a_mean",))
+        training_logs.reset()
+
+    def test_reduce_falls_back_to_gather_when_reducer_declines(self):
+        """A single-rank job (or an unsupported backend) keeps the old path."""
+        training_logs.update(**{"dummy/a_mean": 2.0})
+        training_logs.set_reduce_fn(lambda schema: None)
+        training_logs.set_gather_fn(lambda local: [local, {"dummy/a_mean": 4.0}])
+        try:
+            aggregated = training_logs.gather_and_aggregate()
+        finally:
+            training_logs.set_reduce_fn(None)
+            training_logs.set_gather_fn(None)
+
+        self.assertEqual(aggregated, {"dummy/a_mean": 3.0})
+        training_logs.reset()
+
+    def test_reduce_fingerprint_is_stable_across_processes(self):
+        """PYTHONHASHSEED-salted hash() would re-align the layout every step."""
+        schema = training_logs.build_reduce_schema({"dummy/a_mean": 1.0, "dummy/b_max": 2.0})
+        # Recomputed from the same key layout, as another rank would.
+        twin = training_logs.build_reduce_schema({"dummy/b_max": 9.0, "dummy/a_mean": 9.0})
+        self.assertEqual(schema.fingerprint, twin.fingerprint)
+        different = training_logs.build_reduce_schema({"dummy/a_mean": 1.0})
+        self.assertNotEqual(schema.fingerprint, different.fingerprint)
+        training_logs.reset()
+
     def test_log_flags_are_respected(self):
         probe = DummyProbe(log_per_layer=False, log_global=True)
         probe._record_metrics(0, {"mean": 2.0})

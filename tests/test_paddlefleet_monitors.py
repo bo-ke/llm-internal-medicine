@@ -31,6 +31,7 @@ PaddleQKStatsMonitor = qk_monitor_module.PaddleQKStatsMonitor
 paddlefleet_backend = importlib.import_module("internal_medicine.backends.paddlefleet")
 layer_discovery = importlib.import_module("internal_medicine.backends.paddlefleet.layer_discovery")
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
+TrainingLogs = importlib.import_module("internal_medicine.core.training_logs").TrainingLogs
 
 
 class BrokenPaddleMoELayer:
@@ -3151,3 +3152,176 @@ class MetricFamilySelectionTest(unittest.TestCase):
             paddlefleet_backend.setup_monitors(
                 SimpleNamespace(), monitors=["moe_health"], exclude_families="moe:expert"
             )
+
+
+class _FakeDispatcher(nn.Layer):
+    """``token_dispatcher``: the count lives on it as state, not in a return."""
+
+    def __init__(self):
+        super().__init__()
+        self.tokens_per_expert = None
+
+    def get_dispatched_routing(self):
+        return (None, None, self.tokens_per_expert)
+
+
+class _MinimalGate(nn.Layer):
+    """Just enough for `_find_moe_layers` to recognise the module as MoE."""
+
+    def __init__(self, num_experts=4):
+        super().__init__()
+        self.num_experts = num_experts
+
+
+class _FakeMoELayerWithDispatch(nn.Layer):
+    """MoE layer exposing only what the per-card token path reads."""
+
+    def __init__(self, moe_group=None):
+        super().__init__()
+        self.gate = _MinimalGate()
+        self.token_dispatcher = _FakeDispatcher()
+        self.moe_group = moe_group
+        self.dispatch_calls = 0
+
+    def dispatch(self, tokens_per_expert):
+        # Stands in for the real a2a: the dispatcher's state is only valid once
+        # this has returned, which is why the monitor patches it.
+        self.token_dispatcher.tokens_per_expert = tokens_per_expert
+        self.dispatch_calls += 1
+        return tokens_per_expert
+
+
+def _dispatch_model(layers):
+    wrapped = []
+    for moe_layer in layers:
+        layer = nn.Layer()
+        layer.mlp = moe_layer
+        layer.layer_idx = len(wrapped)
+        wrapped.append(layer)
+    return SimpleNamespace(layers=wrapped)
+
+
+class PaddleMoECardTokensTest(unittest.TestCase):
+    """Dispatched tokens per card — EP-group peak / mean / peak-mean ratio."""
+
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    @staticmethod
+    def _counts(*values):
+        return paddle.to_tensor(list(values), dtype="int64")
+
+    def test_the_three_card_metrics_are_emitted(self):
+        moe_layer = _FakeMoELayerWithDispatch()
+        monitor = PaddleMoEMonitor()
+        monitor.register_hooks(_dispatch_model([moe_layer]))
+        moe_layer.dispatch(self._counts(10, 20, 30))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health/layer_0/card_tokens")
+        self.assertAlmostEqual(latest["moe_health/layer_0/card_tokens_max"], 60.0, places=5)
+        self.assertAlmostEqual(latest["moe_health/layer_0/card_tokens_mean"], 60.0, places=5)
+        # Single rank: this card *is* the peak and the mean.
+        self.assertAlmostEqual(latest["moe_health/layer_0/card_tokens_peak_mean_ratio"], 1.0, places=5)
+        monitor.remove_hooks()
+
+    def test_microbatches_are_averaged_not_summed(self):
+        # Otherwise a gradient-accumulation change would move the curve without
+        # any change in balance.
+        moe_layer = _FakeMoELayerWithDispatch()
+        monitor = PaddleMoEMonitor()
+        monitor.register_hooks(_dispatch_model([moe_layer]))
+        moe_layer.dispatch(self._counts(10, 10))
+        moe_layer.dispatch(self._counts(30, 30))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health/layer_0/card_tokens")
+        self.assertAlmostEqual(latest["moe_health/layer_0/card_tokens_mean"], 40.0, places=5)
+        monitor.remove_hooks()
+
+    def test_the_dispatch_patch_keeps_the_original_return_value(self):
+        moe_layer = _FakeMoELayerWithDispatch()
+        monitor = PaddleMoEMonitor()
+        monitor.register_hooks(_dispatch_model([moe_layer]))
+        counts = self._counts(1, 2)
+        self.assertIs(moe_layer.dispatch(counts), counts)
+        self.assertEqual(moe_layer.dispatch_calls, 1)
+        monitor.remove_hooks()
+
+    def test_remove_hooks_restores_dispatch(self):
+        moe_layer = _FakeMoELayerWithDispatch()
+        monitor = PaddleMoEMonitor()
+        monitor.register_hooks(_dispatch_model([moe_layer]))
+        monitor.remove_hooks()
+        self.assertFalse(hasattr(moe_layer, "_im_original_dispatch"))
+
+        moe_layer.dispatch(self._counts(5, 5))
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="moe_health/layer_0/card_tokens"), {})
+
+    def test_a_layer_without_a_dispatcher_declares_no_card_metrics(self):
+        plain = nn.Layer()
+        plain.gate = _MinimalGate()
+        monitor = PaddleMoEMonitor()
+        monitor.register_hooks(_dispatch_model([plain]))
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="moe_health/layer_0/card_tokens"), {})
+
+    def test_monitor_interval_gates_the_accumulation(self):
+        moe_layer = _FakeMoELayerWithDispatch()
+        monitor = PaddleMoEMonitor(monitor_interval=0)
+        monitor.register_hooks(_dispatch_model([moe_layer]))
+        moe_layer.dispatch(self._counts(10, 20))
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="moe_health/layer_0/card_tokens"), {})
+        monitor.remove_hooks()
+
+    def test_card_metric_naming_contract(self):
+        # training_logs picks the cross-rank reduction from the key name; it must
+        # agree with MAX_AGGREGATED or the EP peak gets averaged across ranks.
+        self.assertIn("card_tokens_max", PaddleMoEMonitor.MAX_AGGREGATED)
+        self.assertTrue(TrainingLogs._is_max_metric("moe_health/layer_0/card_tokens_max"))
+        for name in ("card_tokens_mean", "card_tokens_peak_mean_ratio"):
+            key = f"moe_health/layer_0/{name}"
+            self.assertFalse(TrainingLogs._is_max_metric(key), key)
+            self.assertFalse(TrainingLogs._is_min_metric(key), key)
+
+    def test_the_card_family_can_be_switched_off(self):
+        moe_layer = _FakeMoELayerWithDispatch()
+        monitor = PaddleMoEMonitor(exclude_families="card")
+        monitor.register_hooks(_dispatch_model([moe_layer]))
+        moe_layer.dispatch(self._counts(10, 20))
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="moe_health/layer_0/card_tokens"), {})
+        monitor.remove_hooks()
+
+    def test_the_ratio_is_the_mean_of_per_microbatch_ratios(self):
+        """Reduction order, pinned without needing a process group.
+
+        `max` is convex, so `mean_mb(max_card)` and `max_card(mean_mb)` differ
+        whenever the hottest card changes between microbatches — and only the
+        first matches PaddleFleet's `log_moe_balance`. Two microbatches with the
+        peak on different cards: peaks 80 and 120, means 40 and 40.
+        """
+        peak_per_mb = paddle.to_tensor([[80.0, 120.0]], dtype="float32")
+        mean_per_mb = paddle.to_tensor([[40.0, 40.0]], dtype="float32")
+        peak, mean, ratio = PaddleMoEMonitor._card_token_stats(peak_per_mb, mean_per_mb)
+        self.assertAlmostEqual(float(peak[0]), 100.0, places=5)
+        self.assertAlmostEqual(float(mean[0]), 40.0, places=5)
+        # mean(80/40, 120/40) = mean(2, 3) = 2.5
+        self.assertAlmostEqual(float(ratio[0]), 2.5, places=5)
+
+    def test_the_ratio_is_not_the_ratio_of_the_reported_means(self):
+        """The two coincide only when the per-microbatch mean is constant.
+
+        Documented in the README because someone will otherwise divide the two
+        reported curves and expect the third.
+        """
+        peak_per_mb = paddle.to_tensor([[80.0, 120.0]], dtype="float32")
+        mean_per_mb = paddle.to_tensor([[40.0, 80.0]], dtype="float32")
+        peak, mean, ratio = PaddleMoEMonitor._card_token_stats(peak_per_mb, mean_per_mb)
+        self.assertAlmostEqual(float(ratio[0]), 1.75, places=5)  # mean(2.0, 1.5)
+        self.assertNotAlmostEqual(float(peak[0]) / float(mean[0]), float(ratio[0]), places=3)

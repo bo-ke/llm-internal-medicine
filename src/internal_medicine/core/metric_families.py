@@ -112,6 +112,7 @@ METRIC_TAXONOMY: dict[str, dict] = {
             ("act", "激活量级", r"_act_(abs_max|mean|norm)$|^routed_act|^shared_act"),
             ("shared", "共享 vs 路由", r"^shared_"),
             ("expert", "按专家分布", r"^expert_(token|weight)_share"),
+            ("card", "按卡负载（EP 组内）", r"^card_tokens_"),
         ),
     },
 }

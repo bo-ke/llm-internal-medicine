@@ -52,6 +52,7 @@ class Probe(ABC):
         self.hooks = []
         self.step_count = 0
         self.sampled_this_step = False
+        self._skip_steps_remaining = 0
         self.pp_rank = 0
         self._global_accum: dict[str, float] = {}
         self._global_metric_counts: dict[str, int] = {}
@@ -102,11 +103,15 @@ class Probe(ABC):
         # resumes from a checkpoint while ``step_count`` restarts at 0, and the
         # two drift apart whenever the resume step is not a multiple of
         # ``monitor_interval``.
+        skip_step = self._skip_steps_remaining > 0
         self.sampled_this_step = self._interval_reached()
+        if skip_step:
+            self._skip_steps_remaining -= 1
         self.step_count += 1
-        self._flush_buffers()
-        if self.log_global and self._global_accum:
-            self._flush_global_metrics()
+        if not skip_step:
+            self._flush_buffers()
+            if self.log_global and self._global_accum:
+                self._flush_global_metrics()
 
     def _flush_buffers(self) -> None:
         """Hook for backend-specific batched flush. Default: no-op.
@@ -122,12 +127,21 @@ class Probe(ABC):
         backend-specific conditions on top; ``step`` latches this one alone so
         the flag stays a pure function of the step counter.
         """
-        if not self.monitor_interval:
+        if self._skip_steps_remaining > 0 or not self.monitor_interval:
             return False
         return self.step_count % self.monitor_interval == 0
 
     def _should_monitor(self) -> bool:
         return self._interval_reached()
+
+    def skip_next_steps(self, count: int = 1) -> None:
+        """Suppress metric collection for the next ``count`` training steps.
+
+        The gate lives on the probe so forward/backward hooks see it before doing
+        metric work. ``step()`` still advances the local interval counter while
+        consuming the suppression, preserving the existing process-local phase.
+        """
+        self._skip_steps_remaining = max(self._skip_steps_remaining, max(0, int(count)))
 
     # ------------------------------------------------------------------
     # Legacy CPU-float API

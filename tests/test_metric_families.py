@@ -37,7 +37,7 @@ class MetricFamilyTaxonomyTest(unittest.TestCase):
         """A silently-empty fixture would make every assertion below vacuous."""
         entries = list(corpus_entries())
         self.assertGreater(len(entries), 400)
-        self.assertEqual(len({m for m, _ in entries}), 6)
+        self.assertEqual(len({m for m, _ in entries}), 7)
 
     def test_every_real_metric_lands_in_a_declared_family(self):
         """Nothing may fall through to `other`.

@@ -115,6 +115,18 @@ METRIC_TAXONOMY: dict[str, dict] = {
             ("card", "按卡负载（EP 组内）", r"^card_tokens_"),
         ),
     },
+    "dsa_health": {
+        # `crosslayer` must precede `select`, or `^select_` would swallow the
+        # cross-layer IoU — which is the one family here that answers a question
+        # about the stack rather than about a layer.
+        "families": (
+            ("indexer", "indexer 投影量级", r"^index_"),
+            ("score", "打分分布与选择边界", r"^score_"),
+            ("crosslayer", "跨层选择重合度", r"^select_iou"),
+            ("select", "选择结构与稀疏率", r"^select_"),
+            ("match", "与稠密 attn 的一致性", r"^attn_"),
+        ),
+    },
 }
 
 

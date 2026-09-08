@@ -9,7 +9,7 @@
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 标量指标 + `n²+2n` 条逐元素映射序列，megatron 后端 16 指标；仅在开启 mHC 层时生效)
 - **[KDA Health](./docs/kda_health.md)** — Kimi Delta Attention 线性注意力层的衰减/写入/读出三通路监控 (8 指标；仅 paddlefleet；仅在模型含 KDA 层时生效)
-- **DSA Health** — DeepSeek Sparse Attention 的 indexer 健康度、选择结构、与主干稠密 attention 的一致性 (`attn_recall` / `KL`)、以及跨层选择重合度 (22 指标；仅 paddlefleet；仅在模型含 DSA 层时生效；CP>1 下 `match` 一族关闭)
+- **DSA Health** — DeepSeek Sparse Attention 的 indexer 健康度、选择结构、与主干稠密 attention 的一致性 (`attn_recall` / `KL`)、以及跨层选择重合度 (19 指标；仅 paddlefleet；仅在模型含 DSA 层时生效；CP>1 下 `match` 一族关闭)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
@@ -805,22 +805,36 @@ shape 本身不说明是哪一种。所以 CSA 的标记要显式排掉：indexe
 以及 core 上的 `compressed_sparse_attn`（`qk_monitor` 的稀疏路径就是靠这个属性认的）。认错的后果不是
 报错而是**静默错**：因果判定和距离全部会算在错误的序列上。
 
-| # | 指标 | 族 | 含义 |
-|---|------|-----|------|
-| 1 | `index_{q,k}_rms` / `index_{q,k}_abs_max` | `indexer` | 打分 einsum 真正吃进去的 q / k（已过 RoPE + Hadamard）的量级 |
-| 2 | `index_weights_mean` / `index_weights_abs_max` | `indexer` | 逐头重要性权重的量级（已吸收 `softmax_scale`） |
-| 3 | `index_weights_neg_ratio` | `indexer` | 负权重占比。`weights_proj` 无约束，负权重让那个头的证据**压制**某位置；趋近 0.5 = 逐头重要性不再是重要性 |
-| 4 | `score_selected_mean` / `score_unselected_mean` | `score` | 留下的分数与丢掉的分数，两者的差就是选择边界的清晰度 |
-| 5 | `score_topk_mass` | `score` | 选中位置占总正分数的比例（先 clip 到 ≥0，否则符号和不构成「质量」） |
-| 6 | `select_ratio` | `select` | 实际稀疏率 = 选中数 / 该行的因果长度 |
-| 7 | `select_dist_mean` / `select_dist_max` | `select` | 回看距离，按该行因果长度归一化，跨序列长度可比 |
-| 8 | `select_local_ratio` | `select` | 选中位置落在最近 `local_window` 内的比例。**退化告警**：indexer 塌成滑动窗口时趋 1 |
-| 9 | `select_key_coverage` | `select` | 采样行的并集覆盖了多少 key 轴 |
-| 10 | `attn_recall` / `attn_recall_min` | `match` | **首要指标**：稀疏 mask 之后存活的稠密注意力质量。回答「选择和主干模式匹配吗」 |
-| 11 | `attn_kl` | `match` | `KL(p_sparse ‖ p_dense)`。逐 (head, row) 恒等于 `-log(recall)`，但**报告值不冗余**：`mean(-log r) ≥ -log(mean r)`，两者的差正是「个别头被害得很惨」的代价 |
-| 12 | `attn_top1_hit` | `match` | 最大 logit 是否被选中。均值能停在 0.95 而最重要的那个 key 一直被丢 |
-| 13 | `attn_{dense,sparse}_entropy` | `match` | 稀疏化前后的注意力熵，看 mask 把分布削尖了多少 |
-| 14 | `select_iou_prev` | `crosslayer` | 与**同一次 forward 内前一个** DSA 层选择的 IoU。趋 1 = 各层在重复算同一个选择（跨层共享 index 的收益上界）；趋近稀疏率 = 各层独立选择 |
+符号约定（都在**采样的 query 行 `r` × 采样 head `h`** 上算，见「采样与代价」）：
+`s_t = Σ_h w_h · relu(q_h · k_t)` 是 indexer 打分；`causal_t = [t ≤ r]`、`n_causal = Σ_t causal_t` 是该行的因果长度；
+`sel_t ∈ {0,1}` 是 top-k 选中标记（**已乘 causal**，所以有效 key 不足 k 的行不会虚计），`n_sel = Σ_t sel_t`；
+`dist_t = (r − t) · causal_t`；`p_t = softmax_t(scale · q_h·k_t + causal mask)` 是主干稠密注意力概率。
+
+| # | 键 | 族 | 公式 | 级别 | 诊断意义 |
+|---|-----|-----|------|------|----------|
+| 1 | `index_q_rms` | `indexer` | `sqrt(mean(q²))` | 每层+全局 | 打分 einsum 真正吃进去的 q（已过 RoPE + Hadamard）的量级 |
+| 2 | `index_q_abs_max` | `indexer` | `max(\|q\|)` | 每层+全局 | q 的 outlier；配合 rms 区分整体放大与局部尖峰 |
+| 3 | `index_k_rms` | `indexer` | `sqrt(mean(k²))` | 每层+全局 | indexer key 的量级 |
+| 4 | `index_k_abs_max` | `indexer` | `max(\|k\|)` | 每层+全局 | indexer key 的 outlier |
+| 5 | `index_weights_abs_max` | `indexer` | `max(\|w\|)` | 每层+全局 | 逐头重要性权重的量级（已吸收 `softmax_scale` 与 `n_heads^-0.5`） |
+| 6 | `index_weights_neg_ratio` | `indexer` | `mean(w < 0)` | 每层+全局 | 负权重占比。`weights_proj` 无约束，负权重让那个头的证据**压制**某位置；趋近 0.5 = 逐头重要性不再是重要性 |
+| 7 | `score_selected_mean` | `score` | `mean_r(Σ_t s·sel / n_sel)` | 每层+全局 | 留下的分数（不 clip——负向塌缩要看得见） |
+| 8 | `score_unselected_mean` | `score` | `mean_r(Σ_t s·(causal−sel) / (n_causal−n_sel))` | 每层+全局 | 丢掉的分数。与上一行的差就是选择边界的清晰度 |
+| 9 | `score_topk_mass` | `score` | `mean_r(Σ_t relu(s)·sel / Σ_t relu(s)·causal)` | 每层+全局 | 选中位置占总正分数的比例（先 clip 到 ≥0，否则符号和不构成「质量」） |
+| 10 | `select_ratio` | `select` | `mean_r(n_sel / n_causal)` | 每层+全局 | 实际稀疏率 |
+| 11 | `select_dist_mean` | `select` | `mean_r(Σ_t sel·dist / n_sel / n_causal)` | 每层+全局 | 平均回看距离，按该行因果长度归一化，跨序列长度可比 |
+| 12 | `select_local_ratio` | `select` | `mean_r(Σ_t sel·[dist < W] / n_sel)`，`W = local_window` | 每层+全局 | 选中位置落在最近窗口内的比例。**退化告警**：indexer 塌成滑动窗口时趋 1 |
+| 13 | `select_key_coverage` | `select` | `\|∪_r {t : sel_t = 1}\| / max_r n_causal` | 每层+全局 | 采样行的并集覆盖了多少 key 轴 |
+| 14 | `attn_recall` | `match` | `mean_{h,r}(Σ_t p·sel)` | 每层+全局 | **首要指标**：稀疏 mask 之后存活的稠密注意力质量。回答「选择和主干模式匹配吗」 |
+| 15 | `attn_recall_min` | `match` | `min_{h,r}(Σ_t p·sel)` | 每层+全局 | 最差的那个 (head, row)，均值掩盖的尾部风险 |
+| 16 | `attn_kl` | `match` | `mean_{h,r}(−log recall)` | 每层+全局 | `KL(p_sparse ‖ p_dense)`。逐 (head, row) 恒等于 `−log(recall)`，但**报告值不冗余**：`mean(−log r) ≥ −log(mean r)`，两者的差正是「个别头被害得很惨」的代价 |
+| 17 | `attn_top1_hit` | `match` | `mean_{h,r}(sel[argmax_t logit])` | 每层+全局 | 最大 logit 是否被选中。recall 能停在 0.95 而最重要的那个 key 一直被丢 |
+| 18 | `attn_sparse_entropy` | `match` | `mean_{h,r}(−Σ_t p̃ log p̃)`，`p̃ = p·sel / recall` | 每层+全局 | mask + 重归一之后的注意力熵，看选择把分布削得多尖 |
+| 19 | `select_iou_prev` | `crosslayer` | `mean_r(\|sel ∩ sel_prev\| / \|sel ∪ sel_prev\|)` | 每层+全局 | 与**同一次 forward 内前一个** DSA 层选择的 IoU。趋 1 = 各层在重复算同一个选择（跨层共享 index 的收益上界）；趋近稀疏率 = 各层独立选择 |
+
+> 稠密侧的注意力熵**故意不在这里**：`qk_stats` 已经在同一批 DSA 层上报同一个量，重复一遍只会让两块看板对不上。
+> `index_weights_mean` 和 `select_dist_max` 也去掉了——前者是近对称有符号向量的均值（实测 `1.95e-4`，信息已由
+> `neg_ratio` + `abs_max` 覆盖），后者在实测里稳定饱和在 `~1.0`。
 
 Key 布局同其他 monitor：`dsa_health/layer_{i}/{attn_type}_{name}`，global 由逐层累加器在 flush 时派生。
 

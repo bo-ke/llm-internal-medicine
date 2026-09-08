@@ -29,7 +29,6 @@ INDEXER_METRICS = (
     "index_q_abs_max",
     "index_k_rms",
     "index_k_abs_max",
-    "index_weights_mean",
     "index_weights_abs_max",
     "index_weights_neg_ratio",
 )
@@ -43,7 +42,6 @@ SCORE_METRICS = (
 SELECT_METRICS = (
     "select_ratio",
     "select_dist_mean",
-    "select_dist_max",
     "select_local_ratio",
     "select_key_coverage",
 )
@@ -53,7 +51,6 @@ MATCH_METRICS = (
     "attn_recall_min",
     "attn_kl",
     "attn_top1_hit",
-    "attn_dense_entropy",
     "attn_sparse_entropy",
 )
 
@@ -67,7 +64,6 @@ MAX_METRICS = (
     "index_q_abs_max",
     "index_k_abs_max",
     "index_weights_abs_max",
-    "select_dist_max",
 )
 MIN_METRICS = ("attn_recall_min",)
 
@@ -92,7 +88,6 @@ def indexer_projection_stats(q: paddle.Tensor, k: paddle.Tensor, weights: paddle
         "index_q_abs_max": q.abs().max(),
         "index_k_rms": k.square().mean().sqrt(),
         "index_k_abs_max": k.abs().max(),
-        "index_weights_mean": w.mean(),
         "index_weights_abs_max": w.abs().max(),
         "index_weights_neg_ratio": (w < 0).astype("float32").mean(),
     }
@@ -175,14 +170,12 @@ def selection_stats(sel: paddle.Tensor, causal: paddle.Tensor, dist: paddle.Tens
     valid = causal.sum(axis=-1).unsqueeze(0)
     dist_b = dist.unsqueeze(0)
     mean_dist = (sel * dist_b).sum(axis=-1) / (n_sel + EPS) / (valid + EPS)
-    max_dist = ((sel * dist_b) / (valid.unsqueeze(-1) + EPS)).max()
     local = (sel * (dist_b < float(local_window)).astype(sel.dtype)).sum(axis=-1) / (n_sel + EPS)
     # Union over the sampled rows: how much of the key axis any query looks at.
     covered = (sel.sum(axis=1) > 0).astype(sel.dtype).sum(axis=-1)
     return {
         "select_ratio": (n_sel / (valid + EPS)).mean(),
         "select_dist_mean": mean_dist.mean(),
-        "select_dist_max": max_dist,
         "select_local_ratio": local.mean(),
         "select_key_coverage": (covered / (causal.sum(axis=-1).max() + EPS)).mean(),
     }
@@ -246,7 +239,6 @@ def dense_match_stats(
         "attn_recall_min": recall.min(),
         "attn_kl": -paddle.log(paddle.clip(recall, min=1e-6)).mean(),
         "attn_top1_hit": hit.mean(),
-        "attn_dense_entropy": -(probs * paddle.log(probs + EPS)).sum(axis=-1).mean(),
         "attn_sparse_entropy": -(sparse * paddle.log(sparse + EPS)).sum(axis=-1).mean(),
     }
 

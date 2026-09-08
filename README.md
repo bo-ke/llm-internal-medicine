@@ -2,13 +2,14 @@
 
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
-包含十大监控模块：
+包含十一大监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (28 指标)
 - **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 标量指标 + `n²+2n` 条逐元素映射序列，megatron 后端 16 指标；仅在开启 mHC 层时生效)
 - **[KDA Health](./docs/kda_health.md)** — Kimi Delta Attention 线性注意力层的衰减/写入/读出三通路监控 (8 指标；仅 paddlefleet；仅在模型含 KDA 层时生效)
+- **DSA Health** — DeepSeek Sparse Attention 的 indexer 健康度、选择结构、与主干稠密 attention 的一致性 (`attn_recall` / `KL`)、以及跨层选择重合度 (19 指标；仅 paddlefleet；仅在模型含 DSA 层时生效；CP>1 下 `match` 一族关闭)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
 - **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
@@ -141,7 +142,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update` | `kda_health`
+- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update` | `kda_health` | `dsa_health`
 - `global_idx`: 全局层索引。优先取模块自带的 `layer.layer_number`（0-based 全局编号）；取不到时回退到
   `pp_rank × local_layers + local_idx`。`num_empty_layers_add_in_head > 0` 时所有层号整体偏移该值，看板对号要减掉
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
@@ -791,6 +792,112 @@ RMSNorm / QK-norm 的可学习 scale 在 QK 电路内部，故折进 `W_q` / `W_
 
 ---
 
+## 九、DSA Health Monitor (dsa_health)
+
+DeepSeek Sparse Attention 层的监控。DSA 以 `core_attention` 的形式插进 MLA，选择规则是
+`index_scores = Σ_h w_h · relu(q_h · k)` 取 top-k，因此它有两个独立的失效面：**indexer 本身是否健康**，
+以及**它选出来的 key 是否就是主干 attention 真正要用的 key**。
+
+发现方式是结构判别，不是类名也不是「有 indexer 属性」。`CSAIndexer` 带**完全相同**的
+`forward_before_topk` / `index_topk` 一对，返回的还是同样 arity 的 `(q, k, weights)`——区别在
+**key 轴的含义**：CSA 打分的是压缩位置（`n_compressed ≈ sq/ratio`），DSA 打分的是原始 token，而
+shape 本身不说明是哪一种。所以 CSA 的标记要显式排掉：indexer 上的 `compressor` / `compress_ratio`，
+以及 core 上的 `compressed_sparse_attn`（`qk_monitor` 的稀疏路径就是靠这个属性认的）。认错的后果不是
+报错而是**静默错**：因果判定和距离全部会算在错误的序列上。
+
+符号约定（都在**采样的 query 行 `r` × 采样 head `h`** 上算，见「采样与代价」）：
+`s_t = Σ_h w_h · relu(q_h · k_t)` 是 indexer 打分；`causal_t = [t ≤ r]`、`n_causal = Σ_t causal_t` 是该行的因果长度；
+`sel_t ∈ {0,1}` 是 top-k 选中标记（**已乘 causal**，所以有效 key 不足 k 的行不会虚计），`n_sel = Σ_t sel_t`；
+`dist_t = (r − t) · causal_t`；`p_t = softmax_t(scale · q_h·k_t + causal mask)` 是主干稠密注意力概率。
+
+| # | 键 | 族 | 公式 | 级别 | 诊断意义 |
+|---|-----|-----|------|------|----------|
+| 1 | `index_q_rms` | `indexer` | `sqrt(mean(q²))` | 每层+全局 | 打分 einsum 真正吃进去的 q（已过 RoPE + Hadamard）的量级 |
+| 2 | `index_q_abs_max` | `indexer` | `max(\|q\|)` | 每层+全局 | q 的 outlier；配合 rms 区分整体放大与局部尖峰 |
+| 3 | `index_k_rms` | `indexer` | `sqrt(mean(k²))` | 每层+全局 | indexer key 的量级 |
+| 4 | `index_k_abs_max` | `indexer` | `max(\|k\|)` | 每层+全局 | indexer key 的 outlier |
+| 5 | `index_weights_abs_max` | `indexer` | `max(\|w\|)` | 每层+全局 | 逐头重要性权重的量级（已吸收 `softmax_scale` 与 `n_heads^-0.5`） |
+| 6 | `index_weights_neg_ratio` | `indexer` | `mean(w < 0)` | 每层+全局 | 负权重占比。`weights_proj` 无约束，负权重让那个头的证据**压制**某位置；趋近 0.5 = 逐头重要性不再是重要性 |
+| 7 | `score_selected_mean` | `score` | `mean_r(Σ_t s·sel / n_sel)` | 每层+全局 | 留下的分数（不 clip——负向塌缩要看得见） |
+| 8 | `score_unselected_mean` | `score` | `mean_r(Σ_t s·(causal−sel) / (n_causal−n_sel))` | 每层+全局 | 丢掉的分数。与上一行的差就是选择边界的清晰度 |
+| 9 | `score_topk_mass` | `score` | `mean_r(Σ_t relu(s)·sel / Σ_t relu(s)·causal)` | 每层+全局 | 选中位置占总正分数的比例（先 clip 到 ≥0，否则符号和不构成「质量」） |
+| 10 | `select_ratio` | `select` | `mean_r(n_sel / n_causal)` | 每层+全局 | 实际稀疏率 |
+| 11 | `select_dist_mean` | `select` | `mean_r(Σ_t sel·dist / n_sel / n_causal)` | 每层+全局 | 平均回看距离，按该行因果长度归一化，跨序列长度可比 |
+| 12 | `select_local_ratio` | `select` | `mean_r(Σ_t sel·[dist < W] / n_sel)`，`W = local_window` | 每层+全局 | 选中位置落在最近窗口内的比例。**退化告警**：indexer 塌成滑动窗口时趋 1 |
+| 13 | `select_key_coverage` | `select` | `\|∪_r {t : sel_t = 1}\| / max_r n_causal` | 每层+全局 | 采样行的并集覆盖了多少 key 轴 |
+| 14 | `attn_recall` | `match` | `mean_{h,r}(Σ_t p·sel)` | 每层+全局 | **首要指标**：稀疏 mask 之后存活的稠密注意力质量。回答「选择和主干模式匹配吗」 |
+| 15 | `attn_recall_min` | `match` | `min_{h,r}(Σ_t p·sel)` | 每层+全局 | 最差的那个 (head, row)，均值掩盖的尾部风险 |
+| 16 | `attn_kl` | `match` | `mean_{h,r}(−log recall)` | 每层+全局 | `KL(p_sparse ‖ p_dense)`。逐 (head, row) 恒等于 `−log(recall)`，但**报告值不冗余**：`mean(−log r) ≥ −log(mean r)`，两者的差正是「个别头被害得很惨」的代价 |
+| 17 | `attn_top1_hit` | `match` | `mean_{h,r}(sel[argmax_t logit])` | 每层+全局 | 最大 logit 是否被选中。recall 能停在 0.95 而最重要的那个 key 一直被丢 |
+| 18 | `attn_sparse_entropy` | `match` | `mean_{h,r}(−Σ_t p̃ log p̃)`，`p̃ = p·sel / recall` | 每层+全局 | mask + 重归一之后的注意力熵，看选择把分布削得多尖 |
+| 19 | `select_iou_prev` | `crosslayer` | `mean_r(\|sel ∩ sel_prev\| / \|sel ∪ sel_prev\|)` | 每层+全局 | 与**同一次 forward 内前一个** DSA 层选择的 IoU。趋 1 = 各层在重复算同一个选择（跨层共享 index 的收益上界）；趋近稀疏率 = 各层独立选择 |
+
+> 稠密侧的注意力熵**故意不在这里**：`qk_stats` 已经在同一批 DSA 层上报同一个量，重复一遍只会让两块看板对不上。
+> `index_weights_mean` 和 `select_dist_max` 也去掉了——前者是近对称有符号向量的均值（实测 `1.95e-4`，信息已由
+> `neg_ratio` + `abs_max` 覆盖），后者在实测里稳定饱和在 `~1.0`。
+
+Key 布局同其他 monitor：`dsa_health/layer_{i}/{attn_type}_{name}`，global 由逐层累加器在 flush 时派生。
+
+### 采样与代价
+
+indexer 打分是 `O(sq·sk·h·d)`，主干稠密 attention 是 `O(sq·sk·H·d)`——全长复算等于把这层再跑一遍。
+所以两者都只在**采样的 query 行 × 采样的 head** 上算：
+
+- `row_samples` (默认 32)：行从 `index_topk` 之后取。因果有效 key 少于 `index_topk` 的行会把所有位置都选上，
+  recall 恒为 1、稀疏率恒为 1，混进平均里会把信号冲掉。
+- `head_samples` (默认 8)：只用于 `match` 一族。grouped KV 下 key 的头是**按下标挑**的，不做
+  `repeat_interleave`——生产序列长度下那会先物化几百 MB 再全丢掉。
+- `local_window` (默认 128)：`select_local_ratio` 的判定窗口。
+
+做逐族消融时先关 `match`：它是唯一需要重算稠密 attention 的一族。
+
+### 采集点
+
+一个实例 patch + 一个 forward post hook，每层。patch 打在 `DSAIndexer.forward_before_topk` 上，因为
+那是 indexer 的 `q` / `k` / `weights` 唯一存在的地方——训练路径上 `DSAttention.forward` 把它们直接喂给
+fused loss kernel，`DSAIndexer.forward` 从不执行，挂在 indexer 上的 forward hook 永远不会触发。
+top-k 选择也是照 `compute_index_scores` 的公式**重算**而不是从 fused kernel 里掏 `_last_topk_indices`，
+这样指标在「有没有开 indexer loss」两种配置下语义一致。
+
+同一个 patch 还顺手截下调用方传的 `position_offset`（`MQALatentAttention._indexer_projections` 是位置
+传参）。这是把本 rank 的局部行号换算成全局位置的唯一依据，从调用参数里拿而不是自己按 CP rank 反推，
+可以不关心 `cp_balance_mode` 是哪种切法。
+
+### 上下文并行（CP）
+
+CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gather 到**全局**长度
+（`dsa_attention.py:559-565`：在 `head_dim` 处 gather，比在 `hidden_size` 处少 32 倍流量）。
+所以行采样用局部行号做 `index_select`，因果与距离判定用 `局部行号 + position_offset` 的全局位置 ——
+拿局部行号去比全局 key 位置会静默地把大部分真实历史 mask 掉。
+
+`sample_query_rows` 的下界也按全局位置切：切片起点已经超过 `index_topk` 的 rank 用整个切片，
+只有 rank 0 需要跳过开头那些历史不足的行。
+
+**`match` 一族在 CP>1 下关闭**并 warn。它要和主干注意力对照，而主干的 key 只有本 rank 的切片，
+要复现全局 logits 就得把主干 key 也 all-gather 一次，代价不在这个 monitor 该付的范围内。
+`indexer` / `score` / `select` / `crosslayer` 四族只依赖 indexer 的输出加全局行号，CP 下照常工作。
+
+### 两个 phase 怎么读
+
+`hybrid_mla_attention=mqa_dsa` 有两个训练阶段（`mqa_latent_attention.py:_phase()`），
+由 `dsa_indexer_use_sparse_loss` 选择，指标的**读法**随之不同：
+
+- **`warmup`**（`use_sparse_loss=false`，常配 `train_indexer_only`）：层两边都不用 top-k，
+  attention 跑全因果，KL 覆盖每一个因果列。此时 `select_*` / `match_*` 描述的是一个**假设**的选择 ——
+  「如果现在就切到稀疏，会损失多少」。这恰好是决定何时进入下一阶段的 go/no-go 信号，但**不要**
+  读成「当前稀疏化的损失」。这一阶段真正反映训练健康的是 `indexer` 与 `score` 两族。
+- **`sparse`**（`use_sparse_loss=true`）：层实际消费 `强制局部窗口 ∪ top-k`。
+
+> 已知缺口（`sparse` 阶段）：本实现只复现 top-k 那一半，没有并入 `csa_window_size` 的强制窗口，
+> 也没有把 `add_full_attention_sink_bias` 的 attention sink 计入 `match` 的 softmax。因此该阶段的
+> `select_ratio` / `attn_recall` 会**系统性偏低**，偏差量就是窗口与 sink 贡献的那部分。
+
+> 已知缺口（发现范围）：只在 `self_attn.core_attention` 上找 DSA。`DSv4HybridAttention` 的 `full_attn`
+> 分段里也可以挂一个 indexer（见 `multi_latent_attention.py:985-991` 的注释），那个位置目前不会被
+> 发现 —— 宁可漏报也不猜路径。
+
+---
+
 ## 基础设施
 
 ### TrainingLogs
@@ -879,6 +986,7 @@ NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer
 | `ape_health` | `softmax` 位置 softmax 形状 / `coverage` 位置覆盖 / `scale` 量级与数值健康 |
 | `vha_health` | `mix` postmix 混合矩阵 / `gain` postmix 增益与扰动 / `head` 头间一致性 |
 | `moe_health` | `router` 路由打分质量 / `balance` 负载均衡 / `norm` 专家范数与 bias / `spectrum` gate 谱性质 / `act` 激活量级 / `shared` 共享 vs 路由 / `expert` 按专家分布 / `card` 按卡负载（EP 组内） |
+| `dsa_health` | `indexer` indexer 投影量级 / `score` 打分分布与选择边界 / `select` 选择结构与稀疏率 / `match` 与稠密 attn 的一致性（最贵的一族，做消融先关它）/ `crosslayer` 跨层选择重合度 |
 
 语义是**排除优先**：没声明的族默认全开，所以不配置这个参数时行为与以前逐字节一致；分类表若有遗漏，那条指标不属于任何排除集合，仍会被采集（fail-open）。反过来，族名写错会在启动时直接抛 `UnknownFamilyError`（fail-closed）——否则唯一的症状是「payload 没变小」，太难发现。
 

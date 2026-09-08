@@ -133,6 +133,40 @@ def get_attention_module(layer):
     return attn
 
 
+def get_dsa_core(layer):
+    """Return the layer's DeepSeek-Sparse-Attention core attention, or ``None``.
+
+    DSA plugs into MLA as ``core_attention``, so there is no dedicated attention
+    class to match on, and the indexer's API is not a discriminator either:
+    ``CSAIndexer`` carries the same ``forward_before_topk`` / ``index_topk`` pair
+    and returns the same ``(q, k, weights)`` arity. What differs is the *key
+    axis* -- CSA scores compressed positions (``n_compressed ~ sq / ratio``)
+    while DSA scores original tokens -- and nothing in the shapes says which,
+    so the two must be told apart structurally or the metrics silently describe
+    the wrong sequence.
+
+    The CSA markers are therefore rejected explicitly: a compressor on the
+    indexer, and the ``compressed_sparse_attn`` entry point on the core (the
+    same attribute ``qk_monitor`` keys its sparse path off).
+    """
+    core = getattr(get_attention_module(layer), "core_attention", None)
+    indexer = getattr(core, "indexer", None)
+    if indexer is None:
+        return None
+    if not hasattr(indexer, "forward_before_topk") or not hasattr(indexer, "index_topk"):
+        return None
+    if hasattr(indexer, "compressor") or hasattr(indexer, "compress_ratio"):
+        return None
+    if hasattr(core, "compressed_sparse_attn") or hasattr(core, "compress_ratio"):
+        return None
+    return core
+
+
+def is_dsa_layer(layer) -> bool:
+    """True when this layer's core attention is DSA."""
+    return get_dsa_core(layer) is not None
+
+
 def _uses_compress_ratios(attn) -> bool:
     """True when the stack describes its per-layer attention kind via ratios.
 

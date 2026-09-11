@@ -8,6 +8,7 @@ from .attn_update_monitor import PaddleAttnUpdateMonitor, setup_attn_update_moni
 from .base import PaddleProbe
 from .dsa_monitor import PaddleDSAHealthMonitor, setup_dsa_monitor
 from .gather import install_gather_fn
+from .grad_monitor import PaddleGradHealthMonitor, setup_grad_monitor
 from .kda_monitor import PaddleKDAHealthMonitor, setup_kda_monitor
 from .massive_activation_monitor import PaddleMassiveActivationMonitor, setup_massive_activation_monitor
 from .mhc_monitor import PaddleMHCHealthMonitor, setup_mhc_monitor
@@ -29,6 +30,7 @@ _MONITOR_MAP = {
     "mlp_update": setup_mlp_update_monitor,
     "kda_health": setup_kda_monitor,
     "dsa_health": setup_dsa_monitor,
+    "grad_health": setup_grad_monitor,
 }
 
 _MODEL_MONITOR_ATTR = "_internal_medicine_paddlefleet_monitors"
@@ -159,4 +161,6 @@ __all__ = [
     "setup_kda_monitor",
     "PaddleDSAHealthMonitor",
     "setup_dsa_monitor",
+    "PaddleGradHealthMonitor",
+    "setup_grad_monitor",
 ]

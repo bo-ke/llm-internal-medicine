@@ -898,6 +898,49 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 
 ---
 
+## 十、Grad Health Monitor (grad_health)
+
+**仅 paddlefleet。** 前面的 monitor 看的都是前向量级，这一个看反向：每层、每个模块输出上的
+**激活梯度** `dL/d(activation)` 的 L2 范数。回答「梯度往回走的路上是被放大还是被吃掉」。
+
+三个位置（`position`），命名与 `massive_act` 的前向位置对齐，同层的前向幅度与反向幅度可以并排看：
+
+- `layer_out` —— decoder layer 的输出，也就是残差流本身。**深度方向梯度通路的主指标**
+- `attn_out` —— attention 分支输出
+- `ffn_or_moe_out` —— MLP / MoE 分支输出
+
+| # | 指标 | Key | 公式 | 粒度 | 含义 |
+|---|------|-----|------|------|------|
+| 1 | `{pos}_norm` | `grad_health/.../layer_out_norm` | `‖g‖₂` | 每层+全局 | L2 grad norm，跨 step 看趋势 |
+| 2 | `{pos}_rms` | `grad_health/.../layer_out_rms` | `‖g‖₂/√N` | 每层+全局 | 去掉形状依赖，**跨层可比**的那条 |
+| 3 | `{pos}_abs_max` | `grad_health/.../layer_out_abs_max` | `max\|g\|` | 每层+全局 | 尖峰探测，max 归约 |
+
+采集方式：`forward_post_hook` 只负责拿到输出张量并在其上 `register_hook`，所有归约都在反向里发生，
+前向路径的额外开销是每模块一次 `register_hook`。
+
+### 三个必须知道的口径
+
+**AMP loss scale。** 梯度 hook 看到的是**放大后**的激活梯度（量级 1e4，每次 overflow 都会变）。
+`finalize_scaled_grad_metrics` 在 `on_optimizer_begin` 把 scale 除回去 —— 那个时点 `scaler._scale`
+还是本 step 反向实际用的值。三个量对 `g` 都是一次齐次，所以一次除法同时修好 mean 与 max 累加器。
+非 AMP 或直接调用者由 `_flush_buffers` 兜底。
+
+**分片。** 热路径不做任何 collective（见 `.claude/skills/monitor-hook-perf-rules`），跨卡归约在 flush
+时统一做。TP/SP/CP 下每卡量的是自己那一片：`rms` 在等分片时是全局真值（每卡均方是全局均方的无偏
+估计），而 `norm` 是**每片**的范数 —— 全局范数的 `1/√片数`，趋势一致，但不是 optimizer 的 global
+grad-norm clip 报的那个数。
+
+**Recompute。** `_should_monitor()` 在 grad 关闭时为假，所以被丢弃的第一次前向不挂 hook，真正承载
+反向的重算前向才挂。
+
+### 尚未做的
+
+- 没有进 `METRIC_TAXONOMY`（与 `kda_health` 相同）：所有 key 落在 fail-open 的 `other` 族，即
+  「一直采集、不能按族关掉」。等真实 run 的 key corpus 进 fixture 后再补 family。
+- 只有 paddlefleet 后端。
+
+---
+
 ## 基础设施
 
 ### TrainingLogs
@@ -1132,3 +1175,6 @@ setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode
 | **Optim** | `update_rms` | `sqrt(mean((θ_new−θ_old)²))` | 已全局归约 | 本 step 参数更新幅度 (始终装上, 受 monitor_interval 门控) |
 | **Optim** | `param_rms` | `sqrt(mean(θ_new²))` | 已全局归约 | 更新后参数尺度 (始终装上, 受 monitor_interval 门控) |
 | **Optim** | `update_param_ratio` | `update_rms / param_rms` | 已全局归约 | trust ratio, ~1e-3 健康 (始终装上, 受 monitor_interval 门控) |
+| **Grad** | `{pos}_norm` | `‖dL/d(activation)‖₂` | mean | 反向梯度量级; `pos`=layer_out/attn_out/ffn_or_moe_out |
+| **Grad** | `{pos}_rms` | `‖g‖₂/√N` | mean | 跨层可比的梯度量级 (等分片下为全局真值) |
+| **Grad** | `{pos}_abs_max` | `max\|g\|` | max | 梯度尖峰; bf16 梯度下分辨力受限 |

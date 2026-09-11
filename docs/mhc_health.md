@@ -22,10 +22,13 @@ x_{l+1} = H_res^T @ x_l + H_post^T · F(H_pre @ x_l)
 通过在 `internal_medicine_monitors` 中加入 `mhc_health`（或 `all`）启用。启用它在**任何**模型上都是安全的——
 以下任一情况下它彻底 no-op（不 wrap 任何模块、不声明/产生任何指标、不抛异常）：
 
-1. **mHC 类无法 import**：`setup_mhc_monitor` 在 import 失败时将类名绑定为 `None`，直接返回 `model`。
-2. **模型未使用 mHC 层**：discovery 用 `isinstance(layer, HyperConnectionTransformerLayer)` 与
-   `isinstance(mod, HyperConnectionModule)` 精确匹配（不做 duck-typing），普通 `TransformerLayer` 或
-   `IdentityOp` 占位符都不会被匹配。
+1. **HC 类无法 import**：`setup_mhc_monitor` 在 import 失败时将类名绑定为 `None`，直接返回 `model`。
+2. **模型未使用 hyper-connection 层**：discovery 用 `isinstance(layer, HyperConnectionTransformerLayer)` 与
+   `isinstance(mod, (HyperConnectionModule, DiagonalHyperConnectionModule, IdentityHyperConnectionModule))`
+   精确匹配（不做 duck-typing），普通 `TransformerLayer` 或 `IdentityOp` 占位符都不会被匹配。三种变体共用同一
+   监控 API：`compute_mappings` 均返回 `(h_pre, h_post, h_res)`；区别仅在 `_compute_h` 的返回元数——mHC 返回
+   Sinkhorn 输入 logits、dHC 返回 `diag_embed` 前的 sigmoid 对角向量、iHC 无 logits（2 元组），故 iHC 不发
+   `h_res_logits_*` 系列指标。
 
 ```yaml
 internal_medicine_monitors:

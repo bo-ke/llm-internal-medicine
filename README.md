@@ -914,9 +914,39 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 | 1 | `{pos}_norm` | `grad_health/.../layer_out_norm` | `‖g‖₂` | 每层+全局 | L2 grad norm，跨 step 看趋势 |
 | 2 | `{pos}_rms` | `grad_health/.../layer_out_rms` | `‖g‖₂/√N` | 每层+全局 | 去掉形状依赖，**跨层可比**的那条 |
 | 3 | `{pos}_abs_max` | `grad_health/.../layer_out_abs_max` | `max\|g\|` | 每层+全局 | 尖峰探测，max 归约 |
+| 4 | `{pos}_norm_mb` | `.../layer_out_norm_mb` | `√(Σ_分片 g²)` | 每层+全局 | 单微批**完整**张量的 L2；不分片的布局下等于 `norm` |
+| 5 | `{pos}_rms_global` | `.../layer_out_rms_global` | `√(Σg²/ΣN)` | 每层+全局 | **精确**全局 RMS；与集群规模、并行布局、gas 全部无关 |
+| 6 | `{pos}_norm_global` | `.../layer_out_norm_global` | `√(Σg²)` | 每层+全局 | 全 global batch 的 L2；随 `√(world×gas)` 增长 |
+| 7 | `{pos}_token_norm_max` | `.../layer_out_token_norm_max` | `max_t‖g_t‖₂` | 每层+全局 | 最响 token 的梯度范数，max 归约 |
+| 8 | `{pos}_token_norm_p99` | `.../layer_out_token_norm_p99` | `Q₉₉(‖g_t‖₂)` | 每层+全局 | token 尾部形状；与 max 的距离=孤立一个还是一片 |
+| 9 | `{pos}_token_norm_ratio` | `.../layer_out_token_norm_ratio` | `max_t/median_t` | 每层+全局 | **token 尖峰度**，max 归约 |
+| 10 | `{pos}_token_outlier_ratio` | `.../layer_out_token_outlier_ratio` | `Pr(‖g_t‖>10·median)` | 每层+全局 | 有多少 token 是离群的（占比，非计数） |
 
 采集方式：`forward_post_hook` 只负责拿到输出张量并在其上 `register_hook`，所有归约都在反向里发生，
 前向路径的额外开销是每模块一次 `register_hook`。
+
+### 三类指标怎么分工
+
+**1–3 是近似量，便宜。** 跨卡走 `gather.py` 的通用归约：mean 键取各卡算术平均，所以 `rms` 系统性低估
+真值约 ½CV²（卡间变异系数）；`norm` 是每片的范数，约为全局的 `1/√片数`。零额外通讯。
+
+**4–6 是精确量，一次通讯。** hook 只往 GPU 标量上累加平方和（`numel` 是 Python 元数据，白拿），
+flush 时把整个 schema 的平方和与计数拼成**一个张量**做归约 —— 43 层 × 3 位置 × 6 微批如果在 hook 里做
+就是 774 次 all_reduce/step，正是 `monitor-hook-perf-rules` 记录的那次事故。组的选择见
+`ExactNormReducer` 的 docstring：`cp` 总是求和；`tp` **仅当 `sequence_parallel=1`**（不开 SP 时这些
+张量是跨 TP 复制的，求和会让平方范数乘 `tp_size`）；`dp` 只用于 5/6；`ep` 从不（它是从数据维切出来的，
+`dp` 那次已覆盖）；`pp` 从不（各 rank 持有不同层，key 集合不同，跨 PP 归约会 hang）。
+
+**7–10 是 token 轴分解，零通讯。** `abs_max` 找的是最大的单个**元素**，无法区分「某个 token 整体很响」
+（数据问题：罕见 token、EOS、脏样本）和「某个格子跑飞」（数值/channel 问题），而这两者要用相反的手段
+处理。token 轴而非 channel 轴是对的：`massive_act` 按 channel 分解是因为 massive activation 是 channel
+现象，而梯度尖峰通常由个别 token 承载。四条都跨卡精确且不需要 collective —— 三个位置都是投影后的完整
+hidden，每张卡持有的是**完整 token**，所以 max 跨 rank 就是全局 max；`token_outlier_ratio` 用占比而非
+计数也是同一个原因（计数是每片的）。
+
+判读：`token_norm_ratio` 高而元素级尾部正常 → 少数 token 整体很响；反之 → 少数格子跑飞。
+注意 `token_norm_ratio` 是相对 median 的比值，token 数很少时离群值会把 median 自己拽高，比值饱和在 2
+附近；线上 8k/16k token 不受影响。
 
 ### 三个必须知道的口径
 
@@ -1178,3 +1208,10 @@ setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode
 | **Grad** | `{pos}_norm` | `‖dL/d(activation)‖₂` | mean | 反向梯度量级; `pos`=layer_out/attn_out/ffn_or_moe_out |
 | **Grad** | `{pos}_rms` | `‖g‖₂/√N` | mean | 跨层可比的梯度量级 (等分片下为全局真值) |
 | **Grad** | `{pos}_abs_max` | `max\|g\|` | max | 梯度尖峰; bf16 梯度下分辨力受限 |
+| **Grad** | `{pos}_norm_mb` | `√(Σ_分片 g²)` | mean | 单微批完整张量 L2; 不分片布局下等于 `norm` |
+| **Grad** | `{pos}_rms_global` | `√(Σg²/ΣN)` | mean | 精确全局 RMS; 唯一与集群规模/布局/gas 无关的 |
+| **Grad** | `{pos}_norm_global` | `√(Σg²)` | mean | 全 batch L2; 随 `√(world×gas)` 增长 |
+| **Grad** | `{pos}_token_norm_max` | `max_t‖g_t‖₂` | max | 最响 token 的梯度范数 |
+| **Grad** | `{pos}_token_norm_p99` | `Q₉₉(‖g_t‖₂)` | mean | token 尾部形状 |
+| **Grad** | `{pos}_token_norm_ratio` | `max_t/median_t` | max | token 尖峰度; 高=少数 token 整体很响 |
+| **Grad** | `{pos}_token_outlier_ratio` | `Pr(‖g_t‖>10·median)` | mean | 离群 token 占比 |

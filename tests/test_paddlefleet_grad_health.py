@@ -113,17 +113,39 @@ class GradMonitorSchemaTest(unittest.TestCase):
             f"grad_health/layer_{idx}/{position}_{metric}"
             for idx in (0, 1)
             for position in grad_metrics.POSITIONS
-            for metric in grad_metrics.METRICS
+            for metric in grad_metrics.METRICS + grad_metrics.GLOBAL_METRICS + grad_metrics.TOKEN_METRICS
         }
         self.assertEqual(monitor._mean_keys | monitor._max_keys, expected)
         self.assertEqual(len(monitor.hooks), 6)  # 3 positions x 2 layers
 
+    def test_one_square_accumulator_per_hooked_module(self):
+        """The exact path keeps its own state; it must cover exactly the hooks."""
+        monitor = _monitor([FakeLayer(0), FakeLayer(1)], log_global=False)
+        self.assertEqual(len(monitor._sq_acc), len(monitor.hooks))
+        self.assertEqual(
+            sorted(monitor._sq_acc, key=str),
+            sorted(
+                ((idx, position, None) for idx in (0, 1) for position in grad_metrics.POSITIONS),
+                key=str,
+            ),
+        )
+
     def test_only_abs_max_is_max_aggregated(self):
+        """Spike detectors reduce by max; every magnitude series reduces by mean.
+
+        Averaging a spike detector across microbatches / ranks / layers is exactly
+        the wrong reduction -- the one loud microbatch is the signal.
+        """
         monitor = _monitor([FakeLayer(0)], log_global=False)
         self.assertEqual(
             monitor._max_keys,
-            {f"grad_health/layer_0/{position}_abs_max" for position in grad_metrics.POSITIONS},
+            {
+                f"grad_health/layer_0/{position}_{metric}"
+                for position in grad_metrics.POSITIONS
+                for metric in grad_metrics.MAX_METRICS
+            },
         )
+        self.assertEqual(set(grad_metrics.MAX_METRICS), {"abs_max", "token_norm_max", "token_norm_ratio"})
 
     def test_sample_layers_restricts_both_schema_and_hooks(self):
         monitor = _monitor([FakeLayer(0), FakeLayer(1)], log_global=False, sample_layers=[1])

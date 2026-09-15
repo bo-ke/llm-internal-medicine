@@ -55,7 +55,13 @@ GLOBAL_METRICS = ("norm_mb", "rms_global", "norm_global")
 # post-projection full-hidden tensor, so each rank holds *whole* tokens and a max
 # over ranks is a max over all tokens. ``token_outlier_ratio`` is a fraction
 # rather than a count for the same reason -- a count would be per-shard.
-TOKEN_METRICS = ("token_norm_max", "token_norm_p99", "token_norm_ratio", "token_outlier_ratio")
+TOKEN_METRICS = (
+    "token_norm_max",
+    "token_norm_p99",
+    "token_norm_ratio",
+    "token_outlier_ratio",
+    "token_zero_ratio",
+)
 
 # ``abs_max`` is a max over microbatches / ranks / layers, the rest are means.
 # The two token extremes join it: for a spike detector the worst microbatch is
@@ -87,6 +93,15 @@ def grad_token_stats(value: paddle.Tensor) -> dict[str, paddle.Tensor]:
                               the counterpart of ``massive_act``'s
                               ``channel_max_ratio``
     - ``token_outlier_ratio`` fraction of tokens above ``10x`` the median
+    - ``token_zero_ratio``    fraction of tokens with no gradient at all
+
+    **The median is taken over gradient-carrying tokens only.** A first version
+    used the plain median and measured the wrong thing on a real 8k run:
+    loss-masked positions gave whole rows of exact zeros, the median sat at ~0,
+    and ``token_norm_ratio`` came out 2000-19000 -- a reading of *how much of the
+    batch is masked* rather than of token peakiness. ``nanmedian`` over the
+    non-zero rows restores the intended meaning, and ``token_zero_ratio`` exposes
+    the masked fraction as its own series instead of letting it distort another.
 
     Costs one more full reduction than the scalar stats (``norm(axis=-1)`` over
     the whole tensor); the max / median / quantile that follow run on a vector of
@@ -96,13 +111,21 @@ def grad_token_stats(value: paddle.Tensor) -> dict[str, paddle.Tensor]:
     """
     flat = value.reshape([-1, value.shape[-1]])
     token_norm = paddle.linalg.norm(flat, axis=-1)
-    median = paddle.median(token_norm).clip(min=1e-30)
+    alive = token_norm > 0
+    # NaN for the dead rows so ``nanmedian`` ignores them without a host-side
+    # boolean index (which would need the count on the CPU, i.e. a D2H sync).
+    nonzero = paddle.where(alive, token_norm, paddle.full_like(token_norm, float("nan")))
+    median = paddle.nanmedian(nonzero)
+    # All-masked microbatch -> nanmedian is NaN; fall back to a positive epsilon so
+    # the ratio stays finite instead of poisoning the step with NaN.
+    median = paddle.where(paddle.isnan(median), paddle.zeros_like(median), median).clip(min=1e-30)
     peak = token_norm.max()
     return {
         "token_norm_max": peak,
         "token_norm_p99": paddle.quantile(token_norm, 0.99),
         "token_norm_ratio": peak / median,
         "token_outlier_ratio": (token_norm > TOKEN_OUTLIER_MULTIPLIER * median).astype("float32").mean(),
+        "token_zero_ratio": 1.0 - alive.astype("float32").mean(),
     }
 
 

@@ -46,6 +46,13 @@ from .grad_metrics import (
     TOKEN_METRICS,
     grad_square_and_stats,
 )
+from .grad_reduce import (
+    DATA_CANDIDATES,
+    SHARD_CANDIDATES,
+    GroupInfo,
+    describe,
+    plan_total_groups,
+)
 from .layer_discovery import get_decoder_layers, iter_monitor_layers
 
 logger = logging.getLogger(__name__)
@@ -99,36 +106,50 @@ class ExactNormReducer:
     the squared cross-rank coefficient of variation). Summing squares instead is
     exact, but sums do not commute with sharding for free -- hence this.
 
-    Where the collective goes: **flush time, one batched reduction for the whole
-    schema**, never in a hook. A 43-layer stack with 3 positions and 6
-    microbatches would otherwise queue ~774 all_reduces per step, which is the
-    exact failure mode ``monitor-hook-perf-rules`` was written about.
+    Where the collective goes: **flush time, one batched reduction per group**,
+    never in a hook. A 43-layer stack with 3 positions and 6 microbatches would
+    otherwise queue ~774 all_reduces per step, which is the exact failure mode
+    ``monitor-hook-perf-rules`` was written about.
 
-    Which groups get summed, and why each choice is load-bearing:
+    Two independent sums come off the *same* local value:
 
-    - ``cp`` -- always. Context parallel splits the sequence, so its ranks hold
-      different slices of *the same* tensor.
-    - ``tp`` -- only when ``sequence_parallel`` is on. With SP the residual
-      stream and both branch outputs are sequence-sharded inside the TP group,
-      so they must be summed; without SP the very same tensors are *replicated*
-      across TP, and summing would multiply every squared norm by ``tp_size``.
-    - ``dp`` -- for the global (whole-batch) figures only. Its ranks hold
-      different samples, which is what makes ``norm_global`` a batch quantity
-      rather than a microbatch one.
-    - ``ep`` -- never. Expert parallel is carved out of the data dimension
-      (hence the separate ``expt_dp`` group), so the ``dp`` reduction already
-      covers those ranks; adding it would double count.
-    - ``pp`` -- never. Pipeline ranks own *different layers*, so their key sets
-      differ and a reduction across them would deadlock on mismatched shapes,
-      quite apart from being meaningless.
+    - **shard sum** over the groups that split one tensor -- ``cp`` always, and
+      ``tp`` only under ``sequence_parallel`` (without SP the very same tensors
+      are *replicated* across TP, so summing would multiply every squared norm by
+      ``tp_size``). Feeds ``norm_mb``.
+    - **total sum** over a group set that covers every participating rank
+      *exactly once*. Feeds ``rms_global`` / ``norm_global``.
+
+    The two are never chained. An earlier version reduced over ``cp`` and then
+    continued on the same buffer over ``dp``, which silently assumed the two rank
+    sets were orthogonal. On a ``sharding_first`` topology that assumption fails:
+    with ``data_parallel_size=1`` the samples live on the sharding dimension, so
+    ``_DATA_PARALLEL_GROUP`` spans ``cp`` and the context-parallel contribution
+    got counted twice -- ``norm_global`` came out ``sqrt(cp)`` high (+41% at
+    ``cp=2``) with nothing in the numbers to show it. Chaining was only ever
+    correct by luck.
+
+    So membership is *checked*, not assumed:
+
+    - two mesh groups through this rank are orthogonal iff they intersect in
+      exactly this rank; a candidate that overlaps an already-chosen group more
+      than that is dropped rather than double counted,
+    - the product of the chosen sizes must equal ``world_size / pp_size``. When it
+      does not, ``norm_global`` is **suppressed** rather than emitted wrong: a
+      partial cover makes it the norm of a sub-batch, while ``rms_global`` stays
+      an unbiased estimate on any subset and keeps being reported.
+
+    ``pp`` is never summed: its ranks own different layers, so their key sets
+    differ and a reduction across them would deadlock on mismatched shapes.
     """
 
     def __init__(self, sequence_parallel: bool, verbose: bool = False):
         self.shard_groups: list = []  # same tensor, split across ranks
-        self.data_groups: list = []  # different samples
+        self.total_groups: list = []  # covers every rank exactly once
         self.shard_factor = 1
-        self.data_factor = 1
+        self.total_factor = 1
         self.enabled = False
+        self.exact_total = False  # False -> norm_global is suppressed
         self.plan = "no distributed context"
         self._warned = False
         self._init_groups(sequence_parallel, verbose)
@@ -143,65 +164,102 @@ class ExactNormReducer:
             return
         try:
             from paddlefleet.process_groups_config import ProcessGroupCollection
-            from paddlefleet.utils import get_pg_size
         except Exception as exc:  # pragma: no cover - depends on backend version
             self.plan = f"process groups unavailable ({exc})"
             return
 
-        wanted = [("cp", True), ("tp", bool(sequence_parallel))]
-        described = []
-        for name, take in wanted:
-            if not take:
+        world = int(dist.get_world_size())
+        found = {}
+        for name in dict.fromkeys(SHARD_CANDIDATES + DATA_CANDIDATES + ("pp",)):
+            info = self._resolve(ProcessGroupCollection, name)
+            if info is not None:
+                found[name] = info
+        # ``pp`` is never summed, but its size says how much of the world one
+        # rank's key set is expected to cover: pipeline ranks own different layers.
+        pp_size = found["pp"].size if "pp" in found else 1
+        target = max(1, world // max(1, pp_size))
+
+        for name in SHARD_CANDIDATES:
+            if name == "tp" and not sequence_parallel:
                 continue
-            group, size = self._resolve(ProcessGroupCollection, get_pg_size, name)
-            if group is not None and size > 1:
-                self.shard_groups.append(group)
-                self.shard_factor *= size
-                described.append(f"{name}={size}")
-        group, size = self._resolve(ProcessGroupCollection, get_pg_size, "dp")
-        if group is not None and size > 1:
-            self.data_groups.append(group)
-            self.data_factor *= size
-            described.append(f"dp={size}")
+            info = found.get(name)
+            if info is not None and info.size > 1:
+                self.shard_groups.append(info)
+                self.shard_factor *= info.size
+
+        # Shard groups are candidates for the total too: the ranks that split one
+        # tensor still hold part of the batch.
+        pool = [found[name] for name in DATA_CANDIDATES if name in found] + list(self.shard_groups)
+        self.total_groups, self.total_factor = plan_total_groups(pool, target)
+        self.exact_total = self.total_factor == target
         self.enabled = True
-        self.plan = " x ".join(described) if described else "single rank per key (no reduction needed)"
-        if verbose:
-            logger.info(f"[PaddleGradMonitor] exact-norm reduction over {self.plan}")
+        self.plan = (
+            f"shard[{describe(self.shard_groups)}] total[{describe(self.total_groups)}]"
+            f" covering {self.total_factor}/{target}"
+        )
+        seen = ", ".join(f"{name}={info.size}" for name, info in found.items()) or "none"
+        if verbose or not self.exact_total:
+            emit = logger.info if self.exact_total else logger.warning
+            emit(f"[PaddleGradMonitor] exact-norm reduction {self.plan}; world={world}; groups seen: {seen}")
+        if not self.exact_total:
+            logger.warning(
+                "[PaddleGradMonitor] chosen groups cover %d of %d ranks, so norm_global is "
+                "suppressed -- a partial cover would make it a sub-batch norm. rms_global is "
+                "unbiased on any subset and keeps being reported.",
+                self.total_factor,
+                target,
+            )
 
     @staticmethod
-    def _resolve(collection, get_pg_size, name):
+    def _resolve(collection, name) -> GroupInfo | None:
+        """One named process group as a ``GroupInfo``, or ``None`` if absent.
+
+        Membership comes from the group itself (``nranks`` / ``ranks``) rather than
+        from a size helper, because the plan needs the rank *sets* to test
+        orthogonality -- sizes alone cannot tell a nested group from a disjoint one.
+        """
         try:
             pg = collection.use_mpu_process_groups(required_pgs=[name])
             group = getattr(pg, name, None)
-            return group, int(get_pg_size(group))
+            if group is None:
+                return None
+            return GroupInfo(name, group, getattr(group, "nranks", 1), getattr(group, "ranks", ()) or ())
         except Exception:
-            return None, 1
+            return None
 
     def reduce(self, sq_values, counts):
         """``(shard_sq, total_sq, total_count)`` from this rank's running sums.
 
-        Both vectors travel in one concatenated tensor, so the whole schema costs
-        one reduction per group instead of one per key. The shard result is read
-        out before the data reduction continues on the same buffer, which is why
-        the two stages share a single allocation.
+        The two sums are **independent**, both taken from the same local value on
+        its own copy. They are deliberately not chained: continuing the data
+        reduction on top of the shard-reduced buffer would double count whenever a
+        data group happens to span a shard group, which is exactly how
+        ``norm_global`` came out ``sqrt(cp)`` high on a sharding-first topology.
 
-        With no groups to reduce (single rank, or a layout that shards nothing)
-        this is the identity, so the exact metrics stay well defined and equal to
-        their local counterparts rather than disappearing.
+        Each vector pair travels as one concatenated tensor, so the whole schema
+        costs one reduction per group rather than one per key.
+
+        With nothing to reduce (single rank, or a layout that shards nothing) this
+        is the identity, so the exact metrics stay well defined and equal to their
+        local counterparts rather than disappearing.
         """
-        if not self.enabled or (not self.shard_groups and not self.data_groups):
+        if not self.enabled or (not self.shard_groups and not self.total_groups):
             return sq_values, sq_values, counts
         import paddle
         import paddle.distributed as dist
 
         n = int(sq_values.shape[0])
-        payload = paddle.concat([sq_values, counts])
-        for group in self.shard_groups:
-            dist.all_reduce(payload, group=group)
-        shard_sq = payload[:n].clone()
-        for group in self.data_groups:
-            dist.all_reduce(payload, group=group)
-        return shard_sq, payload[:n], payload[n:]
+        local = paddle.concat([sq_values, counts])
+
+        shard = local.clone()
+        for info in self.shard_groups:
+            dist.all_reduce(shard, group=info.group)
+
+        total = local.clone()
+        for info in self.total_groups:
+            dist.all_reduce(total, group=info.group)
+
+        return shard[:n], total[:n], total[n:]
 
 
 class PaddleGradHealthMonitor(PaddleProbe):
@@ -443,12 +501,16 @@ class PaddleGradHealthMonitor(PaddleProbe):
                 norm_mb = paddle.sqrt(shard_sq / micro.clip(min=1.0))
                 rms_global = paddle.sqrt(total_sq / total_count.clip(min=1.0))
                 norm_global = paddle.sqrt(total_sq)
+                # ``norm_global`` only means "the whole batch" when the reduction
+                # covered every rank exactly once; on a partial cover it would be
+                # the norm of a sub-batch, so it is dropped rather than logged
+                # wrong. ``rms_global`` is unbiased on any subset and stays.
+                emit_total_norm = self._reducer.exact_total or not self._reducer.enabled
                 for i, (layer_idx, position, attn_type) in enumerate(slots):
-                    for metric, value in (
-                        ("norm_mb", norm_mb[i]),
-                        ("rms_global", rms_global[i]),
-                        ("norm_global", norm_global[i]),
-                    ):
+                    series = [("norm_mb", norm_mb[i]), ("rms_global", rms_global[i])]
+                    if emit_total_norm:
+                        series.append(("norm_global", norm_global[i]))
+                    for metric, value in series:
                         self.record_layer_metric(layer_idx, f"{position}_{metric}", value, attn_type=attn_type)
         except Exception as exc:
             if self.verbose and not getattr(self, "_exact_warned", False):

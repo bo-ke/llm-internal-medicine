@@ -45,6 +45,33 @@ def _grad(loud_tokens=(), loud_cells=(), loud=1.0):
 
 
 class TokenStatsMathTest(unittest.TestCase):
+    def test_the_median_ignores_loss_masked_tokens(self):
+        """Masked rows are exact zeros; letting them into the median broke this.
+
+        Measured 2000-19000 on a real 8k run before the fix, because the median sat
+        at ~0 and the ratio was really reporting the masked fraction. The peakiness
+        must now be the same number whatever share of the batch is masked.
+        """
+        for masked in (0, TOKENS // 2, int(TOKENS * 0.9)):
+            value = paddle.full([TOKENS, CHANNELS], QUIET, dtype="float32").numpy()
+            value[:masked] = 0.0
+            value[TOKENS - 1] = 1.0
+            stats = grad_metrics.grad_token_stats(paddle.to_tensor(value))
+            self.assertAlmostEqual(float(stats["token_norm_ratio"]), 1.0 / QUIET, places=2, msg=f"masked={masked}")
+
+    def test_zero_ratio_reports_the_masked_share_on_its_own(self):
+        value = paddle.full([TOKENS, CHANNELS], QUIET, dtype="float32").numpy()
+        value[: TOKENS // 4] = 0.0
+        stats = grad_metrics.grad_token_stats(paddle.to_tensor(value))
+        self.assertAlmostEqual(float(stats["token_zero_ratio"]), 0.25, places=6)
+
+    def test_an_all_masked_microbatch_stays_finite(self):
+        """``nanmedian`` of nothing is NaN; a NaN here would poison the step."""
+        stats = grad_metrics.grad_token_stats(paddle.zeros([TOKENS, CHANNELS]))
+        for name, value in stats.items():
+            self.assertFalse(bool(paddle.isnan(value)), msg=name)
+        self.assertAlmostEqual(float(stats["token_zero_ratio"]), 1.0, places=6)
+
     def test_the_four_series_match_closed_form(self):
         stats = grad_metrics.grad_token_stats(_grad(loud_tokens=(5, 17, 40)))
         self.assertAlmostEqual(float(stats["token_norm_max"]), math.sqrt(CHANNELS), places=5)

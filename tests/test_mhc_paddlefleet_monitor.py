@@ -79,6 +79,18 @@ class FakeHC(nn.Layer):
         return hidden_states, self._h_res, self._h_post
 
 
+class FakeIHC(FakeHC):
+    """Stand-in for ``IdentityHyperConnectionModule``: no h_res logits at all.
+
+    ``_compute_h`` returns a 2-tuple, mirroring the real iHC module; the monitor
+    must discover it, record the shared metrics, and stay silent on the
+    ``h_res_logits_*`` series.
+    """
+
+    def _compute_h(self, proj, r):
+        return self._h_pre, self._h_post
+
+
 class FakeLayer(nn.Layer):
     """Stand-in for HyperConnectionTransformerLayer with the two hc modules."""
 
@@ -807,6 +819,48 @@ class MHCMonitorTest(unittest.TestCase):
             # h_post is constant 1.0 -> equal across streams and across tokens.
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_stream_concentration"], 1.0, places=4)
             self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_token_std"], 0.0, places=5)
+
+    def test_ihc_two_tuple_compute_h_skips_logits_but_records_rest(self):
+        # IdentityHyperConnectionModule: _compute_h returns (h_pre, h_post), no
+        # mixing logits exist. The monitor must discover it alongside a regular
+        # 3-tuple mHC module, record every non-logits metric for both, and emit
+        # nothing for the iHC's h_res_logits_* series.
+        n, s, b = 4, 2, 3
+        ident = paddle.eye(n).reshape([1, 1, n, n]).expand([s, b, n, n])
+        ihc = FakeIHC(
+            n=n,
+            h_pre=paddle.full([s, b, n], 0.5),
+            h_post=paddle.ones([s, b, n]),
+            h_res=paddle.assign(ident),
+        )
+        model = _mhc_model([FakeLayer(attn=ihc, mlp=self._identity_layer(n, s, b).mlp_hyper_connection)])
+
+        orig_ident = mhc_monitor.IdentityHyperConnectionModule
+        mhc_monitor.IdentityHyperConnectionModule = FakeIHC
+        try:
+            monitor = PaddleMHCHealthMonitor(log_per_layer=True, log_global=True)
+            targets = self._prepare_and_attach(monitor, model)
+            # Both the iHC (attn) and the 3-tuple HC (mlp) module are discovered.
+            self.assertEqual(len(targets), 2)
+
+            self._drive(targets, x_dim=n * 8)
+            monitor.step()
+        finally:
+            mhc_monitor.IdentityHyperConnectionModule = orig_ident
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        for comp in ("attn", "mlp"):
+            # Shared metrics flow normally for both module kinds.
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_pre_mean"], 0.5, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_h_post_mean"], 1.0, places=5)
+            self.assertAlmostEqual(latest[f"mhc_health/layer_0/{comp}_amax_gain_fwd"], 1.0, places=5)
+        # iHC has no mixing logits: the series must simply not be emitted.
+        self.assertNotIn("mhc_health/layer_0/attn_h_res_logits_min", latest)
+        self.assertNotIn("mhc_health/layer_0/attn_h_res_logits_max", latest)
+        self.assertNotIn("mhc_health/layer_0/attn_h_res_logits_grad_min", latest)
+        self.assertNotIn("mhc_health/global_attn_h_res_logits_min", latest)
+        # The 3-tuple module's logits series is still recorded.
+        self.assertIn("mhc_health/layer_0/mlp_h_res_logits_min", latest)
 
     def test_remove_hooks_restores_both_wrapped_methods(self):
         n, s, b = 4, 2, 3

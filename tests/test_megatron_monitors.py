@@ -33,6 +33,9 @@ optim_update_module = importlib.import_module("internal_medicine.backends.megatr
 OptimUpdateMonitor = optim_update_module.OptimUpdateMonitor
 setup_optim_update_monitor = optim_update_module.setup_optim_update_monitor
 megatron_backend = importlib.import_module("internal_medicine.backends.megatron")
+grad_metrics = importlib.import_module("internal_medicine.backends.megatron.grad_metrics")
+grad_monitor = importlib.import_module("internal_medicine.backends.megatron.grad_monitor")
+GradHealthMonitor = grad_monitor.GradHealthMonitor
 
 
 class FakePLESublayer:
@@ -1308,6 +1311,370 @@ class MegatronOptimUpdateMonitorTest(unittest.TestCase):
             self.assertEqual(monitor._pending_expert, [])
         finally:
             monitor.remove_hooks()
+
+
+# ======================================================================
+# grad_health
+# ======================================================================
+
+GRAD_WIDTH = 4
+
+
+class GradFakeBranch(nn.Module):
+    """Deterministic stand-in for attention / MLP: a fixed scale of its input."""
+
+    def __init__(self, factor):
+        super().__init__()
+        self.factor = factor
+
+    def forward(self, x):
+        return x * self.factor
+
+
+class GradFakeLayer(nn.Module):
+    """Two residual branches, both hooked, plus the layer output itself.
+
+    Returns ``(hidden, None)`` like a Megatron decoder layer so ``_output_tensor``
+    is exercised on the tuple path. Carries a dummy parameter so the monitor can
+    pick a device via ``next(model.parameters())``.
+    """
+
+    def __init__(self, idx, attn_factor=0.5, mlp_factor=0.25):
+        super().__init__()
+        self.idx = idx
+        self.self_attention = GradFakeBranch(attn_factor)
+        self.mlp = GradFakeBranch(mlp_factor)
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        x = x + self.self_attention(x)
+        return x + self.mlp(x), None
+
+
+class GradFakeDecoder(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+
+
+class GradFakeModel(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.decoder = GradFakeDecoder(layers)
+
+    def forward(self, x):
+        out = x
+        for layer in self.decoder.layers:
+            out, _ = layer(out)
+        return out
+
+
+def _grad_monitor(layers, **kwargs):
+    monitor = GradHealthMonitor(**kwargs)
+    monitor.register_hooks(GradFakeModel(layers))
+    return monitor
+
+
+def _run_grad_backward(model, grad_seed):
+    """Forward the stack, then backprop ``grad_seed`` as ``dL/d(final output)``."""
+    x = torch.ones(2, GRAD_WIDTH, dtype=torch.float32, requires_grad=True)
+    out = model(x)
+    (out * grad_seed).sum().backward()
+
+
+class GradMagnitudeMathTest(unittest.TestCase):
+    def _stats(self, grad):
+        return grad_metrics.grad_square_and_stats(grad)[0]
+
+    def test_norm_is_the_l2_norm(self):
+        grad = torch.tensor([[3.0, 4.0], [0.0, 0.0]])
+        self.assertAlmostEqual(float(self._stats(grad)["norm"]), 5.0, places=5)
+
+    def test_rms_is_the_norm_over_sqrt_numel(self):
+        stats = self._stats(torch.randn(3, 5, 7))
+        self.assertAlmostEqual(float(stats["rms"]), float(stats["norm"]) / math.sqrt(3 * 5 * 7), places=4)
+
+    def test_abs_max_sees_a_negative_spike(self):
+        grad = torch.tensor([[0.1, -9.0], [0.2, 0.3]])
+        self.assertAlmostEqual(float(self._stats(grad)["abs_max"]), 9.0, places=5)
+
+    def test_sum_of_squares_matches_the_reported_norm(self):
+        grad = torch.randn(4, 6)
+        stats, sum_sq, numel = grad_metrics.grad_square_and_stats(grad)
+        self.assertEqual(numel, 24)
+        self.assertAlmostEqual(float(sum_sq), float(stats["norm"]) ** 2, places=3)
+
+    def test_a_low_precision_gradient_is_never_upcast_whole(self):
+        """The hot path must not materialize an fp32 copy of the gradient."""
+        grad = torch.randn(64, 32, dtype=torch.bfloat16)
+        stats, sum_sq, _numel = grad_metrics.grad_square_and_stats(grad)
+        exact = torch.linalg.vector_norm(grad.float())
+        self.assertAlmostEqual(float(stats["norm"]), float(exact), places=2)
+        self.assertAlmostEqual(float(sum_sq), float(exact) ** 2, places=1)
+        # Every reported scalar is fp32 even though the input is bf16.
+        for name, value in stats.items():
+            self.assertEqual(value.dtype, torch.float32, name)
+
+    def test_every_hooked_position_is_a_declared_position(self):
+        positions = [position for position, _module in grad_monitor._branch_modules(GradFakeLayer(0))]
+        self.assertEqual(positions, list(grad_metrics.POSITIONS))
+
+    def test_max_metric_naming_contract(self):
+        # training_logs picks the cross-rank reduction from the key name, independently
+        # of MAX_AGGREGATED. The two must agree or a max within a rank is averaged
+        # across ranks.
+        for name in grad_metrics.ALL_METRICS:
+            key = f"grad_health/layer_0/{name}"
+            is_max = name.endswith(grad_metrics.MAX_METRICS)
+            self.assertEqual(training_logs._is_max_metric(key), is_max, key)
+            self.assertFalse(training_logs._is_min_metric(key), key)
+
+
+class GradExactNormPlanTest(unittest.TestCase):
+    """``norm_global`` is only emitted when the reduction covers the whole batch."""
+
+    def test_pipeline_ranks_are_excluded_from_the_cover(self):
+        # pp ranks own different layers, so they never enter the sum.
+        self.assertEqual(grad_monitor.ExactNormReducer._distinct_data_ranks(32, 4, 1, False), 8)
+
+    def test_tensor_parallel_counts_only_under_sequence_parallel(self):
+        reducer = grad_monitor.ExactNormReducer
+        # SP on: the tp ranks each hold their own sequence shard, so they count.
+        self.assertEqual(reducer._distinct_data_ranks(8, 1, 2, True), 8)
+        # SP off: the tp ranks hold replicated activations and add no samples, so
+        # requiring them would make the cover unreachable and drop norm_global.
+        self.assertEqual(reducer._distinct_data_ranks(8, 1, 2, False), 4)
+
+    def test_a_single_rank_job_targets_itself(self):
+        self.assertEqual(grad_monitor.ExactNormReducer._distinct_data_ranks(1, 1, 1, False), 1)
+
+
+class GradMonitorSchemaTest(unittest.TestCase):
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def test_schema_covers_every_position_times_every_metric(self):
+        monitor = _grad_monitor([GradFakeLayer(0), GradFakeLayer(1)], log_global=False)
+        expected = {
+            f"grad_health/layer_{idx}/{position}_{metric}"
+            for idx in (0, 1)
+            for position in grad_metrics.POSITIONS
+            for metric in grad_metrics.METRICS + grad_metrics.GLOBAL_METRICS + grad_metrics.TOKEN_METRICS
+        }
+        self.assertEqual(monitor._mean_keys | monitor._max_keys, expected)
+        self.assertEqual(len(monitor.hooks), 6)  # 3 positions x 2 layers
+
+    def test_one_square_accumulator_per_hooked_module(self):
+        monitor = _grad_monitor([GradFakeLayer(0), GradFakeLayer(1)], log_global=False)
+        self.assertEqual(len(monitor._sq_acc), len(monitor.hooks))
+        self.assertEqual(
+            sorted(monitor._sq_acc, key=str),
+            sorted(((idx, position) for idx in (0, 1) for position in grad_metrics.POSITIONS), key=str),
+        )
+
+    def test_only_the_spike_detectors_are_max_aggregated(self):
+        monitor = _grad_monitor([GradFakeLayer(0)], log_global=False)
+        self.assertEqual(
+            monitor._max_keys,
+            {
+                f"grad_health/layer_0/{position}_{metric}"
+                for position in grad_metrics.POSITIONS
+                for metric in grad_metrics.MAX_METRICS
+            },
+        )
+        self.assertEqual(set(grad_metrics.MAX_METRICS), {"abs_max", "token_norm_max", "token_norm_ratio"})
+
+    def test_sample_layers_restricts_both_schema_and_hooks(self):
+        monitor = _grad_monitor([GradFakeLayer(0), GradFakeLayer(1)], log_global=False, sample_layers=[1])
+        self.assertEqual(len(monitor.hooks), 3)
+        self.assertTrue(all("/layer_1/" in key for key in monitor._mean_keys | monitor._max_keys))
+
+    def test_a_model_without_layers_registers_nothing(self):
+        monitor = GradHealthMonitor()
+        monitor.register_hooks(GradFakeModel([]))
+        self.assertEqual(monitor.hooks, [])
+
+
+class GradMonitorAmpTest(unittest.TestCase):
+    """The loss scale must not reach the curves; see ``finalize_scaled_grad_metrics``."""
+
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    @staticmethod
+    def _scaler(scale=8.0):
+        """A stand-in for Megatron's grad scaler, whose ``_scale`` is shape ``[1]``.
+
+        The shape is the point: the accumulators are 0-dim, and an in-place divide
+        by a ``[1]`` tensor raises unless the scale is reshaped to a scalar first.
+        """
+        return SimpleNamespace(_scale=torch.tensor([scale]))
+
+    def _norm_after(self, finalize_calls, scale=8.0):
+        layers = [GradFakeLayer(0)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(model)
+        _run_grad_backward(model, torch.full((2, GRAD_WIDTH), 2.0))
+        for _ in range(finalize_calls):
+            monitor.finalize_scaled_grad_metrics(self._scaler(scale))
+        monitor.step()
+        return training_logs.get_latest(prefix="grad_health")["grad_health/layer_0/layer_out_norm"]
+
+    def test_the_loss_scale_is_divided_out(self):
+        expected = float(torch.linalg.vector_norm(torch.full((2, GRAD_WIDTH), 2.0))) / 8.0
+        self.assertAlmostEqual(self._norm_after(1), expected, places=4)
+
+    def test_finalizing_twice_in_one_step_divides_once(self):
+        expected = float(torch.linalg.vector_norm(torch.full((2, GRAD_WIDTH), 2.0))) / 8.0
+        self.assertAlmostEqual(self._norm_after(2), expected, places=4)
+
+    def test_a_zero_dim_or_python_scale_works_too(self):
+        """torch's own GradScaler is 0-dim and direct callers may pass a float."""
+        expected = float(torch.linalg.vector_norm(torch.full((2, GRAD_WIDTH), 2.0))) / 8.0
+        for scale in (torch.tensor(8.0), 8.0):
+            training_logs.reset()
+            layers = [GradFakeLayer(0)]
+            model = GradFakeModel(layers)
+            monitor = GradHealthMonitor(log_global=False)
+            monitor.register_hooks(model)
+            _run_grad_backward(model, torch.full((2, GRAD_WIDTH), 2.0))
+            monitor.finalize_scaled_grad_metrics(SimpleNamespace(_scale=scale))
+            monitor.step()
+            latest = training_logs.get_latest(prefix="grad_health")
+            self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_norm"], expected, places=4)
+
+    def test_a_run_without_a_scaler_is_left_alone(self):
+        layers = [GradFakeLayer(0)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(model)
+        seed = torch.full((2, GRAD_WIDTH), 2.0)
+        _run_grad_backward(model, seed)
+        monitor.finalize_scaled_grad_metrics(None)
+        monitor.step()
+        latest = training_logs.get_latest(prefix="grad_health")
+        self.assertAlmostEqual(
+            latest["grad_health/layer_0/layer_out_norm"], float(torch.linalg.vector_norm(seed)), places=4
+        )
+
+    def test_scale_invariant_ratios_survive_descaling(self):
+        """The degree-0 token ratios must not be divided by the loss scale."""
+        layers = [GradFakeLayer(0)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(model)
+        # Equal token norms -> token_norm_ratio is exactly 1.0; a scale of 8 would
+        # push it to 0.125 if it were wrongly de-scaled with the degree-1 metrics.
+        _run_grad_backward(model, torch.full((2, GRAD_WIDTH), 2.0))
+        monitor.finalize_scaled_grad_metrics(self._scaler())
+        monitor.step()
+        latest = training_logs.get_latest(prefix="grad_health")
+        self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_token_norm_ratio"], 1.0, places=4)
+        self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_token_zero_ratio"], 0.0, places=4)
+        self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_token_outlier_ratio"], 0.0, places=4)
+
+
+class GradMonitorEndToEndTest(unittest.TestCase):
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def test_layer_out_norm_is_the_norm_of_the_incoming_gradient(self):
+        """The last layer's output gradient is exactly the seed, so this is exact."""
+        layers = [GradFakeLayer(0)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(model)
+        seed = torch.tensor([[1.0, 2.0, 3.0, 4.0], [0.0, 0.0, 0.0, 0.0]])
+        _run_grad_backward(model, seed)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="grad_health")
+        expected = float(torch.linalg.vector_norm(seed))
+        self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_norm"], expected, places=4)
+        self.assertAlmostEqual(
+            latest["grad_health/layer_0/layer_out_rms"], expected / math.sqrt(2 * GRAD_WIDTH), places=4
+        )
+        self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_abs_max"], 4.0, places=4)
+
+    def test_single_rank_exact_norms_equal_the_local_values(self):
+        """With no distributed context the reducer is the identity, so the exact
+        series collapse to this rank's own numbers."""
+        layers = [GradFakeLayer(0)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(model)
+        seed = torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 1.0, 1.0]])
+        _run_grad_backward(model, seed)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="grad_health")
+        expected_norm = float(torch.linalg.vector_norm(seed))
+        self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_norm_mb"], expected_norm, places=4)
+        self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_norm_global"], expected_norm, places=4)
+        self.assertAlmostEqual(
+            latest["grad_health/layer_0/layer_out_rms_global"], expected_norm / math.sqrt(2 * GRAD_WIDTH), places=4
+        )
+
+    def test_every_position_of_every_layer_reports(self):
+        layers = [GradFakeLayer(0), GradFakeLayer(1)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(model)
+        _run_grad_backward(model, torch.ones(2, GRAD_WIDTH))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="grad_health")
+        for idx in (0, 1):
+            for position in grad_metrics.POSITIONS:
+                for metric in grad_metrics.METRICS:
+                    key = f"grad_health/layer_{idx}/{position}_{metric}"
+                    self.assertIn(key, latest)
+                    self.assertGreater(latest[key], 0.0)
+
+    def test_the_gradient_grows_towards_the_input_of_a_residual_stack(self):
+        layers = [GradFakeLayer(0), GradFakeLayer(1)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(model)
+        _run_grad_backward(model, torch.ones(2, GRAD_WIDTH))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="grad_health")
+        self.assertGreater(latest["grad_health/layer_0/layer_out_norm"], latest["grad_health/layer_1/layer_out_norm"])
+
+    def test_a_no_grad_forward_records_nothing(self):
+        """Recompute gate: the discarded no-grad forward must not register a hook."""
+        layers = [GradFakeLayer(0)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(model)
+        with torch.no_grad():
+            model(torch.ones(2, GRAD_WIDTH))
+        monitor.step()
+        self.assertEqual(training_logs.get_latest(prefix="grad_health"), {})
+
+    def test_log_per_layer_false_emits_only_global(self):
+        layers = [GradFakeLayer(0)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_per_layer=False, log_global=True)
+        monitor.register_hooks(model)
+        _run_grad_backward(model, torch.ones(2, GRAD_WIDTH))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="grad_health")
+        self.assertTrue(latest)
+        self.assertTrue(all("/layer_" not in key for key in latest))
+        self.assertIn("grad_health/global_layer_out_norm", latest)
 
 
 if __name__ == "__main__":

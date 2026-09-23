@@ -8,7 +8,9 @@ twice and ``norm_global`` came out ``sqrt(cp)`` high with nothing in the numbers
 to show it.
 
 No cluster needed: the planner works off group sizes and rank sets, so stubs pin
-the combination logic exactly.
+the combination logic exactly. It is pure Python and shared by both backends'
+``grad_health`` monitors, so this runs in a torch-only and in a paddle-only
+environment alike -- the paddle module re-exports it.
 """
 
 import importlib
@@ -19,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-gr = importlib.import_module("internal_medicine.backends.paddlefleet.grad_reduce")
+gr = importlib.import_module("internal_medicine.core.grad_reduce")
 
 
 def info(name, ranks):

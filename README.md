@@ -142,7 +142,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update` | `kda_health` | `dsa_health`
+- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update` | `kda_health` | `dsa_health` | `grad_health`
 - `global_idx`: 全局层索引。优先取模块自带的 `layer.layer_number`（0-based 全局编号）；取不到时回退到
   `pp_rank × local_layers + local_idx`。`num_empty_layers_add_in_head > 0` 时所有层号整体偏移该值，看板对号要减掉
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
@@ -900,8 +900,9 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 
 ## 十、Grad Health Monitor (grad_health)
 
-**仅 paddlefleet。** 前面的 monitor 看的都是前向量级，这一个看反向：每层、每个模块输出上的
-**激活梯度** `dL/d(activation)` 的 L2 范数。回答「梯度往回走的路上是被放大还是被吃掉」。
+**paddlefleet + megatron 双后端。** 前面的 monitor 看的都是前向量级，这一个看反向：每层、每个模块
+输出上的 **激活梯度** `dL/d(activation)` 的 L2 范数。回答「梯度往回走的路上是被放大还是被吃掉」。
+两个后端 key 命名一致；megatron 侧不含 MTP 层、也不按 attn_type 分标签，fp16 需 trainer 侧接线（见下）。
 
 三个位置（`position`），命名与 `massive_act` 的前向位置对齐，同层的前向幅度与反向幅度可以并排看：
 
@@ -942,14 +943,15 @@ flush 时把整个 schema 的平方和与计数拼成**一个张量**做归约 �
 **两者绝不串联。** 早期版本在 cp 归约的结果上继续做 dp 归约，隐含假设两个秩集合正交。`sharding_first`
 + `data_parallel_size=1` 时样本铺在 sharding 上，`_DATA_PARALLEL_GROUP` 跨了 cp，于是 cp 的贡献被数两次，
 `norm_global` 偏高 `√cp`（cp=2 时 +41%），而数字本身看不出任何异常。所以现在成员关系是**检查**出来的，
-不是假设的（见 `grad_reduce.py`）：
+不是假设的（见 `core/grad_reduce.py`，两个后端共用；`paddlefleet/grad_reduce.py` 只是转发）：
 
 - 经过同一个 rank 的两个 mesh 组正交 ⟺ 交集恰好只有这个 rank；与已选组重叠更多的候选被丢掉而不是重复
   计数。秩集合取自组本身，因为**只看 size 分不出嵌套组和不交组**
 - 候选按 size 从大到小试，于是已经跨满数据维的组一次覆盖到位，挡住嵌套在里面的 cp 被再加一遍
-- 已选组的 size 之积必须等于 `world_size / pp_size`。对不上时 **`norm_global` 直接不发**（部分覆盖会让它
-  变成子批的范数），而 `rms_global` 在任何子集上都是无偏估计，继续上报；同时打一条 warning 列出所有候选
-  组及其 size
+- 已选组的 size 之积必须等于**持有不同样本**的 rank 数：`world_size / (pp_size × 复制维)`。`pp` 各 rank
+  持有不同层，从不计入；不开 SP 时 TP 内激活是复制的、那些 rank 不带新样本，所以复制维 = `tp_size`，
+  开 SP 时 TP 参与分片、复制维 = 1。对不上时 **`norm_global` 直接不发**（部分覆盖会让它变成子批的范数），
+  而 `rms_global` 在任何子集上都是无偏估计，继续上报；同时打一条 warning 列出所有候选组及其 size
 - `ep` 是候选而不是预设冗余：它是否嵌在数据维里取决于 topo order，交给正交性检查逐 run 回答
 - `pp` 从不求和：各 rank 持有不同层，key 集合不同，跨 PP 归约会因形状不匹配 hang
 
@@ -971,9 +973,11 @@ mask 的极端微批会退化成 0 而不是 NaN。
 ### 三个必须知道的口径
 
 **AMP loss scale。** 梯度 hook 看到的是**放大后**的激活梯度（量级 1e4，每次 overflow 都会变）。
-`finalize_scaled_grad_metrics` 在 `on_optimizer_begin` 把 scale 除回去 —— 那个时点 `scaler._scale`
-还是本 step 反向实际用的值。三个量对 `g` 都是一次齐次，所以一次除法同时修好 mean 与 max 累加器。
-非 AMP 或直接调用者由 `_flush_buffers` 兜底。
+paddlefleet 在 `on_optimizer_begin` 把 scale 除回去 —— 那个时点 `scaler._scale` 还是本 step 反向实际
+用的值。三个量对 `g` 都是一次齐次，所以一次除法同时修好 mean 与 max 累加器。非 AMP 或直接调用者由
+`_flush_buffers` 兜底。megatron 默认 bf16，激活梯度未被 loss-scale，指标开箱即正确；fp16 用户需在
+`optimizer.step()` 前把 grad scaler 传给 `finalize_scaled_grad_metrics(scaler)`，否则 fp16 曲线会随
+scaler 波动。
 
 **分片。** 热路径不做任何 collective（见 `.claude/skills/monitor-hook-perf-rules`），跨卡归约在 flush
 时统一做。TP/SP/CP 下每卡量的是自己那一片：`rms` 在等分片时是全局真值（每卡均方是全局均方的无偏
@@ -987,7 +991,8 @@ grad-norm clip 报的那个数。
 
 - 没有进 `METRIC_TAXONOMY`（与 `kda_health` 相同）：所有 key 落在 fail-open 的 `other` 族，即
   「一直采集、不能按族关掉」。等真实 run 的 key corpus 进 fixture 后再补 family。
-- 只有 paddlefleet 后端。
+- megatron 侧不含 MTP 层、不按 attn_type 分标签；fp16 精确 de-scale 依赖 trainer 侧把 scaler 传进
+  `finalize_scaled_grad_metrics`。
 
 ---
 

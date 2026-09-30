@@ -919,9 +919,9 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 | 5 | `{pos}_rms_global` | `.../layer_out_rms_global` | `√(Σg²/ΣN)` | 每层+全局 | **精确**全局 RMS；与集群规模、并行布局、gas 全部无关 |
 | 6 | `{pos}_norm_global` | `.../layer_out_norm_global` | `√(Σg²)` | 每层+全局 | 全 global batch 的 L2；随 `√(world×gas)` 增长 |
 | 7 | `{pos}_token_norm_max` | `.../layer_out_token_norm_max` | `max_t‖g_t‖₂` | 每层+全局 | 最响 token 的梯度范数，max 归约 |
-| 8 | `{pos}_token_norm_p99` | `.../layer_out_token_norm_p99` | `Q₉₉(‖g_t‖₂)` | 每层+全局 | token 尾部形状；与 max 的距离=孤立一个还是一片 |
-| 9 | `{pos}_token_norm_ratio` | `.../layer_out_token_norm_ratio` | `max_t/median_t` | 每层+全局 | **token 尖峰度**，max 归约 |
-| 10 | `{pos}_token_outlier_ratio` | `.../layer_out_token_outlier_ratio` | `Pr(‖g_t‖>10·median⁺)` | 每层+全局 | 有多少 token 是离群的（占比，非计数） |
+| 8 | `{pos}_token_norm_p99` | `.../layer_out_token_norm_p99` | `Q₉₉⁺(‖g_t‖₂)` | 每层+全局 | token 尾部形状（仅有梯度 token）；与 max 的距离=孤立一个还是一片 |
+| 9 | `{pos}_token_norm_ratio` | `.../layer_out_token_norm_ratio` | `max_t/median⁺_t` | 每层+全局 | **token 尖峰度**，max 归约 |
+| 10 | `{pos}_token_outlier_ratio` | `.../layer_out_token_outlier_ratio` | `Pr⁺(‖g_t‖>10·median⁺)` | 每层+全局 | 有多少**有梯度** token 是离群的（占比，分母为有梯度 token） |
 | 11 | `{pos}_token_zero_ratio` | `.../layer_out_token_zero_ratio` | `Pr(‖g_t‖=0)` | 每层+全局 | 没有梯度的 token 占比（被 loss mask 掉的位置） |
 
 采集方式：`forward_post_hook` 只负责拿到输出张量并在其上 `register_hook`，所有归约都在反向里发生，
@@ -964,11 +964,12 @@ hidden，每张卡持有的是**完整 token**，所以 max 跨 rank 就是全�
 
 判读：`token_norm_ratio` 高而元素级尾部正常 → 少数 token 整体很响；反之 → 少数格子跑飞。
 
-**median 只在有梯度的 token 上取。** 被 loss mask 掉的位置是整行精确 0，把它们算进 median 会让 median 贴
-在 0 上，`token_norm_ratio` 于是变成「这个 batch 被 mask 了多少」而不是尖峰度 —— 32 卡 8k 实测出的
-2000~19340 就是这么来的。现在用 `nanmedian` 只对非零行取中位数，`token_outlier_ratio` 的 10× 阈值也相对
-这个 median；被 mask 的比例由 `token_zero_ratio` 单独一条曲线报出来，不再污染别的指标。全部 token 都被
-mask 的极端微批会退化成 0 而不是 NaN。
+**median、p99、离群占比都只在有梯度的 token 上取。** 被 loss mask 掉的位置是整行精确 0，把它们算进
+median 会让 median 贴在 0 上，`token_norm_ratio` 于是变成「这个 batch 被 mask 了多少」而不是尖峰度 ——
+32 卡 8k 实测出的 2000~19340 就是这么来的。现在 median 用 `nanmedian`、p99 用 `nanquantile` 都只对非零行
+取；`token_outlier_ratio` 的 10× 阈值相对这个 median，且**占比分母也是有梯度 token 数**（否则 mask 比例
+一高分母就被稀释）。被 mask 的比例由 `token_zero_ratio` 单独一条曲线报出来，不再污染别的指标。全部 token
+都被 mask 的极端微批会退化成 0 而不是 NaN。
 
 ### 三个必须知道的口径
 
@@ -1237,7 +1238,7 @@ setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode
 | **Grad** | `{pos}_rms_global` | `√(Σg²/ΣN)` | mean | 精确全局 RMS; 唯一与集群规模/布局/gas 无关的 |
 | **Grad** | `{pos}_norm_global` | `√(Σg²)` | mean | 全 batch L2; 随 `√(world×gas)` 增长 |
 | **Grad** | `{pos}_token_norm_max` | `max_t‖g_t‖₂` | max | 最响 token 的梯度范数 |
-| **Grad** | `{pos}_token_norm_p99` | `Q₉₉(‖g_t‖₂)` | mean | token 尾部形状 |
+| **Grad** | `{pos}_token_norm_p99` | `Q₉₉⁺(‖g_t‖₂)` | mean | token 尾部形状; 只取有梯度的 token |
 | **Grad** | `{pos}_token_norm_ratio` | `max_t/median⁺_t` | max | token 尖峰度; median 只取有梯度的 token |
-| **Grad** | `{pos}_token_outlier_ratio` | `Pr(‖g_t‖>10·median⁺)` | mean | 离群 token 占比 |
+| **Grad** | `{pos}_token_outlier_ratio` | `Pr⁺(‖g_t‖>10·median⁺)` | mean | 离群 token 占比; 分母为有梯度 token |
 | **Grad** | `{pos}_token_zero_ratio` | `Pr(‖g_t‖=0)` | mean | 无梯度 token 占比 (被 loss mask 掉的位置) |

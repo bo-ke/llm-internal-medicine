@@ -1415,6 +1415,24 @@ class GradMagnitudeMathTest(unittest.TestCase):
         for name, value in stats.items():
             self.assertEqual(value.dtype, torch.float32, name)
 
+    def test_a_zero_token_gradient_does_not_throw(self):
+        """A degenerate 0-token microbatch must fill the schema with zeros, not abort
+        the whole record on ``max()`` of an empty tensor."""
+        stats, sum_sq, _numel = grad_metrics.grad_square_and_stats(torch.zeros(0, GRAD_WIDTH))
+        self.assertEqual(float(sum_sq), 0.0)
+        for name, value in stats.items():
+            self.assertEqual(float(value), 0.0, name)
+            self.assertEqual(value.dtype, torch.float32, name)
+
+    def test_token_outlier_ratio_is_over_gradient_carrying_tokens(self):
+        # Norms [0, 0, 1, 100]: two masked tokens, one at the median, one 100x spike.
+        # median over alive = 1; the denominator is the 2 alive tokens, so the outlier
+        # fraction is 1/2 -- not 1/4, which counting the masked rows would give.
+        grad = torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [100.0, 0.0, 0.0, 0.0]])
+        stats = self._stats(grad)
+        self.assertAlmostEqual(float(stats["token_zero_ratio"]), 0.5, places=5)
+        self.assertAlmostEqual(float(stats["token_outlier_ratio"]), 0.5, places=5)
+
     def test_every_hooked_position_is_a_declared_position(self):
         positions = [position for position, _module in grad_monitor._branch_modules(GradFakeLayer(0))]
         self.assertEqual(positions, list(grad_metrics.POSITIONS))

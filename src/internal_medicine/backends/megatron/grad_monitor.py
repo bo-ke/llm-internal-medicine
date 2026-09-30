@@ -215,13 +215,11 @@ class ExactNormReducer:
     def _group_getters(parallel_state):
         """Map the planner's candidate names to Megatron process-group getters.
 
-        ``dp`` is the pure data-parallel group; ``cp_dp`` is data-parallel *with*
-        context parallel folded in, so the planner can cover ``dp`` and ``cp`` in
-        one orthogonal group when the topology nests them that way.
-
-        ``get_data_parallel_group`` is called with its default ``with_gtp_remat=True``
-        on purpose: that is the full distinct-data group, while the replicate group
-        would miss the gtp_remat peers, which hold their own micro-batches.
+        ``dp`` fetches the group *without* context parallel
+        (``with_context_parallel=False``) so ``cp`` stays a separate orthogonal
+        candidate; ``cp_dp`` folds it in (``with_context_parallel=True``) so the
+        planner can cover ``dp`` and ``cp`` as one group when the topology nests
+        them that way.
         """
         return {
             "cp": lambda: parallel_state.get_context_parallel_group(),
@@ -337,10 +335,14 @@ class GradHealthMonitor(TorchProbe):
         return find_transformer_layers(model)
 
     def _prepare_layers(self, model: nn.Module, layer_offset: int = 0):
-        """``[(layer_idx, position, module)]`` for every hooked module; declare keys."""
+        """``([(layer_idx, position, module)], num_local_layers)``; declare keys.
+
+        The local layer count is returned so the multi-chunk caller can advance
+        ``layer_offset`` without walking the model a second time.
+        """
         layers = self._find_transformer_layers(model)
         if not layers:
-            return []
+            return [], 0
 
         targets: list[tuple[int, str, nn.Module]] = []
         for local_idx, layer in layers:
@@ -353,11 +355,11 @@ class GradHealthMonitor(TorchProbe):
         for layer_idx, position, _module in targets:
             for metric in METRICS + GLOBAL_METRICS + TOKEN_METRICS:
                 self.declare_layer_metric(layer_idx, f"{position}_{metric}")
-        return targets
+        return targets, len(layers)
 
     def register_hooks(self, model: nn.Module, layer_offset: int = 0):
         self._init_parallel_state()
-        targets = self._prepare_layers(model, layer_offset=layer_offset)
+        targets, _ = self._prepare_layers(model, layer_offset=layer_offset)
         if not targets:
             logger.info("[GradMonitor] No transformer layers found; skipping.")
             return
@@ -498,9 +500,8 @@ class GradHealthMonitor(TorchProbe):
         self._emit_exact_norms()
         scale = getattr(scaler, "_scale", None) if scaler is not None else None
         if scale is not None:
-            # Megatron's grad scaler holds ``_scale`` as a shape-[1] tensor while the
-            # accumulators are 0-dim, and an in-place divide cannot broadcast its own
-            # output -- reshape to a scalar or every fp16 step raises.
+            # Megatron's grad scaler holds ``_scale`` as shape-[1]; reshape to a 0-dim
+            # scalar or the in-place divide into the 0-dim accumulator raises under fp16.
             scale = scale.detach().float().reshape(()) if isinstance(scale, torch.Tensor) else float(scale)
             for key in self._mean_keys | self._max_keys:
                 if self._gpu_cnt.get(key, 0) > 0 and not key.endswith(SCALE_INVARIANT):
@@ -517,8 +518,12 @@ class GradHealthMonitor(TorchProbe):
         reduction ends up with the same value, the cross-rank mean is a no-op for
         the two global series.
         """
-        slots = [slot for slot in sorted(self._sq_acc, key=str) if self._sq_micro[slot] > 0]
-        if not slots or self._reducer is None:
+        # Reduce over the FULL fixed slot set (identical on every rank of this PP
+        # stage) so the collective shape can never diverge; emit only the slots this
+        # rank actually recorded. Filtering by micro>0 here would let one rank drop a
+        # slot the others keep and hang the all_reduce on mismatched shapes.
+        slots = sorted(self._sq_acc, key=str)
+        if not slots or self._reducer is None or not any(self._sq_micro[s] > 0 for s in slots):
             self._reset_sq_accum()
             return
         try:
@@ -537,11 +542,12 @@ class GradHealthMonitor(TorchProbe):
                 norm_mb = torch.sqrt(shard_sq / micro.clamp(min=1.0))
                 rms_global = torch.sqrt(total_sq / total_count.clamp(min=1.0))
                 norm_global = torch.sqrt(total_sq)
-                # ``norm_global`` only means "the whole batch" when the reduction
-                # covered every rank exactly once; on a partial cover it would be a
-                # sub-batch norm, so it is dropped rather than logged wrong.
+                # ``norm_global`` is the whole-batch norm only when the cover hit every
+                # rank once; on a partial cover it is dropped rather than logged wrong.
                 emit_total_norm = self._reducer.exact_total or not self._reducer.enabled
                 for i, (layer_idx, position) in enumerate(slots):
+                    if self._sq_micro[(layer_idx, position)] == 0:
+                        continue
                     series = [("norm_mb", norm_mb[i]), ("rms_global", rms_global[i])]
                     if emit_total_norm:
                         series.append(("norm_global", norm_global[i]))
@@ -585,9 +591,9 @@ def setup_grad_monitor(
     chunk_targets = []
     layer_offset = 0
     for m in models:
-        targets = monitor._prepare_layers(m, layer_offset=layer_offset)
+        targets, num_local = monitor._prepare_layers(m, layer_offset=layer_offset)
         chunk_targets.append((m, targets))
-        layer_offset += len(monitor._find_transformer_layers(m))
+        layer_offset += num_local
     if any(targets for _, targets in chunk_targets):
         device = next((p.device for m in models for p in m.parameters()), None)
         assert device is not None, "no parameters across model chunks; cannot pick a device"

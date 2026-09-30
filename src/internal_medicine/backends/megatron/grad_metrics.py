@@ -110,36 +110,41 @@ def grad_token_stats(token_norm: torch.Tensor) -> dict[str, torch.Tensor]:
     token; the gradient itself is never materialized in fp32.
 
     - ``token_norm_max``      the loudest token's ``||g_t||``
-    - ``token_norm_p99``      the tail's shape; its distance from the max says
-                              whether the spike is one isolated token or many
+    - ``token_norm_p99``      the tail's shape (over gradient-carrying tokens); its
+                              distance from the max says whether the spike is one
+                              isolated token or many
     - ``token_norm_ratio``    ``max / median``, the token-level peakiness --
                               the counterpart of ``massive_act``'s
                               ``channel_max_ratio``
-    - ``token_outlier_ratio`` fraction of tokens above ``10x`` the median
+    - ``token_outlier_ratio`` fraction of gradient-carrying tokens above ``10x`` the
+                              median
     - ``token_zero_ratio``    fraction of tokens with no gradient at all
 
-    **The median is taken over gradient-carrying tokens only.** A first version
-    used the plain median and measured the wrong thing on a real 8k run:
-    loss-masked positions gave whole rows of exact zeros, the median sat at ~0,
-    and ``token_norm_ratio`` came out 2000-19000 -- a reading of *how much of the
-    batch is masked* rather than of token peakiness. ``nanmedian`` over the
-    non-zero rows restores the intended meaning, and ``token_zero_ratio`` exposes
-    the masked fraction as its own series instead of letting it distort another.
+    **The median, p99 and outlier fraction are all taken over gradient-carrying
+    tokens only.** A first version used the plain median and measured the wrong
+    thing on a real 8k run: loss-masked positions gave whole rows of exact zeros,
+    the median sat at ~0, and ``token_norm_ratio`` came out 2000-19000 -- a reading
+    of *how much of the batch is masked* rather than of token peakiness. Dropping
+    the dead rows restores the intended meaning for all three, and
+    ``token_zero_ratio`` exposes the masked fraction as its own series.
     """
     alive = token_norm > 0
-    # NaN for the dead rows so ``nanmedian`` ignores them without a host-side
-    # boolean index (which would need the count on the CPU, i.e. a D2H sync).
+    # NaN for the dead rows so the nan-aware reductions ignore them without a
+    # host-side boolean index (which would need the count on the CPU, a D2H sync).
     nonzero = torch.where(alive, token_norm, torch.full_like(token_norm, float("nan")))
     median = torch.nanmedian(nonzero)
-    # All-masked microbatch -> nanmedian is NaN; fall back to a positive epsilon so
-    # the ratio stays finite instead of poisoning the step with NaN.
+    # All-masked microbatch -> nan reductions are NaN; fall back to 0 so the ratio
+    # stays finite instead of poisoning the step with NaN.
     median = torch.where(torch.isnan(median), torch.zeros_like(median), median).clamp(min=1e-30)
+    p99 = torch.nanquantile(nonzero, 0.99)
+    p99 = torch.where(torch.isnan(p99), torch.zeros_like(p99), p99)
     peak = token_norm.max()
+    alive_count = alive.float().sum().clamp(min=1.0)
     return {
         "token_norm_max": peak,
-        "token_norm_p99": torch.quantile(token_norm, 0.99),
+        "token_norm_p99": p99,
         "token_norm_ratio": peak / median,
-        "token_outlier_ratio": (token_norm > TOKEN_OUTLIER_MULTIPLIER * median).float().mean(),
+        "token_outlier_ratio": (token_norm > TOKEN_OUTLIER_MULTIPLIER * median).float().sum() / alive_count,
         "token_zero_ratio": 1.0 - alive.float().mean(),
     }
 
@@ -160,6 +165,12 @@ def grad_square_and_stats(grad: torch.Tensor) -> tuple[dict[str, torch.Tensor], 
     token_norm = token_norms(value)
     sum_sq = token_norm.square().sum()
     numel = max(1, value.numel())
+    # A zero-token microbatch makes every reduction below throw (``max`` of empty);
+    # keep the schema filled with zeros so the whole record does not abort.
+    if token_norm.numel() == 0:
+        zero = torch.zeros((), dtype=torch.float32, device=value.device)
+        stats = {name: zero for name in ("norm", "rms", "abs_max", *TOKEN_METRICS)}
+        return stats, sum_sq, numel
     stats = {
         "norm": torch.sqrt(sum_sq),
         "rms": torch.sqrt(sum_sq / numel),

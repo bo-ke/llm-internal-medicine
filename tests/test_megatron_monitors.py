@@ -1613,6 +1613,36 @@ class GradMonitorAmpTest(unittest.TestCase):
         self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_token_zero_ratio"], 0.0, places=4)
         self.assertAlmostEqual(latest["grad_health/layer_0/layer_out_token_outlier_ratio"], 0.0, places=4)
 
+    def test_nonfinite_fraction_is_not_descaled(self):
+        """A fraction is degree-0; dividing it by the loss scale would be wrong."""
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(GradFakeModel([GradFakeLayer(0)]))
+        key = "grad_health/layer_0/layer_out_nonfinite_fraction"
+        monitor._gpu_acc[key].fill_(0.25)
+        monitor._gpu_cnt[key] = 1
+        monitor.finalize_scaled_grad_metrics(self._scaler(8.0))
+        monitor.step()
+        latest = training_logs.get_latest(prefix="grad_health")
+        self.assertAlmostEqual(latest[key], 0.25, places=6)
+
+    def test_rms_depth_ratio_is_scale_invariant(self):
+        """The depth ratio is max/min of two norms, so the loss scale cancels; it must
+        not be de-scaled like the degree-1 magnitudes."""
+
+        def ratio(with_scaler):
+            training_logs.reset()
+            model = GradFakeModel([GradFakeLayer(0), GradFakeLayer(1)])
+            monitor = GradHealthMonitor(log_global=True)
+            monitor.register_hooks(model)
+            _run_grad_backward(model, torch.full((2, GRAD_WIDTH), 2.0))
+            if with_scaler:
+                monitor.finalize_scaled_grad_metrics(self._scaler(8.0))
+            monitor.step()
+            return training_logs.get_latest(prefix="grad_health")["grad_health/global_layer_out_rms_depth_ratio"]
+
+        self.assertGreater(ratio(False), 1.0)
+        self.assertAlmostEqual(ratio(True), ratio(False), places=5)
+
 
 class GradMonitorEndToEndTest(unittest.TestCase):
     def setUp(self):
@@ -1726,7 +1756,7 @@ class GradMonitorEndToEndTest(unittest.TestCase):
         self.assertAlmostEqual(latest["grad_health/global_layer_out_rms_depth_ratio"], expected, places=4)
 
     def test_health_keys_report_and_are_clean_on_a_finite_gradient(self):
-        layers = [GradFakeLayer(0)]
+        layers = [GradFakeLayer(0), GradFakeLayer(1)]  # >=2 layers so depth ratio is declared
         model = GradFakeModel(layers)
         monitor = GradHealthMonitor(log_global=True)
         monitor.register_hooks(model)
@@ -1739,6 +1769,17 @@ class GradMonitorEndToEndTest(unittest.TestCase):
             self.assertIn(key, latest)
             self.assertEqual(latest[key], 0.0)
             self.assertIn(f"grad_health/global_{position}_rms_depth_ratio", latest)
+
+    def test_depth_ratio_is_skipped_for_a_single_layer_stage(self):
+        """One layer per stage -> max/min is a constant 1.0, so the key is not declared."""
+        model = GradFakeModel([GradFakeLayer(0)])
+        monitor = GradHealthMonitor(log_global=True)
+        monitor.register_hooks(model)
+        _run_grad_backward(model, torch.ones(2, GRAD_WIDTH))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="grad_health")
+        self.assertFalse(any("rms_depth_ratio" in key for key in latest))
 
 
 if __name__ == "__main__":

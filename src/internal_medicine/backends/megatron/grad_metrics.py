@@ -69,15 +69,12 @@ TOKEN_METRICS = (
     "token_zero_ratio",
 )
 
-# Numerical-health flag, degree-0 (a fraction). ``nonfinite_fraction`` is the
-# first-line bf16/fp16 alert -- the share of the activation gradient that is
-# NaN/Inf. Max-aggregated so a single bad microbatch/rank/layer is never averaged
-# away; a localized overflow must not vanish into a near-zero mean.
+# Degree-0 NaN/Inf share of the activation gradient -- the bf16/fp16 overflow alert.
+# Max-aggregated (see MAX_METRICS) so a localized overflow is not averaged away.
 HEALTH_METRICS = ("nonfinite_fraction",)
 
-# ``abs_max`` is a max over microbatches / ranks / layers, the rest are means.
-# The two token extremes and ``nonfinite_fraction`` join it: for a spike/overflow
-# detector the worst microbatch is the interesting one, not the average.
+# Max over microbatches / ranks / layers -- a spike/overflow detector wants the
+# worst, not the average. The remaining metrics are means.
 MAX_METRICS = ("abs_max", "token_norm_max", "token_norm_ratio", "nonfinite_fraction")
 
 # How far above the per-token median a token counts as an outlier. Matches
@@ -85,11 +82,8 @@ MAX_METRICS = ("abs_max", "token_norm_max", "token_norm_ratio", "nonfinite_fract
 # series are read the same way.
 TOKEN_OUTLIER_MULTIPLIER = 10.0
 
-# Degree-0 in the gradient: ratios and fractions invariant to a positive rescale.
-# The AMP loss-scale de-scaling must skip these -- they are already correct as
-# recorded, and dividing would make them ``scale`` too small. ``rms_depth_ratio``
-# is a ratio of two de-scaled norms, so the scale cancels there too. The remaining
-# magnitude metrics are degree-1 and must be de-scaled.
+# Degree-0: ratios/fractions invariant to a positive rescale, so AMP de-scale skips
+# them (``rms_depth_ratio`` is a ratio of norms -- scale cancels). Rest are degree-1.
 SCALE_INVARIANT = (
     "token_norm_ratio",
     "token_outlier_ratio",
@@ -192,9 +186,9 @@ def grad_square_and_stats(grad: torch.Tensor) -> tuple[dict[str, torch.Tensor], 
         # max|g| without an abs() copy of the whole tensor: the two extremes of g
         # bracket it, and both are fused reductions in the gradient's own dtype.
         "abs_max": torch.maximum(value.max(), value.min().neg()).float(),
-        # Share of NaN/Inf elements -- the bf16/fp16 overflow alert, one elementwise
-        # pass, no sort. abs_max alone goes NaN under a spike but cannot be alerted on.
-        "nonfinite_fraction": (~torch.isfinite(value)).float().mean(),
+        # NaN/Inf share. Count finite and subtract so only a bool temp is reduced to a
+        # scalar -- no full-size fp32 copy of the gradient (same discipline as above).
+        "nonfinite_fraction": 1.0 - torch.isfinite(value).sum().float() / numel,
     }
     stats.update(grad_token_stats(token_norm))
     return stats, sum_sq, numel

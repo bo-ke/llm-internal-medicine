@@ -932,7 +932,8 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 - `grad_health/global_{pos}_rms_depth_ratio` —— 本 PP stage 内 `rms_global` 的 `max_层/min_层`，衡量梯度幅度沿
   深度的离散度（≈1=残差流均匀传导，偏大=某层放大或吃掉梯度）。**按 PP stage 局部计算**：monitor 从不跨 PP 归约，
   多段 PP 下每个 stage 用同一 key 吐自己的值，跨卡会被平均成「各 stage 比值的均值」，不是全深度比。要全深度 profile
-  请在日志下游用逐层 `rms_global` 自行算 max/min。比值里 scale 自动约掉，故不参与 AMP de-scale。
+  请在日志下游用逐层 `rms_global` 自行算 max/min。比值里 scale 自动约掉，故不参与 AMP de-scale。stage 只有 1 层时
+  比值恒为 1、无信息，故**不声明也不上报**；`rms_global=0` 的层（冻结/整层被 mask）从 min 里剔除，免得一个死层把比值顶到 `1/eps`。
 
 采集方式：`forward_post_hook` 只负责拿到输出张量并在其上 `register_hook`，所有归约都在反向里发生，
 前向路径的额外开销是每模块一次 `register_hook`。`rms_depth_ratio` 在 flush（冷路径）从逐层 `rms_global`

@@ -358,7 +358,7 @@ class GradHealthMonitor(TorchProbe):
                 self.declare_layer_metric(layer_idx, f"{position}_{metric}")
         return targets, len(layers)
 
-    def _declare_depth_ratio_globals(self, positions) -> None:
+    def _declare_depth_ratio_globals(self, positions, num_layers: int) -> None:
         """Declare the per-stage ``rms_global`` depth-ratio globals, once, pre-allocate.
 
         **Stage-local by construction.** The ratio is max/min of ``rms_global`` over
@@ -367,8 +367,11 @@ class GradHealthMonitor(TorchProbe):
         cross-rank mean is an average of per-stage ratios -- not the full-depth ratio.
         The true depth profile is the per-layer ``rms_global`` series, which already
         reaches the log sink from every stage.
+
+        Skipped when the stage holds fewer than two layers: max/min would be a constant
+        1.0 that carries no signal (common under deep PP with one layer per stage).
         """
-        if not self.log_global:
+        if not self.log_global or num_layers < 2:
             return
         for position in sorted(positions):
             key = self._global_key(f"{position}_rms_depth_ratio")
@@ -383,7 +386,10 @@ class GradHealthMonitor(TorchProbe):
             return
         device = next((p.device for p in model.parameters()), None)
         assert device is not None, "model has no parameters; cannot pick a device"
-        self._declare_depth_ratio_globals({position for _idx, position, _m in targets})
+        self._declare_depth_ratio_globals(
+            {position for _idx, position, _m in targets},
+            len({idx for idx, _p, _m in targets}),
+        )
         self.allocate_buffers(device)
         self._build_exact_norm_state([(model, targets)], device)
         self._attach_hooks(targets)
@@ -588,6 +594,10 @@ class GradHealthMonitor(TorchProbe):
         stream carries the gradient evenly, a large value flags a layer where it
         blows up or dies. Stage-local (see ``_declare_depth_ratio_globals``). The
         scale cancels in the ratio, so it needs no AMP de-scale (``SCALE_INVARIANT``).
+
+        Zero-``rms_global`` layers (a frozen or fully-masked layer) are left out of the
+        min, so one dead layer does not blow the ratio up to ``1/eps``; an all-dead
+        stage falls back to 1.0.
         """
         by_position: dict[str, list[torch.Tensor]] = {}
         for i, (layer_idx, position) in enumerate(slots):
@@ -599,7 +609,10 @@ class GradHealthMonitor(TorchProbe):
             if key in self._disabled_keys or key not in self._gpu_acc:
                 continue
             stacked = torch.stack(vals)
-            self.record_mean(key, stacked.max() / stacked.min().clamp(min=1e-30))
+            live = torch.where(stacked > 0, stacked, torch.full_like(stacked, float("inf")))
+            denom = live.min()
+            ratio = torch.where(torch.isinf(denom), torch.ones_like(denom), stacked.max() / denom)
+            self.record_mean(key, ratio)
 
     def _flush_buffers(self) -> None:
         self.finalize_scaled_grad_metrics()
@@ -639,7 +652,8 @@ def setup_grad_monitor(
         device = next((p.device for m in models for p in m.parameters()), None)
         assert device is not None, "no parameters across model chunks; cannot pick a device"
         positions = {position for _m, targets in chunk_targets for _idx, position, _mod in targets}
-        monitor._declare_depth_ratio_globals(positions)
+        num_layers = len({idx for _m, targets in chunk_targets for idx, _p, _mod in targets})
+        monitor._declare_depth_ratio_globals(positions, num_layers)
         monitor.allocate_buffers(device)
         monitor._build_exact_norm_state(chunk_targets, device)
         for _, targets in chunk_targets:

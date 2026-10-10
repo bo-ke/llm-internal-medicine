@@ -20,6 +20,28 @@ from __future__ import annotations
 
 import torch
 
+# Bound the per-chunk temporary when counting NaN/Inf. A whole-tensor ``bool.sum()``
+# promotes to int64 and materializes a full-size (8 B/elem) copy on CUDA, re-adding
+# the kind of transient this module avoids; counting in chunks keeps it ~this many
+# elements. The gradient is read as a view, so no full-size copy is ever made.
+_NONFINITE_CHUNK = 1 << 23
+
+
+def count_nonfinite(value: torch.Tensor) -> torch.Tensor:
+    """Exact int64 0-dim count of NaN/Inf elements, bounded-memory and sync-free.
+
+    Counting the *non-finite* elements (a small number) rather than subtracting a
+    huge finite count keeps the later ``float()`` exact: ``finite_count.float()``
+    rounds once ``finite_count`` passes 2**24, which silently floors a handful of
+    NaNs to a fraction of 0.
+    """
+    flat = value.reshape(-1)
+    total = torch.zeros((), dtype=torch.int64, device=value.device)
+    for start in range(0, flat.numel(), _NONFINITE_CHUNK):
+        total = total + (~torch.isfinite(flat[start : start + _NONFINITE_CHUNK])).sum()
+    return total
+
+
 # Where on the backward path a gradient is read. ``layer_out`` is the residual
 # stream leaving a decoder layer -- the series that answers "does the gradient
 # survive depth"; the other two attribute a layer's share to its two branches.
@@ -34,10 +56,12 @@ METRICS = ("norm", "rms", "abs_max")
 # ``grad_monitor.ExactNormReducer``. Names are separate keys, so the three
 # approximate series above keep their exact previous values.
 #
-# - ``norm_mb``     one microbatch's *complete* tensor, i.e. summed back over
-#                   whatever shards the same tensor (SP / CP / SP-in-TP), then
-#                   averaged over microbatches and data ranks. Equals ``norm``
-#                   exactly on a layout that does not shard activations.
+# - ``norm_mb``     the complete (shard-summed over SP / CP / SP-in-TP) per-microbatch
+#                   tensor norm, quadratic-mean (RMS) over this rank's microbatches.
+#                   It equals ``norm`` only for a SINGLE microbatch: with gradient
+#                   accumulation ``norm`` is the arithmetic mean of the per-microbatch
+#                   norms while ``norm_mb`` is their quadratic mean, so the two diverge
+#                   (mean of sqrt vs sqrt of mean).
 # - ``rms_global``  sqrt(sum g^2 / sum N) over every rank and microbatch. The
 #                   only one of the six that is invariant to cluster size,
 #                   parallel layout and gradient-accumulation depth.
@@ -57,10 +81,15 @@ GLOBAL_METRICS = ("norm_mb", "rms_global", "norm_global")
 # a channel phenomenon, while gradient spikes are usually carried by individual
 # tokens.
 #
-# All four are exact across ranks with no collective: every position is a
-# post-projection full-hidden tensor, so each rank holds *whole* tokens and a max
-# over ranks is a max over all tokens. ``token_outlier_ratio`` is a fraction
-# rather than a count for the same reason -- a count would be per-shard.
+# Cross-rank behaviour is NOT uniform, despite each rank holding whole post-projection
+# tokens. ``token_norm_max`` is exact (max over ranks is the global max) and
+# ``token_zero_ratio`` is exact for equal-sized shards (a mean of fractions). The other
+# three are PER-SHARD then aggregated -- ``token_norm_ratio`` by max, ``token_norm_p99``
+# and ``token_outlier_ratio`` by mean -- which is NOT the global quantile: a median /
+# quantile does not reduce that way, and the outlier count uses each shard's own median.
+# E.g. two shards of all-1 and all-100 norms report ratio=1 (max of per-shard 1s) while
+# the merged tokens give 100. Read those three as per-shard spike detectors, not
+# whole-batch figures; for an exact whole-batch magnitude use ``rms_global``.
 TOKEN_METRICS = (
     "token_norm_max",
     "token_norm_p99",
@@ -186,9 +215,9 @@ def grad_square_and_stats(grad: torch.Tensor) -> tuple[dict[str, torch.Tensor], 
         # max|g| without an abs() copy of the whole tensor: the two extremes of g
         # bracket it, and both are fused reductions in the gradient's own dtype.
         "abs_max": torch.maximum(value.max(), value.min().neg()).float(),
-        # NaN/Inf share. Count finite and subtract so only a bool temp is reduced to a
-        # scalar -- no full-size fp32 copy of the gradient (same discipline as above).
-        "nonfinite_fraction": 1.0 - torch.isfinite(value).sum().float() / numel,
+        # NaN/Inf share. ``count_nonfinite`` counts in the integer domain in chunks,
+        # so no full-size copy is made and a lone NaN is not rounded away (see P3).
+        "nonfinite_fraction": count_nonfinite(value).float() / numel,
     }
     stats.update(grad_token_stats(token_norm))
     return stats, sum_sq, numel

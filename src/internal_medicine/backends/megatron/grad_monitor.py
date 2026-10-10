@@ -318,6 +318,13 @@ class GradHealthMonitor(TorchProbe):
         self._sq_micro: dict[tuple[int, str], int] = {}
         self._reducer: ExactNormReducer | None = None
         self._exact_warned = False
+        # Set by the forward hook on every monitored (sampling-step) forward, before
+        # any requires_grad / record decision. It is the collective gate: all ranks of
+        # a reduction group run the monitored forward in lockstep on a sampling step,
+        # so this is rank-consistent, whereas "did I record anything" is not -- a rank
+        # whose outputs don't require grad records nothing yet must still join the
+        # all_reduce with zero buffers, or its peers hang.
+        self._hooked_this_step = False
 
     # ------------------------------------------------------------------
     # Setup: discover -> declare -> allocate -> attach
@@ -440,6 +447,9 @@ class GradHealthMonitor(TorchProbe):
         def hook_fn(module, args, output):
             if not self._should_monitor():
                 return None
+            # Mark participation before any per-output decision: the flush collective
+            # gates on this, and it must be set even when the output needs no grad.
+            self._hooked_this_step = True
             try:
                 tensor = _output_tensor(output)
                 if tensor is None or not tensor.requires_grad:
@@ -499,6 +509,7 @@ class GradHealthMonitor(TorchProbe):
             buf.zero_()
             self._sq_numel[slot] = 0
             self._sq_micro[slot] = 0
+        self._hooked_this_step = False
 
     # ------------------------------------------------------------------
     # AMP de-scaling (cold path, once per step)
@@ -543,12 +554,13 @@ class GradHealthMonitor(TorchProbe):
         reduction ends up with the same value, the cross-rank mean is a no-op for
         the two global series.
         """
-        # Reduce over the FULL fixed slot set (identical on every rank of this PP
-        # stage) so the collective shape can never diverge; emit only the slots this
-        # rank actually recorded. Filtering by micro>0 here would let one rank drop a
-        # slot the others keep and hang the all_reduce on mismatched shapes.
+        # Participation is gated on ``_hooked_this_step`` (a rank-consistent sampling
+        # signal), never on local records: a rank that monitored its forward but
+        # recorded nothing still joins with zero buffers. The slot set is the FULL
+        # fixed schema so every rank's reduced tensor has the same shape; filtering by
+        # micro>0 would both skip the collective and diverge the shapes, hanging it.
         slots = sorted(self._sq_acc, key=str)
-        if not slots or self._reducer is None or not any(self._sq_micro[s] > 0 for s in slots):
+        if not slots or self._reducer is None or not self._hooked_this_step:
             self._reset_sq_accum()
             return
         try:

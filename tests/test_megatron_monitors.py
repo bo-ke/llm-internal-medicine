@@ -1441,6 +1441,19 @@ class GradMagnitudeMathTest(unittest.TestCase):
     def test_nonfinite_fraction_is_zero_on_a_clean_gradient(self):
         self.assertEqual(float(self._stats(torch.randn(8, 4))["nonfinite_fraction"]), 0.0)
 
+    def test_count_nonfinite_is_exact_integer_across_chunk_boundaries(self):
+        # Force several chunks over a tiny tensor so the boundary logic is exercised;
+        # the count stays an exact int64 (no fp32 rounding, no full-size copy).
+        orig = grad_metrics._NONFINITE_CHUNK
+        grad_metrics._NONFINITE_CHUNK = 4
+        try:
+            g = torch.tensor([1.0, float("nan"), 3.0, 4.0, float("inf"), 6.0, 7.0, float("nan"), 9.0])
+            count = grad_metrics.count_nonfinite(g)
+            self.assertEqual(count.dtype, torch.int64)
+            self.assertEqual(int(count), 3)
+        finally:
+            grad_metrics._NONFINITE_CHUNK = orig
+
     def test_every_hooked_position_is_a_declared_position(self):
         positions = [position for position, _module in grad_monitor._branch_modules(GradFakeLayer(0))]
         self.assertEqual(positions, list(grad_metrics.POSITIONS))
@@ -1714,6 +1727,28 @@ class GradMonitorEndToEndTest(unittest.TestCase):
 
         latest = training_logs.get_latest(prefix="grad_health")
         self.assertGreater(latest["grad_health/layer_0/layer_out_norm"], latest["grad_health/layer_1/layer_out_norm"])
+
+    def test_monitored_forward_with_no_records_still_runs_the_reduction(self):
+        """P1: a rank that monitored its forward must join the collective with zero
+        buffers even if nothing required grad -- otherwise peers hang on all_reduce."""
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(GradFakeModel([GradFakeLayer(0)]))
+        monitor._hooked_this_step = True  # forward ran under monitoring; nothing recorded
+        calls = []
+        orig = monitor._reducer.reduce
+        monitor._reducer.reduce = lambda sq, counts: calls.append(1) or orig(sq, counts)
+        monitor.step()
+        self.assertEqual(len(calls), 1)
+
+    def test_unmonitored_step_skips_the_reduction(self):
+        """The flip side: with no monitored forward this step, no rank reduces."""
+        monitor = GradHealthMonitor(log_global=False)
+        monitor.register_hooks(GradFakeModel([GradFakeLayer(0)]))
+        monitor._hooked_this_step = False
+        calls = []
+        monitor._reducer.reduce = lambda sq, counts: calls.append(1)
+        monitor.step()
+        self.assertEqual(calls, [])
 
     def test_a_no_grad_forward_records_nothing(self):
         """Recompute gate: the discarded no-grad forward must not register a hook."""

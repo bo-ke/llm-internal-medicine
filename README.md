@@ -915,7 +915,7 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 | 1 | `{pos}_norm` | `grad_health/.../layer_out_norm` | `‖g‖₂` | 每层+全局 | L2 grad norm，跨 step 看趋势 |
 | 2 | `{pos}_rms` | `grad_health/.../layer_out_rms` | `‖g‖₂/√N` | 每层+全局 | 去掉形状依赖，**跨层可比**的那条 |
 | 3 | `{pos}_abs_max` | `grad_health/.../layer_out_abs_max` | `max\|g\|` | 每层+全局 | 尖峰探测，max 归约 |
-| 4 | `{pos}_norm_mb` | `.../layer_out_norm_mb` | `√(Σ_分片 g²)` | 每层+全局 | 单微批**完整**张量的 L2；不分片的布局下等于 `norm` |
+| 4 | `{pos}_norm_mb` | `.../layer_out_norm_mb` | `√(Σ_分片 g² / 微批数)` | 每层+全局 | 分片合并后的**完整**单微批张量 L2，按微批取**均方根**；仅单微批（无梯度累积）时等于 `norm`，多微批时 `norm` 取算术均值、`norm_mb` 取均方根，二者发散 |
 | 5 | `{pos}_rms_global` | `.../layer_out_rms_global` | `√(Σg²/ΣN)` | 每层+全局 | **精确**全局 RMS；与集群规模、并行布局、gas 全部无关 |
 | 6 | `{pos}_norm_global` | `.../layer_out_norm_global` | `√(Σg²)` | 每层+全局 | 全 global batch 的 L2；随 `√(world×gas)` 增长 |
 | 7 | `{pos}_token_norm_max` | `.../layer_out_token_norm_max` | `max_t‖g_t‖₂` | 每层+全局 | 最响 token 的梯度范数，max 归约 |
@@ -967,12 +967,18 @@ flush 时把整个 schema 的平方和与计数拼成**一个张量**做归约 �
 - `ep` 是候选而不是预设冗余：它是否嵌在数据维里取决于 topo order，交给正交性检查逐 run 回答
 - `pp` 从不求和：各 rank 持有不同层，key 集合不同，跨 PP 归约会因形状不匹配 hang
 
-**7–10 是 token 轴分解，零通讯。** `abs_max` 找的是最大的单个**元素**，无法区分「某个 token 整体很响」
+**7–11 是 token 轴分解，零通讯。** `abs_max` 找的是最大的单个**元素**，无法区分「某个 token 整体很响」
 （数据问题：罕见 token、EOS、脏样本）和「某个格子跑飞」（数值/channel 问题），而这两者要用相反的手段
 处理。token 轴而非 channel 轴是对的：`massive_act` 按 channel 分解是因为 massive activation 是 channel
-现象，而梯度尖峰通常由个别 token 承载。四条都跨卡精确且不需要 collective —— 三个位置都是投影后的完整
-hidden，每张卡持有的是**完整 token**，所以 max 跨 rank 就是全局 max；`token_outlier_ratio` 用占比而非
-计数也是同一个原因（计数是每片的）。
+现象，而梯度尖峰通常由个别 token 承载。
+
+> **跨卡口径不统一（重要）。** 不是「四条都跨卡精确」。只有 `token_norm_max` 精确（每卡持有完整 token，
+> max 跨 rank 即全局 max），`token_zero_ratio` 在等分片时精确（分数求均值）。而 `token_norm_ratio`（max/median）、
+> `token_norm_p99`、`token_outlier_ratio` 是**每片各算再聚合**（ratio 取 max、p99/outlier 取 mean），**不等于**
+> 全局分位数：分位数不这么规约，离群占比还用的是每片自己的 median。反例：两片范数分别全 1、全 100，聚合得
+> ratio=1、P99=50.5、outlier=0，而合并全体 token 应是 ratio=100、P99≈100、outlier=50%。这三条请当作**每片的尖峰
+> 探测**，不是全 batch 分位；要全 batch 幅度用 `rms_global`。要精确全局分位数需要 flush 时做分布规约（直方图），
+> 属于额外特性，尚未实现。
 
 判读：`token_norm_ratio` 高而元素级尾部正常 → 少数 token 整体很响；反之 → 少数格子跑飞。
 
@@ -1246,7 +1252,7 @@ setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode
 | **Grad** | `{pos}_norm` | `‖dL/d(activation)‖₂` | mean | 反向梯度量级; `pos`=layer_out/attn_out/ffn_or_moe_out |
 | **Grad** | `{pos}_rms` | `‖g‖₂/√N` | mean | 跨层可比的梯度量级 (等分片下为全局真值) |
 | **Grad** | `{pos}_abs_max` | `max\|g\|` | max | 梯度尖峰; bf16 梯度下分辨力受限 |
-| **Grad** | `{pos}_norm_mb` | `√(Σ_分片 g²)` | mean | 单微批完整张量 L2; 不分片布局下等于 `norm` |
+| **Grad** | `{pos}_norm_mb` | `√(Σ_分片 g² / 微批数)` | mean | 完整单微批张量 L2，按微批均方根; 仅单微批时等于 `norm` |
 | **Grad** | `{pos}_rms_global` | `√(Σg²/ΣN)` | mean | 精确全局 RMS; 唯一与集群规模/布局/gas 无关的 |
 | **Grad** | `{pos}_norm_global` | `√(Σg²)` | mean | 全 batch L2; 随 `√(world×gas)` 增长 |
 | **Grad** | `{pos}_token_norm_max` | `max_t‖g_t‖₂` | max | 最响 token 的梯度范数 |

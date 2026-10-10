@@ -69,24 +69,39 @@ TOKEN_METRICS = (
     "token_zero_ratio",
 )
 
+# Numerical-health flag, degree-0 (a fraction). ``nonfinite_fraction`` is the
+# first-line bf16/fp16 alert -- the share of the activation gradient that is
+# NaN/Inf. Max-aggregated so a single bad microbatch/rank/layer is never averaged
+# away; a localized overflow must not vanish into a near-zero mean.
+HEALTH_METRICS = ("nonfinite_fraction",)
+
 # ``abs_max`` is a max over microbatches / ranks / layers, the rest are means.
-# The two token extremes join it: for a spike detector the worst microbatch is
-# the interesting one, and averaging it away is exactly the wrong reduction.
-MAX_METRICS = ("abs_max", "token_norm_max", "token_norm_ratio")
+# The two token extremes and ``nonfinite_fraction`` join it: for a spike/overflow
+# detector the worst microbatch is the interesting one, not the average.
+MAX_METRICS = ("abs_max", "token_norm_max", "token_norm_ratio", "nonfinite_fraction")
 
 # How far above the per-token median a token counts as an outlier. Matches
 # ``massive_act``'s 10x convention so the forward and backward "outlier_ratio"
 # series are read the same way.
 TOKEN_OUTLIER_MULTIPLIER = 10.0
 
-# Degree-0 in the gradient: a ratio of norms and two fractions, all invariant to a
-# positive rescale. The AMP loss-scale de-scaling must skip these -- they are
-# already correct as recorded, and dividing would make them ``scale`` too small.
-# The other eight metrics are degree-1 and must be de-scaled.
-SCALE_INVARIANT = ("token_norm_ratio", "token_outlier_ratio", "token_zero_ratio")
+# Degree-0 in the gradient: ratios and fractions invariant to a positive rescale.
+# The AMP loss-scale de-scaling must skip these -- they are already correct as
+# recorded, and dividing would make them ``scale`` too small. ``rms_depth_ratio``
+# is a ratio of two de-scaled norms, so the scale cancels there too. The remaining
+# magnitude metrics are degree-1 and must be de-scaled.
+SCALE_INVARIANT = (
+    "token_norm_ratio",
+    "token_outlier_ratio",
+    "token_zero_ratio",
+    "nonfinite_fraction",
+    "rms_depth_ratio",
+)
 
 ALL_METRICS = tuple(
-    f"{position}_{metric}" for position in POSITIONS for metric in METRICS + GLOBAL_METRICS + TOKEN_METRICS
+    f"{position}_{metric}"
+    for position in POSITIONS
+    for metric in METRICS + GLOBAL_METRICS + TOKEN_METRICS + HEALTH_METRICS
 )
 
 MAX_AGGREGATED = frozenset(f"{position}_{metric}" for position in POSITIONS for metric in MAX_METRICS)
@@ -169,7 +184,7 @@ def grad_square_and_stats(grad: torch.Tensor) -> tuple[dict[str, torch.Tensor], 
     # keep the schema filled with zeros so the whole record does not abort.
     if token_norm.numel() == 0:
         zero = torch.zeros((), dtype=torch.float32, device=value.device)
-        stats = {name: zero for name in ("norm", "rms", "abs_max", *TOKEN_METRICS)}
+        stats = {name: zero for name in ("norm", "rms", "abs_max", *TOKEN_METRICS, *HEALTH_METRICS)}
         return stats, sum_sq, numel
     stats = {
         "norm": torch.sqrt(sum_sq),
@@ -177,6 +192,9 @@ def grad_square_and_stats(grad: torch.Tensor) -> tuple[dict[str, torch.Tensor], 
         # max|g| without an abs() copy of the whole tensor: the two extremes of g
         # bracket it, and both are fused reductions in the gradient's own dtype.
         "abs_max": torch.maximum(value.max(), value.min().neg()).float(),
+        # Share of NaN/Inf elements -- the bf16/fp16 overflow alert, one elementwise
+        # pass, no sort. abs_max alone goes NaN under a spike but cannot be alerted on.
+        "nonfinite_fraction": (~torch.isfinite(value)).float().mean(),
     }
     stats.update(grad_token_stats(token_norm))
     return stats, sum_sq, numel

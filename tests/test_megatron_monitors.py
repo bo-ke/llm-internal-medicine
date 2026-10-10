@@ -1433,6 +1433,14 @@ class GradMagnitudeMathTest(unittest.TestCase):
         self.assertAlmostEqual(float(stats["token_zero_ratio"]), 0.5, places=5)
         self.assertAlmostEqual(float(stats["token_outlier_ratio"]), 0.5, places=5)
 
+    def test_nonfinite_fraction_counts_nan_and_inf(self):
+        # 2 of 4 elements are non-finite (one NaN, one Inf).
+        grad = torch.tensor([[1.0, float("nan")], [float("inf"), 2.0]])
+        self.assertAlmostEqual(float(self._stats(grad)["nonfinite_fraction"]), 0.5, places=5)
+
+    def test_nonfinite_fraction_is_zero_on_a_clean_gradient(self):
+        self.assertEqual(float(self._stats(torch.randn(8, 4))["nonfinite_fraction"]), 0.0)
+
     def test_every_hooked_position_is_a_declared_position(self):
         positions = [position for position, _module in grad_monitor._branch_modules(GradFakeLayer(0))]
         self.assertEqual(positions, list(grad_metrics.POSITIONS))
@@ -1480,7 +1488,12 @@ class GradMonitorSchemaTest(unittest.TestCase):
             f"grad_health/layer_{idx}/{position}_{metric}"
             for idx in (0, 1)
             for position in grad_metrics.POSITIONS
-            for metric in grad_metrics.METRICS + grad_metrics.GLOBAL_METRICS + grad_metrics.TOKEN_METRICS
+            for metric in (
+                grad_metrics.METRICS
+                + grad_metrics.GLOBAL_METRICS
+                + grad_metrics.TOKEN_METRICS
+                + grad_metrics.HEALTH_METRICS
+            )
         }
         self.assertEqual(monitor._mean_keys | monitor._max_keys, expected)
         self.assertEqual(len(monitor.hooks), 6)  # 3 positions x 2 layers
@@ -1503,7 +1516,9 @@ class GradMonitorSchemaTest(unittest.TestCase):
                 for metric in grad_metrics.MAX_METRICS
             },
         )
-        self.assertEqual(set(grad_metrics.MAX_METRICS), {"abs_max", "token_norm_max", "token_norm_ratio"})
+        self.assertEqual(
+            set(grad_metrics.MAX_METRICS), {"abs_max", "token_norm_max", "token_norm_ratio", "nonfinite_fraction"}
+        )
 
     def test_sample_layers_restricts_both_schema_and_hooks(self):
         monitor = _grad_monitor([GradFakeLayer(0), GradFakeLayer(1)], log_global=False, sample_layers=[1])
@@ -1693,6 +1708,37 @@ class GradMonitorEndToEndTest(unittest.TestCase):
         self.assertTrue(latest)
         self.assertTrue(all("/layer_" not in key for key in latest))
         self.assertIn("grad_health/global_layer_out_norm", latest)
+
+    def test_rms_depth_ratio_is_stage_local_max_over_min(self):
+        """The depth ratio = max/min of this stage's per-layer rms_global."""
+        layers = [GradFakeLayer(0), GradFakeLayer(1)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=True)
+        monitor.register_hooks(model)
+        _run_grad_backward(model, torch.ones(2, GRAD_WIDTH))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="grad_health")
+        r0 = latest["grad_health/layer_0/layer_out_rms_global"]
+        r1 = latest["grad_health/layer_1/layer_out_rms_global"]
+        expected = max(r0, r1) / min(r0, r1)
+        self.assertGreater(expected, 1.0)  # the residual stack really does change the magnitude
+        self.assertAlmostEqual(latest["grad_health/global_layer_out_rms_depth_ratio"], expected, places=4)
+
+    def test_health_keys_report_and_are_clean_on_a_finite_gradient(self):
+        layers = [GradFakeLayer(0)]
+        model = GradFakeModel(layers)
+        monitor = GradHealthMonitor(log_global=True)
+        monitor.register_hooks(model)
+        _run_grad_backward(model, torch.ones(2, GRAD_WIDTH))
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="grad_health")
+        for position in grad_metrics.POSITIONS:
+            key = f"grad_health/layer_0/{position}_nonfinite_fraction"
+            self.assertIn(key, latest)
+            self.assertEqual(latest[key], 0.0)
+            self.assertIn(f"grad_health/global_{position}_rms_depth_ratio", latest)
 
 
 if __name__ == "__main__":

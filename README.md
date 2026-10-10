@@ -923,9 +923,20 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 | 9 | `{pos}_token_norm_ratio` | `.../layer_out_token_norm_ratio` | `max_t/median⁺_t` | 每层+全局 | **token 尖峰度**，max 归约 |
 | 10 | `{pos}_token_outlier_ratio` | `.../layer_out_token_outlier_ratio` | `Pr⁺(‖g_t‖>10·median⁺)` | 每层+全局 | 有多少**有梯度** token 是离群的（占比，分母为有梯度 token） |
 | 11 | `{pos}_token_zero_ratio` | `.../layer_out_token_zero_ratio` | `Pr(‖g_t‖=0)` | 每层+全局 | 没有梯度的 token 占比（被 loss mask 掉的位置） |
+| 12 | `{pos}_nonfinite_fraction` | `.../layer_out_nonfinite_fraction` | `Pr(¬isfinite(g))` | 每层+全局 | NaN/Inf 元素占比，**bf16/fp16 溢出的首要告警**，max 归约 |
+
+> 以下为 **megatron-only**（paddlefleet 侧暂未接入，key 命名预留一致）：
+
+- `{pos}_nonfinite_fraction`（上表第 12 条）—— 一次 elementwise `isfinite`，不排序；max 归约所以单个微批/卡/层
+  的局部溢出不会被干净的那些平均没。`abs_max` 遇尖峰会变 NaN 但没法作为告警量，这条才是干净的告警信号。
+- `grad_health/global_{pos}_rms_depth_ratio` —— 本 PP stage 内 `rms_global` 的 `max_层/min_层`，衡量梯度幅度沿
+  深度的离散度（≈1=残差流均匀传导，偏大=某层放大或吃掉梯度）。**按 PP stage 局部计算**：monitor 从不跨 PP 归约，
+  多段 PP 下每个 stage 用同一 key 吐自己的值，跨卡会被平均成「各 stage 比值的均值」，不是全深度比。要全深度 profile
+  请在日志下游用逐层 `rms_global` 自行算 max/min。比值里 scale 自动约掉，故不参与 AMP de-scale。
 
 采集方式：`forward_post_hook` 只负责拿到输出张量并在其上 `register_hook`，所有归约都在反向里发生，
-前向路径的额外开销是每模块一次 `register_hook`。
+前向路径的额外开销是每模块一次 `register_hook`。`rms_depth_ratio` 在 flush（冷路径）从逐层 `rms_global`
+累加器派生，不进 hook。
 
 ### 三类指标怎么分工
 
@@ -1242,3 +1253,5 @@ setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode
 | **Grad** | `{pos}_token_norm_ratio` | `max_t/median⁺_t` | max | token 尖峰度; median 只取有梯度的 token |
 | **Grad** | `{pos}_token_outlier_ratio` | `Pr⁺(‖g_t‖>10·median⁺)` | mean | 离群 token 占比; 分母为有梯度 token |
 | **Grad** | `{pos}_token_zero_ratio` | `Pr(‖g_t‖=0)` | mean | 无梯度 token 占比 (被 loss mask 掉的位置) |
+| **Grad** | `{pos}_nonfinite_fraction` | `Pr(¬isfinite(g))` | max | NaN/Inf 占比; bf16/fp16 溢出告警 (megatron-only) |
+| **Grad** | `global_{pos}_rms_depth_ratio` | `max_层/min_层 rms_global` | mean | 梯度幅度沿深度离散度; **PP stage 局部** (megatron-only) |

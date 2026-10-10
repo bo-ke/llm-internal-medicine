@@ -56,6 +56,9 @@ MAX_AGGREGATED_SUFFIXES = (
     # grad_health's token peakiness: a max within a rank, so it has to be a max
     # across ranks too, or the spike is averaged away by world_size.
     "token_norm_ratio",
+    # grad_health's NaN/Inf fraction: max across ranks so a localized overflow is
+    # not diluted to near-zero by the clean ranks.
+    "nonfinite_fraction",
 )
 
 # Absolute-threshold channel counts: the threshold is the trailing token

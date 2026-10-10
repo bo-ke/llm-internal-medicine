@@ -50,6 +50,7 @@ from ...core.grad_reduce import (
 from .base import TorchProbe
 from .grad_metrics import (
     GLOBAL_METRICS,
+    HEALTH_METRICS,
     MAX_AGGREGATED,
     METRICS,
     SCALE_INVARIANT,
@@ -353,9 +354,26 @@ class GradHealthMonitor(TorchProbe):
                 targets.append((global_idx, position, module))
 
         for layer_idx, position, _module in targets:
-            for metric in METRICS + GLOBAL_METRICS + TOKEN_METRICS:
+            for metric in METRICS + GLOBAL_METRICS + TOKEN_METRICS + HEALTH_METRICS:
                 self.declare_layer_metric(layer_idx, f"{position}_{metric}")
         return targets, len(layers)
+
+    def _declare_depth_ratio_globals(self, positions) -> None:
+        """Declare the per-stage ``rms_global`` depth-ratio globals, once, pre-allocate.
+
+        **Stage-local by construction.** The ratio is max/min of ``rms_global`` over
+        the layers *this PP rank holds*; the monitor never reduces across PP, so under
+        pipeline parallel every stage emits the same key with its own value and the
+        cross-rank mean is an average of per-stage ratios -- not the full-depth ratio.
+        The true depth profile is the per-layer ``rms_global`` series, which already
+        reaches the log sink from every stage.
+        """
+        if not self.log_global:
+            return
+        for position in sorted(positions):
+            key = self._global_key(f"{position}_rms_depth_ratio")
+            if key not in self._mean_keys and key not in self._disabled_keys:
+                self.declare_mean(key)
 
     def register_hooks(self, model: nn.Module, layer_offset: int = 0):
         self._init_parallel_state()
@@ -365,6 +383,7 @@ class GradHealthMonitor(TorchProbe):
             return
         device = next((p.device for p in model.parameters()), None)
         assert device is not None, "model has no parameters; cannot pick a device"
+        self._declare_depth_ratio_globals({position for _idx, position, _m in targets})
         self.allocate_buffers(device)
         self._build_exact_norm_state([(model, targets)], device)
         self._attach_hooks(targets)
@@ -553,12 +572,34 @@ class GradHealthMonitor(TorchProbe):
                         series.append(("norm_global", norm_global[i]))
                     for metric, value in series:
                         self.record_layer_metric(layer_idx, f"{position}_{metric}", value)
+                if self.log_global:
+                    self._record_depth_ratios(slots, rms_global)
         except Exception as exc:
             if self.verbose and not self._exact_warned:
                 logger.error(f"[GradMonitor] exact-norm reduction failed: {exc}")
                 self._exact_warned = True
         finally:
             self._reset_sq_accum()
+
+    def _record_depth_ratios(self, slots, rms_global) -> None:
+        """Per-position max/min of ``rms_global`` over this stage's live layers.
+
+        A spread of the gradient magnitude across depth: ~1 means the residual
+        stream carries the gradient evenly, a large value flags a layer where it
+        blows up or dies. Stage-local (see ``_declare_depth_ratio_globals``). The
+        scale cancels in the ratio, so it needs no AMP de-scale (``SCALE_INVARIANT``).
+        """
+        by_position: dict[str, list[torch.Tensor]] = {}
+        for i, (layer_idx, position) in enumerate(slots):
+            if self._sq_micro[(layer_idx, position)] == 0:
+                continue
+            by_position.setdefault(position, []).append(rms_global[i])
+        for position, vals in by_position.items():
+            key = self._global_key(f"{position}_rms_depth_ratio")
+            if key in self._disabled_keys or key not in self._gpu_acc:
+                continue
+            stacked = torch.stack(vals)
+            self.record_mean(key, stacked.max() / stacked.min().clamp(min=1e-30))
 
     def _flush_buffers(self) -> None:
         self.finalize_scaled_grad_metrics()
@@ -597,6 +638,8 @@ def setup_grad_monitor(
     if any(targets for _, targets in chunk_targets):
         device = next((p.device for m in models for p in m.parameters()), None)
         assert device is not None, "no parameters across model chunks; cannot pick a device"
+        positions = {position for _m, targets in chunk_targets for _idx, position, _mod in targets}
+        monitor._declare_depth_ratio_globals(positions)
         monitor.allocate_buffers(device)
         monitor._build_exact_norm_state(chunk_targets, device)
         for _, targets in chunk_targets:

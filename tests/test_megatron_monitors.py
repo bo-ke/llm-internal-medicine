@@ -1454,6 +1454,16 @@ class GradMagnitudeMathTest(unittest.TestCase):
         finally:
             grad_metrics._NONFINITE_CHUNK = orig
 
+    def test_count_nonfinite_is_correct_on_a_noncontiguous_gradient(self):
+        # A transposed (non-contiguous) gradient must be counted in place via ``narrow``;
+        # ``reshape(-1)`` would clone the whole tensor first.
+        base = torch.ones(3, 4)
+        base[1, 2] = float("nan")
+        base[0, 0] = float("inf")
+        nc = base.t()  # [4, 3], non-contiguous
+        self.assertFalse(nc.is_contiguous())
+        self.assertEqual(int(grad_metrics.count_nonfinite(nc)), 2)
+
     def test_every_hooked_position_is_a_declared_position(self):
         positions = [position for position, _module in grad_monitor._branch_modules(GradFakeLayer(0))]
         self.assertEqual(positions, list(grad_metrics.POSITIONS))
@@ -1728,25 +1738,35 @@ class GradMonitorEndToEndTest(unittest.TestCase):
         latest = training_logs.get_latest(prefix="grad_health")
         self.assertGreater(latest["grad_health/layer_0/layer_out_norm"], latest["grad_health/layer_1/layer_out_norm"])
 
-    def test_monitored_forward_with_no_records_still_runs_the_reduction(self):
-        """P1: a rank that monitored its forward must join the collective with zero
-        buffers even if nothing required grad -- otherwise peers hang on all_reduce."""
+    def test_recompute_first_pass_still_joins_the_reduction(self):
+        """P1: the recompute no_grad first forward (which every rank runs for every
+        block) must set the participation flag via the real forward hook, so a rank
+        whose backward never replays this block still enters the collective. No manual
+        flag -- this drives the actual hook path under ``torch.no_grad()``."""
         monitor = GradHealthMonitor(log_global=False)
-        monitor.register_hooks(GradFakeModel([GradFakeLayer(0)]))
-        monitor._hooked_this_step = True  # forward ran under monitoring; nothing recorded
+        model = GradFakeModel([GradFakeLayer(0)])
+        monitor.register_hooks(model)
         calls = []
         orig = monitor._reducer.reduce
         monitor._reducer.reduce = lambda sq, counts: calls.append(1) or orig(sq, counts)
+        with torch.no_grad():  # recompute first pass / inference: no backward replays
+            model(torch.ones(2, GRAD_WIDTH))
+        self.assertTrue(monitor._hooked_this_step, "no_grad forward must still mark participation")
         monitor.step()
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 1, "reduction must run despite zero records")
 
-    def test_unmonitored_step_skips_the_reduction(self):
-        """The flip side: with no monitored forward this step, no rank reduces."""
-        monitor = GradHealthMonitor(log_global=False)
-        monitor.register_hooks(GradFakeModel([GradFakeLayer(0)]))
-        monitor._hooked_this_step = False
+    def test_off_phase_step_skips_the_reduction(self):
+        """The flip side, via the real path: on a non-sampling step the forward hook
+        does not set the flag, so no rank reduces."""
+        monitor = GradHealthMonitor(log_global=False, monitor_interval=2)
+        model = GradFakeModel([GradFakeLayer(0)])
+        monitor.register_hooks(model)
         calls = []
-        monitor._reducer.reduce = lambda sq, counts: calls.append(1)
+        orig = monitor._reducer.reduce
+        monitor._reducer.reduce = lambda sq, counts: calls.append(1) or orig(sq, counts)
+        monitor.step_count = 1  # 1 % 2 != 0 -> off-phase
+        _run_grad_backward(model, torch.ones(2, GRAD_WIDTH))
+        self.assertFalse(monitor._hooked_this_step)
         monitor.step()
         self.assertEqual(calls, [])
 

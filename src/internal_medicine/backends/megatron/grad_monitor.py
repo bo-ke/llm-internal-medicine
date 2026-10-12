@@ -318,12 +318,8 @@ class GradHealthMonitor(TorchProbe):
         self._sq_micro: dict[tuple[int, str], int] = {}
         self._reducer: ExactNormReducer | None = None
         self._exact_warned = False
-        # Set by the forward hook on every monitored (sampling-step) forward, before
-        # any requires_grad / record decision. It is the collective gate: all ranks of
-        # a reduction group run the monitored forward in lockstep on a sampling step,
-        # so this is rank-consistent, whereas "did I record anything" is not -- a rank
-        # whose outputs don't require grad records nothing yet must still join the
-        # all_reduce with zero buffers, or its peers hang.
+        # Collective gate: set by the forward hook on any sampling-step forward (phase,
+        # not grad), so it stays rank-consistent even under recompute. See the hook.
         self._hooked_this_step = False
 
     # ------------------------------------------------------------------
@@ -445,11 +441,15 @@ class GradHealthMonitor(TorchProbe):
         """
 
         def hook_fn(module, args, output):
-            if not self._should_monitor():
+            # Participation gates on the sampling PHASE alone (not grad-enabled), so the
+            # flag is set on the recompute no_grad first pass too -- which every rank runs
+            # for every block -- keeping it rank-consistent even when a rank's backward
+            # never replays this block. The grad guard below only governs capture.
+            if not self._interval_reached():
                 return None
-            # Mark participation before any per-output decision: the flush collective
-            # gates on this, and it must be set even when the output needs no grad.
             self._hooked_this_step = True
+            if not torch.is_grad_enabled():
+                return None
             try:
                 tensor = _output_tensor(output)
                 if tensor is None or not tensor.requires_grad:

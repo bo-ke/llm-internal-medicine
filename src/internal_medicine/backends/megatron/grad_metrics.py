@@ -20,10 +20,10 @@ from __future__ import annotations
 
 import torch
 
-# Bound the per-chunk temporary when counting NaN/Inf. A whole-tensor ``bool.sum()``
+# Target per-chunk element budget when counting NaN/Inf. A whole-tensor ``bool.sum()``
 # promotes to int64 and materializes a full-size (8 B/elem) copy on CUDA, re-adding
 # the kind of transient this module avoids; counting in chunks keeps it ~this many
-# elements. The gradient is read as a view, so no full-size copy is ever made.
+# elements.
 _NONFINITE_CHUNK = 1 << 23
 
 
@@ -34,11 +34,21 @@ def count_nonfinite(value: torch.Tensor) -> torch.Tensor:
     huge finite count keeps the later ``float()`` exact: ``finite_count.float()``
     rounds once ``finite_count`` passes 2**24, which silently floors a handful of
     NaNs to a fraction of 0.
+
+    Chunks with ``narrow`` along the largest dim -- a view, so a non-contiguous
+    (e.g. transposed) gradient is read in place. ``reshape(-1)`` would clone the whole
+    tensor first on such inputs, defeating the chunking.
     """
-    flat = value.reshape(-1)
     total = torch.zeros((), dtype=torch.int64, device=value.device)
-    for start in range(0, flat.numel(), _NONFINITE_CHUNK):
-        total = total + (~torch.isfinite(flat[start : start + _NONFINITE_CHUNK])).sum()
+    if value.dim() == 0:
+        return total + (~torch.isfinite(value)).sum()
+    dim = max(range(value.dim()), key=lambda d: value.shape[d])
+    size = value.shape[dim]
+    row_numel = max(1, value.numel() // size)
+    step = max(1, _NONFINITE_CHUNK // row_numel)
+    for start in range(0, size, step):
+        chunk = value.narrow(dim, start, min(step, size - start))
+        total = total + (~torch.isfinite(chunk)).sum()
     return total
 
 

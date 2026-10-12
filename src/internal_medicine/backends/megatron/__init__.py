@@ -5,6 +5,7 @@ import logging
 from ...core.metric_families import parse_exclusions, validate_exclusions
 from .base import TorchProbe
 from .gather import install_gather_fn
+from .grad_monitor import GradHealthMonitor, setup_grad_monitor
 from .massive_activation_monitor import MassiveActivationMonitor, setup_massive_activation_monitor
 from .mhc_monitor import MHCHealthMonitor, setup_mhc_monitor
 from .moe_monitor import MoESpecialistMonitor, setup_moe_monitor
@@ -20,6 +21,7 @@ _MONITOR_MAP = {
     "ple_health": setup_ple_monitor,
     "massive_act": setup_massive_activation_monitor,
     "mhc_health": setup_mhc_monitor,
+    "grad_health": setup_grad_monitor,
 }
 
 _ALWAYS_ON_MONITORS = {"optim": setup_optim_update_monitor}
@@ -81,6 +83,8 @@ __all__ = [
     "setup_massive_activation_monitor",
     "MHCHealthMonitor",
     "setup_mhc_monitor",
+    "GradHealthMonitor",
+    "setup_grad_monitor",
     "OptimUpdateMonitor",
     "setup_optim_update_monitor",
 ]

@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
+from .layer_discovery import find_transformer_layers
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
@@ -296,25 +297,7 @@ class MassiveActivationMonitor(TorchProbe):
         logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
 
     def _find_transformer_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
-        if hasattr(model, "module"):
-            model = model.module
-
-        layers = None
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            layers = model.decoder.layers
-        elif hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            layers = model.encoder.layers
-        elif hasattr(model, "layers"):
-            layers = model.layers
-        elif hasattr(model, "language_model"):
-            lm = model.language_model
-            if hasattr(lm, "decoder") and hasattr(lm.decoder, "layers"):
-                layers = lm.decoder.layers
-
-        if layers is None:
-            return []
-
-        return list(enumerate(layers))
+        return find_transformer_layers(model)
 
     def _resolve_lm_head(self, model: nn.Module):
         """Return ``(lm_head_weight, final_norm)`` for this model chunk, else ``(None, None)``.

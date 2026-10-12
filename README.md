@@ -142,7 +142,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                     # 全局聚合指标
 ```
 
-- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update` | `kda_health` | `dsa_health`
+- `monitor_name`: `ape_health` | `moe_health` | `qk_stats` | `massive_act` | `ple_health` | `mhc_health` | `vha_health` | `attn_update` | `mlp_update` | `kda_health` | `dsa_health` | `grad_health`
 - `global_idx`: 全局层索引。优先取模块自带的 `layer.layer_number`（0-based 全局编号）；取不到时回退到
   `pp_rank × local_layers + local_idx`。`num_empty_layers_add_in_head > 0` 时所有层号整体偏移该值，看板对号要减掉
 - `_mtp`: 仅 MTP layer 带有的层类型标记，随指标走现有聚合和日志链路
@@ -900,8 +900,9 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 
 ## 十、Grad Health Monitor (grad_health)
 
-**仅 paddlefleet。** 前面的 monitor 看的都是前向量级，这一个看反向：每层、每个模块输出上的
-**激活梯度** `dL/d(activation)` 的 L2 范数。回答「梯度往回走的路上是被放大还是被吃掉」。
+**paddlefleet + megatron 双后端。** 前面的 monitor 看的都是前向量级，这一个看反向：每层、每个模块
+输出上的 **激活梯度** `dL/d(activation)` 的 L2 范数。回答「梯度往回走的路上是被放大还是被吃掉」。
+两个后端 key 命名一致；megatron 侧不含 MTP 层、也不按 attn_type 分标签，fp16 需 trainer 侧接线（见下）。
 
 三个位置（`position`），命名与 `massive_act` 的前向位置对齐，同层的前向幅度与反向幅度可以并排看：
 
@@ -914,17 +915,29 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 | 1 | `{pos}_norm` | `grad_health/.../layer_out_norm` | `‖g‖₂` | 每层+全局 | L2 grad norm，跨 step 看趋势 |
 | 2 | `{pos}_rms` | `grad_health/.../layer_out_rms` | `‖g‖₂/√N` | 每层+全局 | 去掉形状依赖，**跨层可比**的那条 |
 | 3 | `{pos}_abs_max` | `grad_health/.../layer_out_abs_max` | `max\|g\|` | 每层+全局 | 尖峰探测，max 归约 |
-| 4 | `{pos}_norm_mb` | `.../layer_out_norm_mb` | `√(Σ_分片 g²)` | 每层+全局 | 单微批**完整**张量的 L2；不分片的布局下等于 `norm` |
+| 4 | `{pos}_norm_mb` | `.../layer_out_norm_mb` | `√(Σ_分片 g² / 微批数)` | 每层+全局 | 分片合并后的**完整**单微批张量 L2，按微批取**均方根**；仅单微批（无梯度累积）时等于 `norm`，多微批时 `norm` 取算术均值、`norm_mb` 取均方根，二者发散 |
 | 5 | `{pos}_rms_global` | `.../layer_out_rms_global` | `√(Σg²/ΣN)` | 每层+全局 | **精确**全局 RMS；与集群规模、并行布局、gas 全部无关 |
 | 6 | `{pos}_norm_global` | `.../layer_out_norm_global` | `√(Σg²)` | 每层+全局 | 全 global batch 的 L2；随 `√(world×gas)` 增长 |
 | 7 | `{pos}_token_norm_max` | `.../layer_out_token_norm_max` | `max_t‖g_t‖₂` | 每层+全局 | 最响 token 的梯度范数，max 归约 |
-| 8 | `{pos}_token_norm_p99` | `.../layer_out_token_norm_p99` | `Q₉₉(‖g_t‖₂)` | 每层+全局 | token 尾部形状；与 max 的距离=孤立一个还是一片 |
-| 9 | `{pos}_token_norm_ratio` | `.../layer_out_token_norm_ratio` | `max_t/median_t` | 每层+全局 | **token 尖峰度**，max 归约 |
-| 10 | `{pos}_token_outlier_ratio` | `.../layer_out_token_outlier_ratio` | `Pr(‖g_t‖>10·median⁺)` | 每层+全局 | 有多少 token 是离群的（占比，非计数） |
+| 8 | `{pos}_token_norm_p99` | `.../layer_out_token_norm_p99` | `Q₉₉⁺(‖g_t‖₂)` | 每层+全局 | token 尾部形状（仅有梯度 token）；与 max 的距离=孤立一个还是一片 |
+| 9 | `{pos}_token_norm_ratio` | `.../layer_out_token_norm_ratio` | `max_t/median⁺_t` | 每层+全局 | **token 尖峰度**，max 归约 |
+| 10 | `{pos}_token_outlier_ratio` | `.../layer_out_token_outlier_ratio` | `Pr⁺(‖g_t‖>10·median⁺)` | 每层+全局 | 有多少**有梯度** token 是离群的（占比，分母为有梯度 token） |
 | 11 | `{pos}_token_zero_ratio` | `.../layer_out_token_zero_ratio` | `Pr(‖g_t‖=0)` | 每层+全局 | 没有梯度的 token 占比（被 loss mask 掉的位置） |
+| 12 | `{pos}_nonfinite_fraction` | `.../layer_out_nonfinite_fraction` | `Pr(¬isfinite(g))` | 每层+全局 | NaN/Inf 元素占比，**bf16/fp16 溢出的首要告警**，max 归约 |
+
+> 以下为 **megatron-only**（paddlefleet 侧暂未接入，key 命名预留一致）：
+
+- `{pos}_nonfinite_fraction`（上表第 12 条）—— 一次 elementwise `isfinite`，不排序；max 归约所以单个微批/卡/层
+  的局部溢出不会被干净的那些平均没。`abs_max` 遇尖峰会变 NaN 但没法作为告警量，这条才是干净的告警信号。
+- `grad_health/global_{pos}_rms_depth_ratio` —— 本 PP stage 内 `rms_global` 的 `max_层/min_层`，衡量梯度幅度沿
+  深度的离散度（≈1=残差流均匀传导，偏大=某层放大或吃掉梯度）。**按 PP stage 局部计算**：monitor 从不跨 PP 归约，
+  多段 PP 下每个 stage 用同一 key 吐自己的值，跨卡会被平均成「各 stage 比值的均值」，不是全深度比。要全深度 profile
+  请在日志下游用逐层 `rms_global` 自行算 max/min。比值里 scale 自动约掉，故不参与 AMP de-scale。stage 只有 1 层时
+  比值恒为 1、无信息，故**不声明也不上报**；`rms_global=0` 的层（冻结/整层被 mask）从 min 里剔除，免得一个死层把比值顶到 `1/eps`。
 
 采集方式：`forward_post_hook` 只负责拿到输出张量并在其上 `register_hook`，所有归约都在反向里发生，
-前向路径的额外开销是每模块一次 `register_hook`。
+前向路径的额外开销是每模块一次 `register_hook`。`rms_depth_ratio` 在 flush（冷路径）从逐层 `rms_global`
+累加器派生，不进 hook。
 
 ### 三类指标怎么分工
 
@@ -942,38 +955,48 @@ flush 时把整个 schema 的平方和与计数拼成**一个张量**做归约 �
 **两者绝不串联。** 早期版本在 cp 归约的结果上继续做 dp 归约，隐含假设两个秩集合正交。`sharding_first`
 + `data_parallel_size=1` 时样本铺在 sharding 上，`_DATA_PARALLEL_GROUP` 跨了 cp，于是 cp 的贡献被数两次，
 `norm_global` 偏高 `√cp`（cp=2 时 +41%），而数字本身看不出任何异常。所以现在成员关系是**检查**出来的，
-不是假设的（见 `grad_reduce.py`）：
+不是假设的（见 `core/grad_reduce.py`，两个后端共用；`paddlefleet/grad_reduce.py` 只是转发）：
 
 - 经过同一个 rank 的两个 mesh 组正交 ⟺ 交集恰好只有这个 rank；与已选组重叠更多的候选被丢掉而不是重复
   计数。秩集合取自组本身，因为**只看 size 分不出嵌套组和不交组**
 - 候选按 size 从大到小试，于是已经跨满数据维的组一次覆盖到位，挡住嵌套在里面的 cp 被再加一遍
-- 已选组的 size 之积必须等于 `world_size / pp_size`。对不上时 **`norm_global` 直接不发**（部分覆盖会让它
-  变成子批的范数），而 `rms_global` 在任何子集上都是无偏估计，继续上报；同时打一条 warning 列出所有候选
-  组及其 size
+- 已选组的 size 之积必须等于**持有不同样本**的 rank 数：`world_size / (pp_size × 复制维)`。`pp` 各 rank
+  持有不同层，从不计入；不开 SP 时 TP 内激活是复制的、那些 rank 不带新样本，所以复制维 = `tp_size`，
+  开 SP 时 TP 参与分片、复制维 = 1。对不上时 **`norm_global` 直接不发**（部分覆盖会让它变成子批的范数），
+  而 `rms_global` 在任何子集上都是无偏估计，继续上报；同时打一条 warning 列出所有候选组及其 size
 - `ep` 是候选而不是预设冗余：它是否嵌在数据维里取决于 topo order，交给正交性检查逐 run 回答
 - `pp` 从不求和：各 rank 持有不同层，key 集合不同，跨 PP 归约会因形状不匹配 hang
 
-**7–10 是 token 轴分解，零通讯。** `abs_max` 找的是最大的单个**元素**，无法区分「某个 token 整体很响」
+**7–11 是 token 轴分解，零通讯。** `abs_max` 找的是最大的单个**元素**，无法区分「某个 token 整体很响」
 （数据问题：罕见 token、EOS、脏样本）和「某个格子跑飞」（数值/channel 问题），而这两者要用相反的手段
 处理。token 轴而非 channel 轴是对的：`massive_act` 按 channel 分解是因为 massive activation 是 channel
-现象，而梯度尖峰通常由个别 token 承载。四条都跨卡精确且不需要 collective —— 三个位置都是投影后的完整
-hidden，每张卡持有的是**完整 token**，所以 max 跨 rank 就是全局 max；`token_outlier_ratio` 用占比而非
-计数也是同一个原因（计数是每片的）。
+现象，而梯度尖峰通常由个别 token 承载。
+
+> **跨卡口径不统一（重要）。** 不是「四条都跨卡精确」。只有 `token_norm_max` 精确（每卡持有完整 token，
+> max 跨 rank 即全局 max），`token_zero_ratio` 在等分片时精确（分数求均值）。而 `token_norm_ratio`（max/median）、
+> `token_norm_p99`、`token_outlier_ratio` 是**每片各算再聚合**（ratio 取 max、p99/outlier 取 mean），**不等于**
+> 全局分位数：分位数不这么规约，离群占比还用的是每片自己的 median。反例：两片范数分别全 1、全 100，聚合得
+> ratio=1、P99=50.5、outlier=0，而合并全体 token 应是 ratio=100、P99≈100、outlier=50%。这三条请当作**每片的尖峰
+> 探测**，不是全 batch 分位；要全 batch 幅度用 `rms_global`。要精确全局分位数需要 flush 时做分布规约（直方图），
+> 属于额外特性，尚未实现。
 
 判读：`token_norm_ratio` 高而元素级尾部正常 → 少数 token 整体很响；反之 → 少数格子跑飞。
 
-**median 只在有梯度的 token 上取。** 被 loss mask 掉的位置是整行精确 0，把它们算进 median 会让 median 贴
-在 0 上，`token_norm_ratio` 于是变成「这个 batch 被 mask 了多少」而不是尖峰度 —— 32 卡 8k 实测出的
-2000~19340 就是这么来的。现在用 `nanmedian` 只对非零行取中位数，`token_outlier_ratio` 的 10× 阈值也相对
-这个 median；被 mask 的比例由 `token_zero_ratio` 单独一条曲线报出来，不再污染别的指标。全部 token 都被
-mask 的极端微批会退化成 0 而不是 NaN。
+**median、p99、离群占比都只在有梯度的 token 上取。** 被 loss mask 掉的位置是整行精确 0，把它们算进
+median 会让 median 贴在 0 上，`token_norm_ratio` 于是变成「这个 batch 被 mask 了多少」而不是尖峰度 ——
+32 卡 8k 实测出的 2000~19340 就是这么来的。现在 median 用 `nanmedian`、p99 用 `nanquantile` 都只对非零行
+取；`token_outlier_ratio` 的 10× 阈值相对这个 median，且**占比分母也是有梯度 token 数**（否则 mask 比例
+一高分母就被稀释）。被 mask 的比例由 `token_zero_ratio` 单独一条曲线报出来，不再污染别的指标。全部 token
+都被 mask 的极端微批会退化成 0 而不是 NaN。
 
 ### 三个必须知道的口径
 
 **AMP loss scale。** 梯度 hook 看到的是**放大后**的激活梯度（量级 1e4，每次 overflow 都会变）。
-`finalize_scaled_grad_metrics` 在 `on_optimizer_begin` 把 scale 除回去 —— 那个时点 `scaler._scale`
-还是本 step 反向实际用的值。三个量对 `g` 都是一次齐次，所以一次除法同时修好 mean 与 max 累加器。
-非 AMP 或直接调用者由 `_flush_buffers` 兜底。
+paddlefleet 在 `on_optimizer_begin` 把 scale 除回去 —— 那个时点 `scaler._scale` 还是本 step 反向实际
+用的值。三个量对 `g` 都是一次齐次，所以一次除法同时修好 mean 与 max 累加器。非 AMP 或直接调用者由
+`_flush_buffers` 兜底。megatron 默认 bf16，激活梯度未被 loss-scale，指标开箱即正确；fp16 用户需在
+`optimizer.step()` 前把 grad scaler 传给 `finalize_scaled_grad_metrics(scaler)`，否则 fp16 曲线会随
+scaler 波动。
 
 **分片。** 热路径不做任何 collective（见 `.claude/skills/monitor-hook-perf-rules`），跨卡归约在 flush
 时统一做。TP/SP/CP 下每卡量的是自己那一片：`rms` 在等分片时是全局真值（每卡均方是全局均方的无偏
@@ -987,7 +1010,8 @@ grad-norm clip 报的那个数。
 
 - 没有进 `METRIC_TAXONOMY`（与 `kda_health` 相同）：所有 key 落在 fail-open 的 `other` 族，即
   「一直采集、不能按族关掉」。等真实 run 的 key corpus 进 fixture 后再补 family。
-- 只有 paddlefleet 后端。
+- megatron 侧不含 MTP 层、不按 attn_type 分标签；fp16 精确 de-scale 依赖 trainer 侧把 scaler 传进
+  `finalize_scaled_grad_metrics`。
 
 ---
 
@@ -1228,11 +1252,13 @@ setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode
 | **Grad** | `{pos}_norm` | `‖dL/d(activation)‖₂` | mean | 反向梯度量级; `pos`=layer_out/attn_out/ffn_or_moe_out |
 | **Grad** | `{pos}_rms` | `‖g‖₂/√N` | mean | 跨层可比的梯度量级 (等分片下为全局真值) |
 | **Grad** | `{pos}_abs_max` | `max\|g\|` | max | 梯度尖峰; bf16 梯度下分辨力受限 |
-| **Grad** | `{pos}_norm_mb` | `√(Σ_分片 g²)` | mean | 单微批完整张量 L2; 不分片布局下等于 `norm` |
+| **Grad** | `{pos}_norm_mb` | `√(Σ_分片 g² / 微批数)` | mean | 完整单微批张量 L2，按微批均方根; 仅单微批时等于 `norm` |
 | **Grad** | `{pos}_rms_global` | `√(Σg²/ΣN)` | mean | 精确全局 RMS; 唯一与集群规模/布局/gas 无关的 |
 | **Grad** | `{pos}_norm_global` | `√(Σg²)` | mean | 全 batch L2; 随 `√(world×gas)` 增长 |
 | **Grad** | `{pos}_token_norm_max` | `max_t‖g_t‖₂` | max | 最响 token 的梯度范数 |
-| **Grad** | `{pos}_token_norm_p99` | `Q₉₉(‖g_t‖₂)` | mean | token 尾部形状 |
+| **Grad** | `{pos}_token_norm_p99` | `Q₉₉⁺(‖g_t‖₂)` | mean | token 尾部形状; 只取有梯度的 token |
 | **Grad** | `{pos}_token_norm_ratio` | `max_t/median⁺_t` | max | token 尖峰度; median 只取有梯度的 token |
-| **Grad** | `{pos}_token_outlier_ratio` | `Pr(‖g_t‖>10·median⁺)` | mean | 离群 token 占比 |
+| **Grad** | `{pos}_token_outlier_ratio` | `Pr⁺(‖g_t‖>10·median⁺)` | mean | 离群 token 占比; 分母为有梯度 token |
 | **Grad** | `{pos}_token_zero_ratio` | `Pr(‖g_t‖=0)` | mean | 无梯度 token 占比 (被 loss mask 掉的位置) |
+| **Grad** | `{pos}_nonfinite_fraction` | `Pr(¬isfinite(g))` | max | NaN/Inf 占比; bf16/fp16 溢出告警 (megatron-only) |
+| **Grad** | `global_{pos}_rms_depth_ratio` | `max_层/min_层 rms_global` | mean | 梯度幅度沿深度离散度; **PP stage 局部** (megatron-only) |

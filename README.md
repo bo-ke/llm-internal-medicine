@@ -2,18 +2,19 @@
 
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
-包含十一大监控模块：
-- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (28 指标)
-- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标 + CSA/HCA 层 2 项)
-- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (20 指标)
-- **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
-- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 标量指标 + `n²+2n` 条逐元素映射序列，megatron 后端 16 指标；仅在开启 mHC 层时生效)
+包含十二大监控模块：
+- **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (28 核心指标；另含 router_margin / assignment_load / gate_mass / act 等后端相关族，详见下表)
+- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (megatron 9 指标；paddlefleet 另含 `entropy_std` / `attn_sink_logit` / q·k·v 范数 + CSA/HCA 层 2 项)
+- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (megatron 与 paddlefleet 各有专有指标，详见下表)
+- **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标；仅 megatron)
+- **[mHC Health](./docs/mhc_health.md)** — Manifold-Constrained Hyper-Connections 映射监控 (每 hc 模块 29 标量指标 + `n²+2n` 条逐元素映射序列，megatron 后端仅前 8 条标量；仅在开启 mHC 层时生效)
 - **[KDA Health](./docs/kda_health.md)** — Kimi Delta Attention 线性注意力层的衰减/写入/读出三通路监控 (8 指标；仅 paddlefleet；仅在模型含 KDA 层时生效)
 - **DSA Health** — DeepSeek Sparse Attention 的 indexer 健康度、选择结构、与主干稠密 attention 的一致性 (`attn_recall` / `KL`)、以及跨层选择重合度 (19 指标；仅 paddlefleet；仅在模型含 DSA 层时生效；CP>1 下 `match` 一族关闭)
 - **VHA Health** — Virtual Head Attention 的 Q Premix (近恒等虚拟头扩展) 与 Linear Postmix (`I + A Bᵗ` 低秩跨头融合) 结构监控 (仅 paddlefleet；仅在 `use_vha_attention` 时生效)
 - **APE Health** — CSA/HCA compressor APE 参数健康监控 (P0 级 7 指标；仅 paddlefleet)
-- **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅权重，不挂 forward hook)
-- **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 36 指标；仅权重)
+- **Attn Update** — QK 乘积增量 `Δ₂ = ΔW_q W_kᵗ + W_q ΔW_kᵗ` / `Δ₃ = ΔW_q ΔW_kᵗ` 的谱监控 (每项 3 指标；仅 paddlefleet；仅权重，不挂 forward hook)
+- **MLP Update** — MoE 专家 MLP 的参数增量 `ΔW_m`，按 (层 × 专家 × gate/up/down) 分开测再按层汇总 (每层 36 指标；仅 paddlefleet；仅权重)
+- **Grad Health** — 反向激活梯度 `dL/d(activation)` 的逐层 L2 健康监控 (每位置 12 指标；paddlefleet + megatron 双后端；`nonfinite_fraction` 与 `rms_depth_ratio` 仅 megatron)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
 - **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
@@ -81,10 +82,14 @@ internal_medicine_monitors:
 
 `true` 表示启用该 monitor 并使用默认参数；嵌套 dict 会作为该 monitor 的 kwargs 透传，例如上面的 `massive_act` 等价于
 `setup_internal_medicine(..., massive_act={"log_activation_rms": False, "log_post_norm_metrics": False})`。
-`log_activation_rms` 统一控制残差尺度/增益一组指标（`activation_rms` + `spectral_norm_max/min`）——`activation_rms` 由 spectral hook 的 per-token pre-RMS 免费导出，故合用一个开关。
-`log_lipschitz`（默认 `true`）控制每层 Lipschitz/梯度增益指标（`lipschitz_max/min`）——由 forward hook 在输入/输出 hidden 上注册 tensor grad hook，在反向传播采集 `‖∂L/∂x‖/‖∂L/∂y‖`。
-`log_logit_lens_entropy`（默认 **`false`**）控制 logit-lens 熵指标（`logit_lens_entropy_mean` + `logit_lens_logsumexp_mean`，均只报告 token 均值）；`log_logit_lens_cross_entropy`（默认 **`false`**）额外开启逐层交叉熵（`logit_lens_cross_entropy_mean`，末层≈LM loss，与熵共用同一次投影，只多一次 gather）——将每层残差经 LM head 投影求 softmax 熵/对数配分/对真实 token 的交叉熵，**开销较大**故默认关闭。配套参数：`logit_lens_chunk_size`（默认 `1024`，按 token 分块的 tile 大小）、`logit_lens_apply_final_norm`（默认 `true`，投影前是否过 `decoder.final_layernorm`）、`logit_lens_layers`（默认 `None`=全部持有 head 的层；传 list 只监控指定 global 层索引）。交叉熵的 label 由 head-owning chunk 上的顶层 pre-hook 从 `forward(labels=...)` 捕获，loss_mask 在模型外施加故报告未加权 token 均值。PP 下仅持有 LM head 的 stage 生效，其余 stage 为 no-op。
-`log_hidden_spectral_entropy`（默认 **`false`**）控制 post-RMSNorm 隐状态谱熵指标（`hidden_spectral_entropy`）——对归一化后 hidden 的 Gram 矩阵做 `eigvalsh` 求归一化特征值分布的熵（有效秩，衡量表征多样性/秩坍缩），无 full SVD、无 host sync。set-level 非线性量，跨 shard 均值为近似。
+
+常用的 `massive_act` 开关：
+
+- `log_activation_rms` 统一控制残差尺度/增益一组指标（`activation_rms` + `spectral_norm_max/min`）——`activation_rms` 由 spectral hook 的 per-token pre-RMS 免费导出，故合用一个开关。
+- `log_lipschitz`（默认 `true`）控制每层 Lipschitz/梯度增益指标（`lipschitz_max/min`）——由 forward hook 在输入/输出 hidden 上注册 tensor grad hook，在反向传播采集 `‖∂L/∂x‖/‖∂L/∂y‖`。
+- `log_logit_lens_entropy`（默认 **`false`**）控制 logit-lens 熵指标（`logit_lens_entropy_mean` + `logit_lens_logsumexp_mean`，均只报告 token 均值）；`log_logit_lens_cross_entropy`（默认 **`false`**）额外开启逐层交叉熵（`logit_lens_cross_entropy_mean`，末层≈LM loss，与熵共用同一次投影，只多一次 gather）——将每层残差经 LM head 投影求 softmax 熵/对数配分/对真实 token 的交叉熵，**开销较大**故默认关闭。配套参数：`logit_lens_chunk_size`（默认 `1024`，按 token 分块的 tile 大小）、`logit_lens_apply_final_norm`（默认 `true`，投影前是否过 `decoder.final_layernorm`）、`logit_lens_layers`（默认 `None`=全部持有 head 的层；传 list 只监控指定 global 层索引）。交叉熵的 label 由 head-owning chunk 上的顶层 pre-hook 从 `forward(labels=...)` 捕获，loss_mask 在模型外施加故报告未加权 token 均值。PP 下仅持有 LM head 的 stage 生效，其余 stage 为 no-op。
+- `log_hidden_spectral_entropy`（默认 **`false`**）控制 post-RMSNorm 隐状态谱熵指标（`hidden_spectral_entropy`）——对归一化后 hidden 的 Gram 矩阵做 `eigvalsh` 求归一化特征值分布的熵（有效秩，衡量表征多样性/秩坍缩），无 full SVD、无 host sync。set-level 非线性量，跨 shard 均值为近似。
+
 list 形式仍兼容，但需要按 monitor 传参时不要再额外加 `internal_medicine_monitor_kwargs` 字段。
 
 ### 读取指标
@@ -155,6 +160,10 @@ setup_internal_medicine()
 
 监控 MoE (Mixture of Experts) 路由、专家权重和负载均衡健康状况。
 
+> **后端差异（重要）**：下表 1–13 两后端都有；**14–18（`load_*`）仅 megatron**；**19–28（gate 谱 /
+> `expert_*_share`）仅 paddlefleet**。megatron 只输出 1–18（router 7 + load 5 + expert 6），paddlefleet 输出
+> 1–13、19–28 以及紧随表后那组 router/负载族。
+
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
 | 1 | `router_entropy` | `moe_health/.../router_entropy` | `-Σ(p × log(p))` | 每层+全局 | 路由分布均匀度 |
@@ -190,23 +199,27 @@ setup_internal_medicine()
 > 奇异值经 Gram 矩阵特征分解得到 (`W Wᵀ` 或 `WᵀW` 取较小方阵)，比 `svdvals` 快约 40 倍；路由专家与共享专家的 Gram 拼成一个批次求解，避免 cuSOLVER 因批次形状变化重建 workspace。
 > 随机初始化下 stable rank ≈ `mn/(√m+√n)²` 而非 `min(m,n)`（方阵约为 `n/4`），所以初值偏大是正常基线，有意义的是相对基线的下降幅度。
 
-PaddleFleet 后端还会直接从每次 router forward 的实际选择结果输出以下指标：
+**仅 PaddleFleet** 后端还会直接从每次 router forward 的实际选择结果输出以下指标（megatron 后端无）：
 
 | 指标组 | 公式 | 诊断意义 |
 |--------|------|----------|
 | `router_input_{rms,abs_max,abs_p99}` | Router 输入的 RMS、绝对最大值和绝对值 P99 | 区分输入整体放大与局部 outlier |
 | `router_entropy_norm` | `router_entropy / log(E)` | 跨不同专家数比较路由亲和度的尖锐程度 |
-| `router_margin_{mean,min,p10,p01}` | 最弱已选专家分数减最强未选专家分数 | 衡量 Top-K 决策边界的稳健程度 |
+| `router_margin_{mean,min,p10,p01,valid_ratio}` | 最弱已选专家分数减最强未选专家分数（`valid_ratio` 为有效 margin 占比） | 衡量 Top-K 决策边界的稳健程度 |
+| `router_scalar_{mean,std,max,min,ratio}` | router 打分标量的分布统计 | router logit 整体量级与离散度 |
+| `expert_bias_{max,min}` | `max/min(expert_bias)` | 专家偏置的极值（配合第 5–6 行均值/标准差） |
 | `assignment_load_*` | 对各专家实际 hard assignment 数量的分布统计 | 衡量 token 数量负载是否均衡 |
 | `gate_mass_*` | 对各专家已选正亲和度总量的分布统计 | 衡量专家获得的连续门控质量是否均衡 |
+| `{shared,routed}_act_{norm,abs_max,mean}` / `shared_routed_act_ratio` | 共享/路由专家激活输出的量级与两者比值 | 共享 vs 路由分支的激活幅度对照（`act` 族） |
 
 `assignment_load_*` 和 `gate_mass_*` 均包含 `cv`、`entropy_norm`、
 `kl_uniform`、`max_frac`、`min_frac` 与 `max_min_ratio`。它们分别回答
 “每个专家接收多少 token”和“每个专家接收多少正门控质量”，不可互相替代。
 
 > **注**: 指标 14-18 (`load_*`) 在满足以下**任一**条件时输出, 优先使用前者:
-> 1. `global_aux_loss` 已开启 (`get_aux_loss_coeff("global_aux_loss") > 0`): 复用
->    router 的 `global_tokens_per_expert` 缓冲区 (已跨 TPxDPxCP all-reduce 并在
+> 1. router 暴露了 `global_tokens_per_expert` 缓冲区 (即 global_aux_loss 路径已启用,
+>    判据为 `getattr(router, "global_tokens_per_expert", None) is not None`): 复用该
+>    缓冲区 (已跨 TPxDPxCP all-reduce 并在
 >    global batch 内累加)。该缓冲区在 `finalize_model_grads` →
 >    `reset_model_temporary_tensors` 中被清零, 因此在清零**之前**读取。
 > 2. `moe_router_enable_expert_bias=true`: 复用 mcore 在 `get_updated_expert_bias`
@@ -336,8 +349,12 @@ EP 归约批到 `step()` 里做：把各层各微批的本地值 stack 成一个
 | 10 | `attn_sink_logit` | `qk_stats/.../attn_sink_logit` | `mean(sink_logit)` | 每层+全局 | learned sink logit 量级漂移；稀疏层取 `attn_sink`，full 层取 `softmax_offset` |
 | 11 | `{q,k,v}_norm_mean` | `qk_stats/.../{q,k,v}_norm_mean` | `mean(||q/k/v||₂)` | 每层+全局 | Dense core-attention 的平均向量尺度 |
 | 12 | `{q,k,v}_norm_max` | `qk_stats/.../{q,k,v}_norm_max` | `max(||q/k/v||₂)` | 每层+全局 | Dense core-attention 的局部尺度峰值 |
+| 13 | `entropy_std` | `qk_stats/.../entropy_std` | `std(per_head_entropy)` | 每层+全局 | head 间熵的离散度 |
 
-其中 `s` 取 attention 层运行时的 `softmax_scale`；未显式设置时回退为 `1 / sqrt(head_dim)`。
+> **后端差异**：megatron 后端只输出第 1–9 条；**第 10–13 条（`attn_sink_logit`、`{q,k,v}_norm_*`、`entropy_std`）仅 paddlefleet**。
+
+其中 `s` 取 attention 层运行时的 `softmax_scale`；未显式设置时回退为 `1 / sqrt(head_dim)`
+（**此回退仅 paddlefleet 后端成立**；megatron 的 Triton kernel 固定使用 `1 / sqrt(head_dim)`，不读运行时 `softmax_scale`）。
 
 > **learnable / off-by-one softmax 的 sink 折叠**：当 `core_attention.softmax_offset`
 > 存在时（`softmax_type` 为 `learnable` / `off-by-one`），`entropy_avg` / `sink` 会把这个
@@ -417,7 +434,7 @@ global 指标已按层类型拆分，不要再把不同类型平均到一起。
 | 8 | `channel_count_gt_20` | `massive_act/.../channel_count_gt_20` | `count(per_channel_max > 20)` | 每层+全局 | 高幅度通道数量 |
 | 9 | `channel_count_gt_30` | `massive_act/.../channel_count_gt_30` | `count(per_channel_max > 30)` | 每层+全局 | 接近当前 1.5B FP4 峰值区间的通道数量 |
 | 10 | `topk_channel_norm` | `massive_act/.../topk_channel_norm` | `norm(topk(3))` | 每层+全局 | 对应论文 Figure 1 |
-| 11 | `activation_rms` | `massive_act/.../activation_rms` | `sqrt(mean(H_i^2))` | 每层+全局 | residual stream 整体 scale |
+| 11 | `activation_rms` (+ `activation_rms_std`) | `massive_act/.../activation_rms` | `sqrt(mean(H_i^2))`（`activation_rms_std` = `std_t(pre_rms_t)`，per-token RMS 离散度，**仅 megatron**） | 每层+全局 | residual stream 整体 scale |
 | 12 | `post_norm_sparsity` | `massive_act/.../post_norm_sparsity` | `mean(abs(x) < eps)` | 每层+全局 | 归一化后稀疏度 |
 | 13 | `post_norm_cosine` | `massive_act/.../post_norm_cosine` | `cos_sim(tokens)` | 每层+全局 | 近常量向量检测 |
 | 14 | `spectral_norm_max` | `massive_act/.../spectral_norm_max` | `max(post_rms / pre_rms)` | 每层+全局 | 层增益比上界，谱范数(σ_max)下界 |
@@ -430,6 +447,9 @@ global 指标已按层类型拆分，不要再把不同类型平均到一起。
 | 21 | `hidden_spectral_entropy` | `massive_act/.../hidden_spectral_entropy` | `-Σ p_i log p_i, p_i=σ_i²/‖h‖_F²` | 每层+全局 | post-norm 隐状态谱熵(有效秩)，表征多样性/秩坍缩 |
 | 22 | `{position}_{rms,abs_max,abs_p99,outlier_ratio}` | `massive_act/.../{position}_*` | 五个真实执行位置的尺度与 tail | 每层+全局 | 定位异常由 Attention、FFN/MoE 还是 residual 累积产生 |
 | 23 | `{attn,ffn}_update_rms_ratio` | `massive_act/.../{attn,ffn}_update_rms_ratio` | `RMS(residual_after-residual_before)/RMS(residual_before)` | 每层+全局 | 模块对 residual stream 的实际写入比例 |
+
+> **后端差异**：1–13 两后端都有；**14–21（`spectral_norm_*`、`lipschitz_*`、`logit_lens_*`、`hidden_spectral_entropy`）仅 megatron**；
+> **22–23（五个 `position` 族与 `{attn,ffn}_update_rms_ratio`）仅 paddlefleet**。
 
 PaddleFleet 的 `position` 为 `layer_input`、`attn_out`、`post_attn_residual`、
 `ffn_or_moe_out`、`post_ffn_residual`。两个 residual 位置从真实 forward 边界采样，update ratio
@@ -503,7 +523,10 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 `h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值。
 
 第 17-29 条对应论文 Eq. (7) 的静态与 pre-sigmoid 部分（`alpha` / `bias` / 门控 logits），
-**目前仅 paddlefleet 后端实现**，megatron 后端仍为前 16 条。
+**目前仅 paddlefleet 后端实现**。megatron 后端只实现其中 **8 条标量**（每 hc 模块）：
+表中第 1-4、9、10 行，加上两条 composite —— 后者在 megatron 侧名为 `composite_amax_gain_fwd` /
+`composite_amax_gain_bwd`（**无 `_max` 后缀，按 mean 归约**）。megatron 不实现第 5-8、11-16 行，
+也没有逐元素映射序列。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
@@ -925,7 +948,7 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 | 11 | `{pos}_token_zero_ratio` | `.../layer_out_token_zero_ratio` | `Pr(‖g_t‖=0)` | 每层+全局 | 没有梯度的 token 占比（被 loss mask 掉的位置） |
 | 12 | `{pos}_nonfinite_fraction` | `.../layer_out_nonfinite_fraction` | `Pr(¬isfinite(g))` | 每层+全局 | NaN/Inf 元素占比，**bf16/fp16 溢出的首要告警**，max 归约 |
 
-> 以下为 **megatron-only**（paddlefleet 侧暂未接入，key 命名预留一致）：
+> 以下为 **megatron-only**（paddlefleet 侧暂无这两个指标，未声明对应 key）：
 
 - `{pos}_nonfinite_fraction`（上表第 12 条）—— 一次 elementwise `isfinite`，不排序；max 归约所以单个微批/卡/层
   的局部溢出不会被干净的那些平均没。`abs_max` 遇尖峰会变 NaN 但没法作为告警量，这条才是干净的告警信号。
@@ -955,15 +978,17 @@ flush 时把整个 schema 的平方和与计数拼成**一个张量**做归约 �
 **两者绝不串联。** 早期版本在 cp 归约的结果上继续做 dp 归约，隐含假设两个秩集合正交。`sharding_first`
 + `data_parallel_size=1` 时样本铺在 sharding 上，`_DATA_PARALLEL_GROUP` 跨了 cp，于是 cp 的贡献被数两次，
 `norm_global` 偏高 `√cp`（cp=2 时 +41%），而数字本身看不出任何异常。所以现在成员关系是**检查**出来的，
-不是假设的（见 `core/grad_reduce.py`，两个后端共用；`paddlefleet/grad_reduce.py` 只是转发）：
+不是假设的（正交性检查与 `plan_total_groups` 在 `core/grad_reduce.py`，两个后端共用；下面「复制维」目标
+数的推导则在各后端自己的 `ExactNormReducer` 里，仅 megatron 实现了 tp 复制因子）：
 
 - 经过同一个 rank 的两个 mesh 组正交 ⟺ 交集恰好只有这个 rank；与已选组重叠更多的候选被丢掉而不是重复
   计数。秩集合取自组本身，因为**只看 size 分不出嵌套组和不交组**
 - 候选按 size 从大到小试，于是已经跨满数据维的组一次覆盖到位，挡住嵌套在里面的 cp 被再加一遍
 - 已选组的 size 之积必须等于**持有不同样本**的 rank 数：`world_size / (pp_size × 复制维)`。`pp` 各 rank
   持有不同层，从不计入；不开 SP 时 TP 内激活是复制的、那些 rank 不带新样本，所以复制维 = `tp_size`，
-  开 SP 时 TP 参与分片、复制维 = 1。对不上时 **`norm_global` 直接不发**（部分覆盖会让它变成子批的范数），
-  而 `rms_global` 在任何子集上都是无偏估计，继续上报；同时打一条 warning 列出所有候选组及其 size
+  开 SP 时 TP 参与分片、复制维 = 1。（此 tp 复制因子仅 megatron 侧实现；paddlefleet 用 `world/pp_size`、
+  不含复制因子，故 TP-without-SP 下它直接不发 `norm_global` 而非做修正。）对不上时 **`norm_global` 直接不发**
+  （部分覆盖会让它变成子批的范数），而 `rms_global` 在任何子集上都是无偏估计，继续上报；同时打一条 warning 列出所有候选组及其 size
 - `ep` 是候选而不是预设冗余：它是否嵌在数据维里取决于 topo order，交给正交性检查逐 run 回答
 - `pp` 从不求和：各 rank 持有不同层，key 集合不同，跨 PP 归约会因形状不匹配 hang
 
@@ -989,14 +1014,21 @@ median 会让 median 贴在 0 上，`token_norm_ratio` 于是变成「这个 bat
 一高分母就被稀释）。被 mask 的比例由 `token_zero_ratio` 单独一条曲线报出来，不再污染别的指标。全部 token
 都被 mask 的极端微批会退化成 0 而不是 NaN。
 
+> **这段 alive-only 口径（`⁺` / `nanmedian` / `nanquantile`）目前只对 megatron 后端成立。** paddlefleet 侧
+> `token_norm_p99` 用普通 `quantile`、`token_outlier_ratio` 用全体 `mean`，分母含被 mask 的 0 token（只有
+> `median` 是 alive-only）。两后端 `token_norm_ratio` 的 median、`token_norm_max`、`token_zero_ratio` 口径一致。
+
 ### 三个必须知道的口径
 
 **AMP loss scale。** 梯度 hook 看到的是**放大后**的激活梯度（量级 1e4，每次 overflow 都会变）。
 paddlefleet 在 `on_optimizer_begin` 把 scale 除回去 —— 那个时点 `scaler._scale` 还是本 step 反向实际
-用的值。三个量对 `g` 都是一次齐次，所以一次除法同时修好 mean 与 max 累加器。非 AMP 或直接调用者由
-`_flush_buffers` 兜底。megatron 默认 bf16，激活梯度未被 loss-scale，指标开箱即正确；fp16 用户需在
-`optimizer.step()` 前把 grad scaler 传给 `finalize_scaled_grad_metrics(scaler)`，否则 fp16 曲线会随
-scaler 波动。
+用的值。幅度类指标（`norm`、`rms`、`abs_max`、`norm_mb`、`rms_global`、`norm_global`、`token_norm_max`、
+`token_norm_p99` 这 8 个一次齐次量）一次除法即可同时修好 mean 与 max 累加器；而比值/占比类
+（`token_norm_ratio`、`token_outlier_ratio`、`token_zero_ratio`、`nonfinite_fraction`、`rms_depth_ratio`）
+是 scale-invariant，**megatron 的 `finalize_scaled_grad_metrics` 用 `SCALE_INVARIANT` 名单显式跳过它们**
+（除了会把它们错误缩小）。非 AMP 或直接调用者由 `_flush_buffers` 兜底。megatron 默认 bf16，激活梯度未被
+loss-scale，指标开箱即正确；fp16 用户需在 `optimizer.step()` 前把 grad scaler 传给
+`finalize_scaled_grad_metrics(scaler)`，否则 fp16 曲线会随 scaler 波动。
 
 **分片。** 热路径不做任何 collective（见 `.claude/skills/monitor-hook-perf-rules`），跨卡归约在 flush
 时统一做。TP/SP/CP 下每卡量的是自己那一片：`rms` 在等分片时是全局真值（每卡均方是全局均方的无偏
@@ -1030,7 +1062,7 @@ from internal_medicine import training_logs
 | 键名模式 | 推断模式 | 输出值 |
 |----------|----------|--------|
 | 包含 `/max` 或以 `_max` 结尾 | `max` | 历史最大值 |
-| 以 `topk_channel_norm`、`channel_max_ratio`、`channel_median`、`channel_p95`、`channel_p99`、`activation_rms` 结尾 | `max` | 历史最大值 |
+| 以 `topk_channel_norm`、`channel_max_ratio`、`channel_median`、`channel_p95`、`channel_p99`、`activation_rms`、`token_norm_ratio`、`nonfinite_fraction` 结尾 | `max` | 历史最大值 |
 | `massive_act_channel_count` 或 `channel_count_gt_*` | `max` | 历史最大值 |
 | 包含 `/min` 或以 `_min` 结尾 | `min` | 历史最小值 |
 | 其他 | `mean` | 累积均值 |
@@ -1041,15 +1073,15 @@ from internal_medicine import training_logs
 
 | 键名模式 | 聚合方式 |
 |----------|----------|
-| 包含 `_max` 或以 `/max` 结尾 | `np.max(all_ranks)` |
-| `channel_max_ratio`、`channel_median`、`channel_p95`、`channel_p99`、`topk_channel_norm`、`activation_rms` | `np.max(all_ranks)` |
+| 包含 `/max` 或以 `_max` 结尾 | `np.max(all_ranks)` |
+| `channel_max_ratio`、`channel_median`、`channel_p95`、`channel_p99`、`topk_channel_norm`、`activation_rms`、`token_norm_ratio`、`nonfinite_fraction` | `np.max(all_ranks)` |
 | `massive_act_channel_count` 或 `channel_count_gt_*` | `np.max(all_ranks)` |
-| 包含 `_min` 或以 `/min` 结尾 | `np.min(all_ranks)` |
+| 包含 `/min` 或以 `_min` 结尾 | `np.min(all_ranks)` |
 | 其他 | `np.mean(all_ranks)` |
 
 PaddleFleet 后端默认走**数值 all_reduce**：首次采样只 `all_gather_object` 各 rank 的 key 名
-以对齐 layout，之后每次采样只交换一个 float64 向量（3 次 all_reduce：SUM 值与 count、MAX、MIN），
-载荷不随 world size 增长。`all_gather_object` 保留为回退路径，`IM_DISABLE_REDUCE=1` 可切回。
+以对齐 layout，之后每次采样只交换一个 float64 向量（3 次数值 all_reduce：SUM 值与 count、MAX、MIN；
+另有每次调用 2 次定长 int64 的 layout 对齐归约），载荷不随 world size 增长。`all_gather_object` 保留为回退路径，`IM_DISABLE_REDUCE=1` 可切回。
 
 **`monitor_interval > 1` 时不要每步都调用**：`gather_and_aggregate()` 是全 world 的
 集合通信，只有采样步才可能产出指标，其余步跑的是一次空的 `all_gather_object`
@@ -1186,6 +1218,7 @@ setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode
 | **QK** | `sink` | `p(token_0)` avg | mean | 不应过高 |
 | **QK** | `entropy_min` | `min(head_H)` | min | 不应过低 |
 | **QK** | `entropy_max` | `max(head_H)` | max | 合理范围 |
+| **QK** | `entropy_std` | `std(head_H)` | mean | head 间熵离散度（仅 paddlefleet） |
 | **QK** | `sink_head_ratio` | `count(sink>threshold)/N_heads` | mean | Sink head 占比 |
 | **QK** | `sink_head_max` | `max(sink_per_head)` | max | 最强 sink head |
 | **QK** | `sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | mean | Sink vs 非Sink gap |
@@ -1201,6 +1234,7 @@ setup_monitors(model, monitors=[...], exclude_families=exclusions_for(debug_mode
 | **MassiveAct** | `channel_count_gt_30` | `count(ch > 30)` | max | 接近当前 FP4 峰值区间 |
 | **MassiveAct** | `topk_channel_norm` | `norm(topk(3))` | max | Top-K 通道范数 |
 | **MassiveAct** | `activation_rms` | `sqrt(mean(H_i^2))` | max | residual stream 整体 scale |
+| **MassiveAct** | `activation_rms_std` | `std_t(pre_rms_t)` | mean | per-token RMS 离散度（仅 megatron） |
 | **MassiveAct** | `post_norm_sparsity` | `mean(abs(x) < eps)` | mean | 归一化后稀疏度 |
 | **MassiveAct** | `post_norm_cosine` | `cos_sim(tokens)` | mean | 近常量向量检测 |
 | **MassiveAct** | `spectral_norm_max` | `max(post_rms / pre_rms)` | max | 谱范数(σ_max)下界 |

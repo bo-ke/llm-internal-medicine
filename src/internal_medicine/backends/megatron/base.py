@@ -143,11 +143,18 @@ class TorchProbe(Probe):
     def allocate_buffers(self, device, dtype: torch.dtype = torch.float32) -> None:
         """Materialize all declared accumulators on ``device``. Idempotent.
 
+        A non-CUDA ``device`` is coerced to the current CUDA device when CUDA is
+        available: the accumulators must live where the recorded tensors do.
+
         Call from ``register_hooks`` after the model is on GPU. Subsequent
         ``declare_*`` calls will raise.
         """
         if self._buffers_allocated:
             return
+        # Callers pass ``next(model.parameters()).device``, which on a VL model at
+        # pre-wrap time is the vision tower's plain ``nn.Conv3d`` — still on CPU.
+        if (device is None or torch.device(device).type != "cuda") and torch.cuda.is_available():
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
         for k in self._mean_keys:
             self._gpu_acc[k] = torch.zeros((), device=device, dtype=dtype)
             self._gpu_cnt[k] = 0

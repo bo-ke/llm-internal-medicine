@@ -988,6 +988,40 @@ class MegatronOptimUpdateMonitorTest(unittest.TestCase):
             {"optim/update_rms", "optim/param_rms", "optim/update_param_ratio"},
         )
 
+    def _run_step_retract(self, retraction, entries):
+        """Drive one step with a skewon-like inner optimizer exposing ``_retract_pending``
+        (list of ``(sum_sq 0-dim, numel, is_expert)``)."""
+        opt = _FakeDistOpt(torch.randn(4096) * 0.02)
+        opt.optimizer = SimpleNamespace(_retract_pending=list(entries))
+        monitor = OptimUpdateMonitor(retraction=retraction)
+        self.assertTrue(monitor.attach_optimizer(opt))
+        opt.apply_update(torch.randn(4096) * 1e-4)
+        opt._copy_main_params_to_model_params()
+        try:
+            return opt, monitor.step()
+        finally:
+            monitor.remove_hooks()
+
+    def test_retraction_reports_retract_rms(self):
+        torch.manual_seed(7)
+        entries = [(torch.tensor(0.5), 100, False), (torch.tensor(0.3), 300, False)]
+        opt, got = self._run_step_retract(retraction=True, entries=entries)
+        want = math.sqrt((0.5 + 0.3) / (100 + 300))
+        self.assertAlmostEqual(got["optim/retract_rms"], want, places=6)
+        self.assertAlmostEqual(
+            got["optim/retract_param_ratio"], got["optim/retract_rms"] / got["optim/param_rms"], places=9
+        )
+        self.assertAlmostEqual(
+            got["optim/retract_update_ratio"], got["optim/retract_rms"] / got["optim/update_rms"], places=9
+        )
+        self.assertEqual(opt.optimizer._retract_pending, [], "inner pending must be drained")
+
+    def test_retraction_off_omits_retract_metrics(self):
+        entries = [(torch.tensor(0.5), 100, False)]
+        _, got = self._run_step_retract(retraction=False, entries=entries)
+        self.assertNotIn("optim/retract_rms", got)
+        self.assertEqual(set(got), {"optim/update_rms", "optim/param_rms", "optim/update_param_ratio"})
+
     def test_debias_keeps_small_updates_accurate(self):
         """A bf16 theta_old rounds, which inflates the raw difference once the update is
         near the bf16 resolution — 11x at lr 3e-6. Debiasing must hold ~1.0x across the

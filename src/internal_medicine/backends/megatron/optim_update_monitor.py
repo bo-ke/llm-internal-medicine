@@ -7,6 +7,14 @@ alongside grad-norm / param-norm:
     optim/param_rms         sqrt(mean(theta_new**2))
     optim/update_param_ratio  update_rms / param_rms   (the "trust ratio", ~1e-3 healthy)
 
+With ``retraction=True`` (opt-in, Skewon only) three more are logged — the RMS of the
+per-step polar-retraction correction ``polar(X+lrB) - (X+lrB)``, drained from the inner
+optimizer's ``_retract_pending`` and pooled like update_rms:
+
+    optim/retract_rms           sqrt(mean(retraction_correction**2))
+    optim/retract_param_ratio   retract_rms / param_rms
+    optim/retract_update_ratio  retract_rms / update_rms  (fraction of net motion that is snap-back)
+
 No copy of the parameters is kept. ``MixedPrecisionOptimizer.step_with_ready_grads``
 runs ``self.optimizer.step()`` and then ``self._copy_main_params_to_model_params()``;
 between those two calls the fp32 main param already holds ``theta_new`` while the bf16
@@ -87,14 +95,25 @@ class OptimUpdateMonitor:
     ``step()`` (which runs outside any forward, so collectives are free to happen).
     """
 
-    def __init__(self, monitor_interval: int = 1, verbose: bool = False, debias_low_precision: bool = True):
+    def __init__(
+        self,
+        monitor_interval: int = 1,
+        verbose: bool = False,
+        debias_low_precision: bool = True,
+        retraction: bool = False,
+    ):
         self.monitor_interval = monitor_interval
         self.step_count = 0
         self.verbose = verbose
         self.debias_low_precision = debias_low_precision
+        self.retraction = retraction
         self._patched: list[tuple[Any, str, Any, bool]] = []
         self._pending_dense: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
         self._pending_expert: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
+        # Optional retraction-correction sums (opt-in via ``retraction``), drained from a
+        # skewon inner optimizer's ``_retract_pending``; (sum_sq, numel) per shard.
+        self._pending_dense_retract: list[tuple[torch.Tensor, int]] = []
+        self._pending_expert_retract: list[tuple[torch.Tensor, int]] = []
         self._groups_resolved = False
         self._dp_cp_group = None
         self._expt_dp_group = None
@@ -243,6 +262,25 @@ class OptimUpdateMonitor:
             else:
                 self._pending_expert.append(sums)
 
+        if self.retraction:
+            self._drain_retraction(opt)
+
+    def _drain_retraction(self, opt) -> None:
+        """Pull a skewon inner optimizer's per-step retraction sums into the retract
+        buckets. ``opt`` is the Float16 wrapper; the emerging optimizer is ``opt.optimizer``.
+        Each entry is ``(sum_sq GPU 0-dim, numel, is_expert)``; bucketed like update sums so
+        it reduces over the same groups in ``step``."""
+        inner = getattr(opt, "optimizer", None)
+        pending = getattr(inner, "_retract_pending", None)
+        if not pending:
+            return
+        for ss, n, is_expert in pending:
+            if is_expert:
+                self._pending_expert_retract.append((ss, n))
+            else:
+                self._pending_dense_retract.append((ss, n))
+        inner._retract_pending = []
+
     @staticmethod
     def _param_triples(opt):
         """``(fp32_main_shard, low_precision_shard, original_model_param)`` per param.
@@ -313,6 +351,17 @@ class OptimUpdateMonitor:
         self._all_reduce(acc, model_group)
         return acc
 
+    def _pool_retract(self, pending, shard_group, model_group, device) -> torch.Tensor:
+        """Reduce one retract bucket's ``(sum_sq, count)`` globally, mirroring ``_pool``.
+        Always issues both collectives so every rank makes the same number of calls."""
+        acc = torch.zeros(2, dtype=torch.float64, device=device)
+        for ss, n in pending:
+            acc[0] += ss.to(torch.float64)
+            acc[1] += float(n)
+        self._all_reduce(acc, shard_group)
+        self._all_reduce(acc, model_group)
+        return acc
+
     @torch.no_grad()
     def step(self, global_step: int | None = None) -> dict[str, float]:
         """Reduce the step's sums, publish the scalars, and return them.
@@ -332,6 +381,8 @@ class OptimUpdateMonitor:
         self.step_count += 1
         dense, self._pending_dense = self._pending_dense, []
         expert, self._pending_expert = self._pending_expert, []
+        dense_retract, self._pending_dense_retract = self._pending_dense_retract, []
+        expert_retract, self._pending_expert_retract = self._pending_expert_retract, []
         self.latest = {}
         if not dense and not expert:
             return self.latest
@@ -366,6 +417,21 @@ class OptimUpdateMonitor:
             f"{METRIC_PREFIX}/param_rms": param_rms,
             f"{METRIC_PREFIX}/update_param_ratio": update_rms / param_rms if param_rms > 0 else 0.0,
         }
+        if self.retraction and (dense_retract or expert_retract):
+            racc = self._pool_retract(dense_retract, self._dp_cp_group, self._mp_group, device)
+            racc += self._pool_retract(
+                expert_retract,
+                self._expt_dp_group or self._dp_cp_group,
+                self._expert_group or self._mp_group,
+                device,
+            )
+            if float(racc[1]) > 0.0:
+                retract_rms = float((racc[0] / racc[1].clamp(min=1.0)).sqrt())
+                self.latest[f"{METRIC_PREFIX}/retract_rms"] = retract_rms
+                self.latest[f"{METRIC_PREFIX}/retract_param_ratio"] = retract_rms / param_rms if param_rms > 0 else 0.0
+                self.latest[f"{METRIC_PREFIX}/retract_update_ratio"] = (
+                    retract_rms / update_rms if update_rms > 0 else 0.0
+                )
         training_logs.update(**self.latest)
         return self.latest
 
@@ -381,6 +447,8 @@ class OptimUpdateMonitor:
         self._patched = []
         self._pending_dense = []
         self._pending_expert = []
+        self._pending_dense_retract = []
+        self._pending_expert_retract = []
 
 
 def setup_optim_update_monitor(
@@ -389,6 +457,7 @@ def setup_optim_update_monitor(
     monitor_dict: dict | None = None,
     monitor_interval: int = 1,
     verbose: bool = False,
+    retraction: bool = False,
     **_ignored,
 ):
     """Enable ``optim/update_rms`` + ``param_rms``. Always installed; no opt-in needed.
@@ -398,6 +467,11 @@ def setup_optim_update_monitor(
     no ``optimizer`` given (the normal path — it does not exist at model-setup time) the
     mcore optimizer CLASSES are patched instead, which covers whatever is built later.
 
+    ``retraction`` (opt-in, default off) additionally logs ``optim/retract_rms`` +
+    ``optim/retract_param_ratio`` + ``optim/retract_update_ratio`` for Skewon: the RMS of
+    the per-step polar-retraction correction, drained from the inner optimizer's
+    ``_retract_pending`` and pooled like ``update_rms``. Absent on Muon/Adam (no retraction).
+
     ``monitor_interval`` is honoured exactly like the model-side monitors: these are
     slow-moving scalars, so reporting them every step would only add log noise and two
     collectives per step.
@@ -406,7 +480,7 @@ def setup_optim_update_monitor(
     prints ``training_logs`` by iterating ``monitor_dict`` keys as prefixes picks these up
     with no extra wiring.
     """
-    monitor = OptimUpdateMonitor(monitor_interval=monitor_interval, verbose=verbose)
+    monitor = OptimUpdateMonitor(monitor_interval=monitor_interval, verbose=verbose, retraction=retraction)
     if optimizer is not None:
         monitor.attach_optimizer(optimizer)
     else:

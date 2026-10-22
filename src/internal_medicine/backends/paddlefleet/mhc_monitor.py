@@ -26,8 +26,10 @@ Forward hooks are not enough, so three bound methods are wrapped instead (see
 ``mhc_metrics`` for what each metric means):
 
 - ``compute_mappings`` — ``h_pre`` is not in ``forward``'s return value.
-- ``_compute_h``       — the mixing logits only exist before the Sinkhorn
-  projection, and wrapping here also sidesteps the ``use_fused_mhc`` fork.
+- ``_compute_h``       — the mixing logits (mHC: Sinkhorn input; dHC: the
+  sigmoid diagonal before ``diag_embed``; iHC: none, 2-tuple return) only
+  exist inside this call, and wrapping here also sidesteps the
+  ``use_fused_mhc`` fork.
 - ``fused_h_res_h_post_bda`` — the only point where both update terms are
   visible.
 """
@@ -56,11 +58,42 @@ logger = logging.getLogger(__name__)
 # (non-mHC model, or a PaddleFleet build without hyper-connections). Bind to
 # None on import failure and gate every code path on that.
 try:
-    from paddlefleet.transformer.hyper_connection import HyperConnectionModule
+    from paddlefleet.transformer.hyper_connection import (
+        DiagonalHyperConnectionModule,
+        HyperConnectionModule,
+        IdentityHyperConnectionModule,
+    )
     from paddlefleet.transformer.transformer_layer import HyperConnectionTransformerLayer
 except Exception:  # pragma: no cover - environment dependent
     HyperConnectionModule = None
+    DiagonalHyperConnectionModule = None
+    IdentityHyperConnectionModule = None
     HyperConnectionTransformerLayer = None
+
+
+# All three HC variants share the monitored API surface: ``compute_mappings``
+# returns ``(h_pre, h_post, h_res)`` with ``h_res`` shaped ``[..., n, n]``
+# (mHC: doubly stochastic; dHC: per-token diagonal; iHC: broadcast identity),
+# and ``fused_h_res_h_post_bda`` has the same signature. The only divergence
+# is ``_compute_h``'s arity — iHC has no h_res logits at all (see
+# ``_make_logits_capture``) — which the wrappers handle, so one type tuple
+# serves discovery and every guard below.
+def _hc_module_types() -> tuple:
+    """The three HC module classes, in preference order; empty if unavailable.
+
+    A function, not a module-level constant: the optional import and the unit
+    tests swap the module attributes at runtime, so discovery must resolve
+    them on every call.
+    """
+    return tuple(
+        t
+        for t in (
+            HyperConnectionModule,
+            DiagonalHyperConnectionModule,
+            IdentityHyperConnectionModule,
+        )
+        if t is not None
+    )
 
 
 _METRIC_NAMES = (
@@ -230,7 +263,7 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         real classes rather than duck-typing, so a plain ``TransformerLayer``
         (or an ``IdentityOp`` placeholder) is never matched.
         """
-        if HyperConnectionTransformerLayer is None or HyperConnectionModule is None:
+        if HyperConnectionTransformerLayer is None or not _hc_module_types():
             return []
         layers = get_decoder_layers(chunk)
         if not layers:
@@ -249,7 +282,7 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         for item in monitor_layers:
             for comp, attr in _COMPONENTS:
                 mod = getattr(item.layer, attr, None)
-                if not isinstance(mod, HyperConnectionModule):
+                if not isinstance(mod, _hc_module_types()):
                     continue
                 entries.append((item.idx, comp, mod))
         return entries
@@ -520,6 +553,15 @@ class PaddleMHCHealthMonitor(PaddleProbe):
         ``_compute_h`` does not return and are therefore rebuilt from its own
         ``(proj, r)`` arguments plus ``mod``'s ``alpha`` / ``bias`` — see
         ``gate_logits_extrema``.
+
+        The residual-mixing return value differs across the three HC variants:
+        for mHC it is the n×n Sinkhorn input (the saturation sentinel the
+        monitor exists for); for dHC it is the ``[..., n]`` sigmoid diagonal
+        vector (same sentinel semantics, pre-``diag_embed``); iHC has **no**
+        mixing logits at all — ``_compute_h`` returns a 2-tuple, so its
+        ``h_res_logits_*`` metrics are never recorded (flush skips unrecorded
+        keys), and ``h_{pre,post}_logits_*`` are equally skipped by the early
+        return.
         """
 
         def wrapped(proj, r):
@@ -527,6 +569,9 @@ class PaddleMHCHealthMonitor(PaddleProbe):
             if not self._should_monitor():
                 return out
             try:
+                if len(out) < 3:
+                    # iHC: H_res is a fixed identity, there is nothing to saturate.
+                    return out
                 _h_pre, _h_post, h_res_logits = out
                 if not h_res_logits.stop_gradient:
 
@@ -638,8 +683,8 @@ def setup_mhc_monitor(
     Multi-chunk (VPP / interleaved 1F1B) safe: declares the schema across all
     chunks before ``allocate_buffers`` locks it, then attaches.
     """
-    # No-op guarantee #1: mHC classes unavailable -> touch nothing.
-    if HyperConnectionTransformerLayer is None or HyperConnectionModule is None:
+    # No-op guarantee #1: HC classes unavailable -> touch nothing.
+    if HyperConnectionTransformerLayer is None or not _hc_module_types():
         logger.info("[PaddleMHCMonitor] Hyper-connection classes unavailable; skipping.")
         return model
 

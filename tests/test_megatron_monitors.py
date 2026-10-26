@@ -136,6 +136,14 @@ class MegatronMoEMonitorTest(unittest.TestCase):
         self.assertIn("moe_health/global_router_entropy", latest)
         self.assertIn("moe_health/global_score_sum_max", latest)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_allocate_buffers_coerces_non_cuda_device(self):
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        monitor.declare_layer_metric(0, moe_monitor_module._ROUTER_METRICS[0])
+        monitor.allocate_buffers(torch.device("cpu"))
+        for acc in monitor._gpu_acc.values():
+            self.assertEqual(acc.device.type, "cuda")
+
     def test_step_computes_expert_metrics_even_under_no_grad(self):
         monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
         for name in moe_monitor_module._EXPERT_METRICS:

@@ -2005,7 +2005,7 @@ class MegatronHybridMHCMassiveActTest(unittest.TestCase):
         targets = monitor._prepare_layers(model)
 
         self.assertEqual([idx for idx, _, _ in targets], [0, 1, 2, 3])
-        self.assertEqual(monitor._mhc_streams, self.STREAMS)
+        self.assertEqual(monitor._residual_streams, self.STREAMS)
         self.assertEqual(monitor._hidden_size, self.HIDDEN)
         for _, wrapper, norm in targets:
             inner = wrapper.inner_layer
@@ -2093,15 +2093,29 @@ class MegatronHybridMHCMassiveActTest(unittest.TestCase):
             self.assertIn(f"massive_act/layer_0/{key}", latest)
 
 
-class MHCStreamResolveTest(unittest.TestCase):
+class ResidualStreamResolveTest(unittest.TestCase):
     def test_resolve_reads_the_model_config(self):
         model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=1)
-        self.assertEqual(layer_discovery.resolve_mhc_streams(model), (4, 4))
+        self.assertEqual(layer_discovery.resolve_residual_streams(model), (4, 4))
 
         model.config.enable_mhc_connections = False
-        self.assertEqual(layer_discovery.resolve_mhc_streams(model), (1, 4))
+        self.assertEqual(layer_discovery.resolve_residual_streams(model), (1, 4))
 
-        self.assertEqual(layer_discovery.resolve_mhc_streams(nn.Linear(2, 2)), (1, None))
+        self.assertEqual(layer_discovery.resolve_residual_streams(nn.Linear(2, 2)), (1, None))
+
+    def test_wide_residual_is_the_other_multi_stream_scheme(self):
+        # wide_residual and enable_mhc_connections are mutually exclusive in mcore, and
+        # both widen the inter-layer tensor to n*H -- the guards must engage for either.
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=1)
+        model.config.enable_mhc_connections = False
+        model.config.wide_residual = SimpleNamespace(num_streams=3)
+        self.assertEqual(layer_discovery.resolve_residual_streams(model), (3, 4))
+
+    def test_config_is_read_through_one_wrapper(self):
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=1)
+        wrapper = nn.Module()
+        wrapper.module = model
+        self.assertEqual(layer_discovery.resolve_residual_streams(wrapper), (4, 4))
 
 
 class MegatronHybridMHCMoEDiscoveryTest(unittest.TestCase):

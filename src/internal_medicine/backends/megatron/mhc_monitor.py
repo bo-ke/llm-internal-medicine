@@ -10,8 +10,10 @@ mHC (Manifold-Constrained Hyper-Connections) model:
   mapping** (cumulative product of ``h_res`` across the layers local to this
   pipeline stage / VPP chunk).
 
-Per hyper-connection module (a layer has two: ``attn`` and ``mlp``) we emit 8
-mean-aggregated series, name-prefixed by component:
+Per hyper-connection module we emit 8 mean-aggregated series, name-prefixed by
+component. In-layer mHC gives a layer two modules (``attn`` and ``mlp``);
+layer-boundary mHC on a ``HybridStack`` gives each slot one, labelled by the branch
+that slot owns:
 
     {attn,mlp}_h_pre_mean   {attn,mlp}_h_pre_std
     {attn,mlp}_h_post_mean  {attn,mlp}_h_post_std
@@ -23,9 +25,9 @@ use a forward hook. Instead we wrap the module's ``compute_mappings`` bound meth
 to capture its real ``(h_pre, h_post, h_res)`` — no recompute. Everything is
 detached and computed under ``no_grad`` (see the VRAM-safety notes on the hook).
 
-The monitor is a hard no-op unless the model actually uses the mHC layer: if the
-mHC classes cannot be imported, or no ``HyperConnectionTransformerLayer`` is
-found, ``setup_mhc_monitor`` attaches nothing and registers no metrics.
+The monitor is a hard no-op unless the model actually uses mHC: if the mHC classes
+cannot be imported, or no layer carries a ``HyperConnectionModule``,
+``setup_mhc_monitor`` attaches nothing and registers no metrics.
 
 Hot-path discipline (no D2H sync, no hook-time collectives, schema fixed at
 registration): see ``.claude/skills/monitor-hook-perf-rules``.
@@ -37,6 +39,7 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
+from .layer_discovery import find_transformer_layers, is_identity_module, unwrap_layer
 from .mhc_metrics import amax_gain, gate_stats
 
 logger = logging.getLogger(__name__)
@@ -108,43 +111,39 @@ class MHCHealthMonitor(TorchProbe):
     # Discovery
     # ------------------------------------------------------------------
 
-    def _find_layer_stack(self, model: nn.Module):
-        if hasattr(model, "module"):
-            model = model.module
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            return model.decoder.layers
-        if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            return model.encoder.layers
-        if hasattr(model, "layers"):
-            return model.layers
-        if hasattr(model, "language_model"):
-            lm = model.language_model
-            if hasattr(lm, "decoder") and hasattr(lm.decoder, "layers"):
-                return lm.decoder.layers
-        return None
+    def _layer_components(self, layer: nn.Module):
+        """``[(component, hc_module)]`` for one stack entry, ``[]`` when it has no mHC.
+
+        In-layer mHC owns one hc module per branch. Layer-boundary mHC
+        (``HyperConnectionHybridLayer`` on a ``HybridStack``) owns a single one and wraps
+        an attention-only or MLP-only slot, so the component follows the branch it has.
+        """
+        if isinstance(layer, HyperConnectionTransformerLayer):
+            return [(comp, getattr(layer, attr, None)) for comp, attr in _COMPONENTS]
+        hc = getattr(layer, "hyper_connection", None)
+        if not isinstance(hc, HyperConnectionModule):
+            return []
+        has_attn = not is_identity_module(getattr(unwrap_layer(layer), "self_attention", None))
+        return [("attn" if has_attn else "mlp", hc)]
 
     def _find_hc_modules(self, model: nn.Module, layer_offset: int = 0):
         """Return ``[(global_idx, component, hc_module)]`` for every mHC hc module.
 
-        Empty (auto-skip) when the mHC classes are unavailable or the model has no
-        ``HyperConnectionTransformerLayer``. Uses ``isinstance`` against the real
-        classes rather than duck-typing, so a plain ``TransformerLayer`` (or an
-        ``IdentityOp`` placeholder) is never matched.
+        Empty (auto-skip) when the mHC classes are unavailable or no layer carries a
+        ``HyperConnectionModule``. Matched by ``isinstance`` against the real class, so a
+        plain ``TransformerLayer`` (or an ``IdentityOp`` placeholder) is never picked up.
         """
         if HyperConnectionTransformerLayer is None or HyperConnectionModule is None:
             return []
-        layers = self._find_layer_stack(model)
-        if layers is None:
-            return []
 
         entries = []
-        num_local = len(layers)
-        for local_idx, layer in enumerate(layers):
-            if not isinstance(layer, HyperConnectionTransformerLayer):
+        layers = find_transformer_layers(model)
+        for local_idx, layer in layers:
+            components = self._layer_components(layer)
+            if not components:
                 continue
-            global_idx = self._resolve_layer_idx(layer, local_idx, num_local, layer_offset)
-            for comp, attr in _COMPONENTS:
-                mod = getattr(layer, attr, None)
+            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers), layer_offset)
+            for comp, mod in components:
                 if isinstance(mod, HyperConnectionModule):
                     entries.append((global_idx, comp, mod))
         return entries
@@ -160,10 +159,10 @@ class MHCHealthMonitor(TorchProbe):
         for global_idx, comp, _ in entries:
             for name in _METRIC_NAMES:
                 self.declare_layer_metric(global_idx, f"{comp}_{name}")
-        # The chunk root = the attn hc of the lowest-index layer; it is the first
-        # hc module executed on this stage, so it resets the composite each forward.
-        root_idx = min(gi for gi, comp, _ in entries if comp == "attn")
-        return [(gi, comp, mod, chunk_id, comp == "attn" and gi == root_idx) for gi, comp, mod in entries]
+        # The chunk root is the first hc module executed on this stage; it resets the
+        # composite each forward. Lowest layer index, attn before mlp within a layer.
+        root = min((gi, comp != "attn") for gi, comp, _ in entries)
+        return [(gi, comp, mod, chunk_id, (gi, comp != "attn") == root) for gi, comp, mod in entries]
 
     def _attach_hooks(self, targets):
         for layer_idx, comp, mod, chunk_id, is_root in targets:
@@ -311,8 +310,7 @@ def setup_mhc_monitor(
     for chunk_id, m in enumerate(models):
         targets = monitor._prepare_layers(m, chunk_id=chunk_id, layer_offset=layer_offset)
         chunk_targets.append(targets)
-        stack = monitor._find_layer_stack(m)
-        layer_offset += len(stack) if stack is not None else 0
+        layer_offset += len(find_transformer_layers(m))
 
     if any(chunk_targets):
         device = next((p.device for m in models for p in m.parameters()), None)
@@ -323,7 +321,7 @@ def setup_mhc_monitor(
         if monitor_dict is not None:
             monitor_dict["mhc_health"] = monitor
     else:
-        # No-op guarantee #2: no HyperConnectionTransformerLayer found.
+        # No-op guarantee #2: no layer carries a HyperConnectionModule.
         logger.info("[MHCMonitor] No hyper-connection layers found; skipping.")
 
     logger.info(f"[MHCMonitor] Setup complete. Monitoring {len(monitor._wrapped)} hc modules.")

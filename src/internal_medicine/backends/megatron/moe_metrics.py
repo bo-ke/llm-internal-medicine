@@ -52,48 +52,62 @@ def compute_topk_score_sum(scores: torch.Tensor, topk: int) -> dict[str, torch.T
     }
 
 
+def _as_expert_onehot(routing_map: torch.Tensor, num_experts: int | None) -> torch.Tensor | None:
+    """routing map 归一化成 bool ``[tokens, num_experts]``, 无法归一化时返回 None.
+
+    index 形 ``[tokens, topk]`` 里 ``-1`` 是无效路由 (flex dispatcher 后端的 padding
+    行/未填满的 topk), 按 mcore 自己的写法 (``router.py`` router_diagnostics) 用
+    ``scatter_add_`` + ``valid`` 掩码丢掉它们. bool/uint8 形原样返回.
+    """
+    if routing_map.dtype in (torch.bool, torch.uint8):
+        return routing_map.bool()
+    if num_experts is None:
+        return None
+    valid = routing_map >= 0
+    return (
+        torch.zeros(routing_map.shape[0], num_experts, device=routing_map.device, dtype=torch.int32)
+        .scatter_add_(1, routing_map.long().masked_fill(~valid, 0), valid.to(torch.int32))
+        .bool()
+    )
+
+
 def compute_bias_affinity_jaccard(
     routing_map_before_bias: torch.Tensor,
     routing_map_after_bias: torch.Tensor,
     num_experts: int | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     """
     计算 Bias-Affinity Jaccard 相似度.
 
     Jaccard(A, B) = |A ∩ B| / |A ∪ B|
 
+    两个 map 各自独立归一化: mcore 的 before 图恒为 bool ``[tokens, num_experts]``,
+    而 after 图在 flex dispatcher 后端下是 dense index ``[tokens, topk]`` (含 ``-1``),
+    两边形态不同是常态.
+
     Args:
         routing_map_before_bias: Bias前的routing map [tokens, topk] (index form)
             or [tokens, num_experts] (one-hot/bool form).
         routing_map_after_bias: Bias后的routing map.
-        num_experts: required when routing_map is in index form (last dim == topk).
+        num_experts: required when either routing_map is in index form.
             Pass router.num_experts. Avoids a D2H sync on the hot path.
 
     Returns:
-        jaccard: Jaccard相似度 (0-1)
+        jaccard: Jaccard相似度 (0-1), 形态无法归一化或两边 token 数不一致时返回 None.
     """
-    if routing_map_before_bias.dim() == 2:
-        is_onehot = routing_map_before_bias.shape[-1] != 1 and routing_map_before_bias.dtype in (
-            torch.bool,
-            torch.uint8,
-        )
+    if routing_map_before_bias.dim() != 2 or routing_map_after_bias.dim() != 2:
+        return None
+    if routing_map_before_bias.shape[0] != routing_map_after_bias.shape[0]:
+        return None
 
-        if not is_onehot and num_experts is not None and routing_map_before_bias.dtype not in (torch.bool, torch.uint8):
-            num_tokens, topk = routing_map_before_bias.shape
-            before_onehot = torch.zeros(
-                num_tokens, num_experts, device=routing_map_before_bias.device, dtype=torch.bool
-            )
-            after_onehot = torch.zeros(num_tokens, num_experts, device=routing_map_after_bias.device, dtype=torch.bool)
+    before = _as_expert_onehot(routing_map_before_bias, num_experts)
+    after = _as_expert_onehot(routing_map_after_bias, num_experts)
+    if before is None or after is None or before.shape != after.shape:
+        return None
 
-            for k in range(topk):
-                before_onehot.scatter_(1, routing_map_before_bias[:, k : k + 1].long(), True)
-                after_onehot.scatter_(1, routing_map_after_bias[:, k : k + 1].long(), True)
-
-            routing_map_before_bias = before_onehot
-            routing_map_after_bias = after_onehot
-
-    before = routing_map_before_bias.bool()
-    after = routing_map_after_bias.bool()
+    # before 图里 padding 行已被 compute_routing_scores_for_aux_loss 清零; 对齐到
+    # after 图, 否则 padding 行只在一侧有路由会把相似度压低.
+    after = after & before.any(dim=-1, keepdim=True)
 
     intersection = (before & after).float().sum()
     union = (before | after).float().sum()

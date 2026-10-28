@@ -12,10 +12,11 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
-from .layer_discovery import find_transformer_layers
+from .layer_discovery import find_transformer_layers, is_identity_module, resolve_mhc_streams, unwrap_layer
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
+    compute_activation_scale_stats,
     compute_grad_gain_bounds,
     compute_hidden_spectral_entropy,
     compute_logit_lens_entropy,
@@ -135,6 +136,11 @@ class MassiveActivationMonitor(TorchProbe):
         self.tp_group = None
         self._warned_per_channel_aggregate = False
         self._post_norm_failed_layers: set[int] = set()
+        # Layer-boundary mHC concatenates n residual streams on the last dim, so the
+        # inter-layer tensor is [s, b, n*H]. Resolved per chunk in _prepare_layers and
+        # used only to disable logit-lens, which needs a single hidden vector.
+        self._mhc_streams = 1
+        self._hidden_size = None
 
     def _layer_metric_names(self) -> tuple[str, ...]:
         names = [
@@ -199,28 +205,47 @@ class MassiveActivationMonitor(TorchProbe):
         except ImportError:
             pass
 
-    def _prepare_layers(self, model: nn.Module, layer_offset: int = 0) -> list[tuple[int, nn.Module]]:
+    def _prepare_layers(self, model: nn.Module, layer_offset: int = 0) -> list[tuple[int, nn.Module, nn.Module | None]]:
         layers = self._find_transformer_layers(model)
         if not layers:
             logger.warning("[MassiveActMonitor] No transformer layers found!")
             return []
+        self._resolve_residual_streams(model)
 
-        targets: list[tuple[int, nn.Module]] = []
+        targets: list[tuple[int, nn.Module, nn.Module | None]] = []
         for local_idx, layer in layers:
             global_idx = self._resolve_layer_idx(layer, local_idx, len(layers), layer_offset)
             if self.sample_layers and global_idx not in self.sample_layers:
                 continue
-            targets.append((global_idx, layer))
+            targets.append((global_idx, layer, self._resolve_input_norm(layer)))
+
+        # Without a real norm the channel/post-norm family falls back to the residual
+        # pre-hook, which cannot produce post_norm_* -- say so instead of letting the
+        # keys vanish at flush time.
+        unnormed = [idx for idx, _, norm in targets if norm is None]
+        if unnormed:
+            logger.warning(
+                "[MassiveActMonitor] %d/%d layers expose no input norm (first: %s); "
+                "post_norm_* and hidden_spectral_entropy will be absent for them.",
+                len(unnormed),
+                len(targets),
+                unnormed[:8],
+            )
 
         # Resolve the LM head once per chunk for the logit-lens metrics (entropy and/or
         # cross-entropy share it). Returns (None, None) on PP stages that don't own the
         # head weight, which keeps the metric a clean no-op there (no weight broadcast).
         head_weight, head_norm = (None, None)
         if self._logit_lens_enabled():
-            head_weight, head_norm = self._resolve_lm_head(model)
+            if self._is_mhc():
+                # The layer output is the n-stream concatenation, not a hidden vector the
+                # LM head can consume.
+                logger.warning("[MassiveActMonitor] logit-lens disabled: mHC multi-stream residual.")
+            else:
+                head_weight, head_norm = self._resolve_lm_head(model)
 
         head_owned_eligible = False
-        for global_idx, _ in targets:
+        for global_idx, _, _ in targets:
             for name in self._layer_metric_names():
                 self.declare_layer_metric(global_idx, name)
             # Logit-lens keys are declared ONLY on the head-owning chunk, and only for
@@ -241,7 +266,7 @@ class MassiveActivationMonitor(TorchProbe):
             self._label_capture_models.append(model)
         return targets
 
-    def _attach_hooks(self, targets: list[tuple[int, nn.Module]], model: nn.Module | None = None):
+    def _attach_hooks(self, targets: list[tuple[int, nn.Module, nn.Module | None]], model: nn.Module | None = None):
         # Cross-entropy: capture the forward's `labels` kwarg once per head-owning chunk.
         # A model-level pre-hook fires before the layer hooks, so _captured_labels is
         # fresh when the logit-lens hook reads it. Attaches only where CE is enabled and
@@ -250,8 +275,7 @@ class MassiveActivationMonitor(TorchProbe):
             cap_hook = model.register_forward_pre_hook(self._make_label_capture_hook(), with_kwargs=True)
             self.hooks.append(cap_hook)
         registered = 0
-        for global_idx, layer in targets:
-            norm_layer = getattr(layer, "input_layernorm", None)
+        for global_idx, layer, norm_layer in targets:
             if norm_layer is not None:
                 hook = norm_layer.register_forward_hook(
                     self.timed_hook("input_layernorm", self._make_input_layernorm_hook(global_idx)), with_kwargs=True
@@ -298,6 +322,31 @@ class MassiveActivationMonitor(TorchProbe):
 
     def _find_transformer_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
         return find_transformer_layers(model)
+
+    def _resolve_residual_streams(self, model: nn.Module):
+        """Read the mHC residual-stream count off the model config (cold path)."""
+        self._mhc_streams, self._hidden_size = resolve_mhc_streams(model)
+
+    def _is_mhc(self) -> bool:
+        return self._mhc_streams > 1 and bool(self._hidden_size)
+
+    def _resolve_input_norm(self, layer: nn.Module) -> nn.Module | None:
+        """The norm whose input is this layer's residual, or ``None`` if there is none.
+
+        Hybrid layers are attention-only or MLP-only, so the real norm is
+        ``input_layernorm`` on the former and ``pre_mlp_layernorm`` on the latter (the
+        other slot is an ``IdentityOp``). Both see the layer input, which under mHC is
+        the aggregated single-stream ``[s, b, H]`` tensor the model itself computed --
+        hence the classic H-wide channel semantics, with no merge on our side. Looked up
+        on the unwrapped layer; wrappers proxy nothing.
+        """
+        inner = unwrap_layer(layer)
+        for name in ("input_layernorm", "pre_mlp_layernorm"):
+            norm = getattr(inner, name, None)
+            if is_identity_module(norm):
+                continue
+            return norm
+        return None
 
     def _resolve_lm_head(self, model: nn.Module):
         """Return ``(lm_head_weight, final_norm)`` for this model chunk, else ``(None, None)``.
@@ -411,10 +460,7 @@ class MassiveActivationMonitor(TorchProbe):
     def _compute_spectral_norm(self, layer_idx: int, pre: torch.Tensor, post: torch.Tensor):
         if pre.shape[-1] == 0 or pre.numel() == 0 or post.numel() == 0:
             return
-        # pre is the layer input residual — the same tensor the input_layernorm /
-        # residual hook sees — so activation_rms is derived here for free from the
-        # per-token pre-RMS instead of squaring the input a second time.
-        tensor_metrics = compute_spectral_norm_bounds(pre, post, include_activation_rms=True)
+        tensor_metrics = compute_spectral_norm_bounds(pre, post)
         for name, val in tensor_metrics.items():
             self.record_layer_metric(layer_idx, name, val)
 
@@ -547,6 +593,8 @@ class MassiveActivationMonitor(TorchProbe):
             k=self.topk_channels,
             absolute_thresholds=self.absolute_thresholds,
         )
+        if self.log_activation_rms:
+            tensor_metrics.update(compute_activation_scale_stats(hidden_states))
 
         for name, val in tensor_metrics.items():
             self.record_layer_metric(layer_idx, name, val)

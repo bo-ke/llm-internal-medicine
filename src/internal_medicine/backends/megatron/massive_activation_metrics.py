@@ -57,10 +57,16 @@ def compute_per_channel_max(hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 def compute_activation_scale_stats(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Absolute scale statistics over the full residual stream."""
+    """Absolute scale statistics over the full residual stream.
+
+    ``activation_rms`` is the global RMS; ``activation_rms_std`` is the std of the
+    per-token RMS (per-token scale dispersion).
+    """
     h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
+    token_rms = h.square().mean(dim=-1).sqrt()
     return {
-        "activation_rms": h.square().mean().sqrt(),
+        "activation_rms": token_rms.square().mean().sqrt(),
+        "activation_rms_std": token_rms.std(),
     }
 
 
@@ -68,7 +74,6 @@ def compute_spectral_norm_bounds(
     pre_hidden: torch.Tensor,
     post_hidden: torch.Tensor,
     eps: float = 1e-8,
-    include_activation_rms: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Per-token residual gain ratio (post_layer_rms / pre_layer_rms) reduced to
     max/min bounds on the layer's spectral norm.
@@ -85,11 +90,9 @@ def compute_spectral_norm_bounds(
     full-vector RMS, so no TP channel reduction is needed. The max/min compose
     across token-partitioned ranks via ``training_logs.gather_and_aggregate``.
 
-    When ``include_activation_rms`` is set, the input residual's global RMS
-    (``activation_rms``) is derived from the same per-token ``pre_rms`` for free
-    (``activation_rms == sqrt(mean_t(pre_rms_t**2))``), so callers that already run
-    this function need not recompute it in a separate pass. ``activation_rms_std``
-    is the std of ``pre_rms`` across tokens (per-token RMS dispersion).
+    The ratio is scale-free, so under layer-boundary mHC (where both tensors are the
+    n residual streams concatenated) it still reads as the gain of the wrapped block
+    on the token's whole residual state -- the concatenation does not inflate it.
 
     Returns 0-dim GPU tensors (no host sync).
     """
@@ -98,14 +101,10 @@ def compute_spectral_norm_bounds(
     pre_rms = pre.square().mean(dim=-1).sqrt()
     post_rms = post.square().mean(dim=-1).sqrt()
     ratio = post_rms / pre_rms.clamp(min=eps)
-    metrics = {
+    return {
         "spectral_norm_max": ratio.max(),
         "spectral_norm_min": ratio.min(),
     }
-    if include_activation_rms:
-        metrics["activation_rms"] = pre_rms.square().mean().sqrt()
-        metrics["activation_rms_std"] = pre_rms.std()
-    return metrics
 
 
 def compute_grad_gain_bounds(

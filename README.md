@@ -164,6 +164,14 @@ setup_internal_medicine()
 > `expert_*_share`）仅 paddlefleet**。megatron 只输出 1–18（router 7 + load 5 + expert 6），paddlefleet 输出
 > 1–13、19–28 以及紧随表后那组 router/负载族。
 
+> **层发现（hybrid / mHC）**：`HybridStack` + 层边界 mHC 下 `decoder.layers[i]` 是
+> `HyperConnectionHybridLayer` 包装器，真层在 `.inner_layer` 且不代理属性。monitor 先
+> `unwrap_layer` 再探测 `mlp.router` / `moe` / `router`，所以 DSv4-Flash 这类 "attention 槽 +
+> MoE 槽" 的混合栈只在 MoE 槽上挂 hook，层号取 wrapper 的 `layer_number`。
+> `bias_affinity_jaccard` 在 bias 前/后 routing map 无法统一成 one-hot 形态时（索引形但拿不到
+> `num_experts`，或两侧 token 数不一致）跳过记录，日志里不会出现这个键，并在首次发生时打一条带
+> 形状/dtype 的 warning。
+
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
 | 1 | `router_entropy` | `moe_health/.../router_entropy` | `-Σ(p × log(p))` | 每层+全局 | 路由分布均匀度 |
@@ -454,6 +462,17 @@ global 指标已按层类型拆分，不要再把不同类型平均到一起。
 PaddleFleet 的 `position` 为 `layer_input`、`attn_out`、`post_attn_residual`、
 `ffn_or_moe_out`、`post_ffn_residual`。两个 residual 位置从真实 forward 边界采样，update ratio
 由实际 residual 差分计算，因此包含 bias、dropout、BDA 与 mHC residual mixing 的影响。
+
+> **hybrid / mHC 挂点（megatron）**：`channel_*` / `post_norm_*` / `hidden_spectral_entropy` /
+> `activation_rms*` 挂在 `inner_layer` 的真实 norm 上（attention 槽取 `input_layernorm`，MoE 槽取
+> `pre_mlp_layernorm`，另一侧是 `IdentityOp`）。norm 的输入正是 mHC 自己聚合出来的单流
+> `[s, b, H]`，所以这些指标的通道口径仍是 hidden_size、绝对尺度也是模型真实看到的那一份，
+> monitor 侧不做任何流合并。`spectral_norm_*` / `lipschitz_*` 挂在 wrapper 上，看到的是 n 路残差
+> 流拼接的 `[s, b, n*H]`，但两者都是 per-token 的比值（`post_rms/pre_rms`、`‖∂L/∂x‖/‖∂L/∂y‖`），
+> 与最后一维宽度无关，读作「这一层对 token 整个残差状态的增益」。
+> `logit_lens_*` 在 mHC 下自动关闭（拼接流不能直接过 LM head）。真 norm 两侧都是 `IdentityOp`
+> 的层（非 pre-norm 结构）退回 wrapper 的残差 pre-hook，`post_norm_*` / `hidden_spectral_entropy`
+> 在这些层上没有数据，注册时会打一条带层号的 warning。
 
 > **注**: 指标 18-20 (`logit_lens_*`) 为**默认关闭**的可选项（熵/logsumexp 由 `log_logit_lens_entropy=True`
 > 开启，交叉熵由 `log_logit_lens_cross_entropy=True` 开启）。
@@ -932,6 +951,15 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 - `layer_out` —— decoder layer 的输出，也就是残差流本身。**深度方向梯度通路的主指标**
 - `attn_out` —— attention 分支输出
 - `ffn_or_moe_out` —— MLP / MoE 分支输出
+
+> **hybrid / mHC 挂点（megatron）**：`attn_out` / `ffn_or_moe_out` 取 `unwrap_layer(layer)` 上的
+> `self_attention` / `mlp`（wrapper 不代理属性），`layer_out` 仍挂 wrapper —— mHC fast path 不走
+> `inner_layer.__call__`，且 wrapper 才是吐残差的那个。混合栈里每个物理层只拥有一个分支，另一侧是
+> `IdentityOp` 占位符，会被跳过：attention 槽只出 `attn_out_*`，MoE 槽只出 `ffn_or_moe_out_*`，
+> 不会声明填不上的键。因此 `layer_out` 的梯度是 n 路拼接的 `[s, b, n*H]`：`token_norm_*` /
+> `token_rms_*` 这几项是 per-token 跨全部流的量，与扁平模型不同口径。
+> 这里不像 `massive_act` 那样合并流 —— 梯度的流合并（求和 vs 求均值）差一个 n 倍，取哪个取决于
+> mHC 学到的聚合权重，没有无歧义的约定。
 
 | # | 指标 | Key | 公式 | 粒度 | 含义 |
 |---|------|-----|------|------|------|

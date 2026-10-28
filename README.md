@@ -343,6 +343,10 @@ EP 归约批到 `step()` 里做：把各层各微批的本地值 stack 成一个
 监控注意力 QK logit 的数值稳定性、集中度和 sink 现象。基于 Triton Online Softmax 内核高效计算。
 新增 Sink Head 分类指标，基于 Sun et al. (2026) arXiv:2603.05498 的发现。
 
+> **层发现（hybrid / mHC）**：注意力模块取 `unwrap_layer(layer)` 上的 `self_attention` /
+> `attention`（层边界 mHC 的 wrapper 不代理属性）。混合栈里 MLP-only 槽的 `self_attention` 是
+> `IdentityOp` 占位符，会被跳过，不声明填不上的键。
+
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
 | 1 | `max` | `qk_stats/.../max` | `max(sQ·K^T)` | 每层+全局 | Logit 最大值，数值稳定性 |
@@ -470,9 +474,19 @@ PaddleFleet 的 `position` 为 `layer_input`、`attn_out`、`post_attn_residual`
 > monitor 侧不做任何流合并。`spectral_norm_*` / `lipschitz_*` 挂在 wrapper 上，看到的是 n 路残差
 > 流拼接的 `[s, b, n*H]`，但两者都是 per-token 的比值（`post_rms/pre_rms`、`‖∂L/∂x‖/‖∂L/∂y‖`），
 > 与最后一维宽度无关，读作「这一层对 token 整个残差状态的增益」。
-> `logit_lens_*` 在 mHC 下自动关闭（拼接流不能直接过 LM head）。真 norm 两侧都是 `IdentityOp`
-> 的层（非 pre-norm 结构）退回 wrapper 的残差 pre-hook，`post_norm_*` / `hidden_spectral_entropy`
-> 在这些层上没有数据，注册时会打一条带层号的 warning。
+> `logit_lens_*` 在 mHC 下自动关闭（拼接流不能直接过 LM head）。
+>
+> 两侧 norm 都是 `IdentityOp` 的层（norm 被融进 TE linear 的 spec，如 `attention_layer` /
+> `mlp_layer`）没有可读的单流张量：**非 mHC** 时退回 wrapper 的残差 pre-hook（`post_norm_*` /
+> `hidden_spectral_entropy` 缺数据），**mHC** 时整组 `channel_*` / `activation_rms*` /
+> `post_norm_*` / `hidden_spectral_entropy` 直接跳过——否则这些层会把 `n*H` 宽的量和兄弟层
+> `H` 宽的量混进同一个 `global_*` 键。两种情况都在注册时打一条带层号的 warning。
+> DSv4-Flash 的 86 个槽全部命中带 `TENorm` 的 spec（`csa_qk_layernorm_layer` /
+> `moe_layer`），不走这条路径。
+>
+> `recompute_modules` 含 `"mhc"` 时，层内真实 norm 走 mHC recompute manager：forward 那遍在
+> `no_grad` 下不记录，记录发生在 backward 的 `rebuild()`（含 `_aggregate_per_channel_max` 的
+> TP all-reduce，会和梯度归约抢带宽），且未被重放的 microbatch 不出数。注册时会 warning。
 
 > **注**: 指标 18-20 (`logit_lens_*`) 为**默认关闭**的可选项（熵/logsumexp 由 `log_logit_lens_entropy=True`
 > 开启，交叉熵由 `log_logit_lens_cross_entropy=True` 开启）。
@@ -516,6 +530,9 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 
 监控 Per-Layer Embedding 双分支架构的健康状况。
 
+> **层发现（hybrid / mHC）**：`ple` 子模块取 `unwrap_layer(layer)`，`IdentityOp` 占位符跳过，
+> 与其它 monitor 共用 `layer_discovery` 的那套层布局判断。
+
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
 | 1 | `token_ple_norm` | `ple_health/global_token_ple_norm` | `mean(\|\|token_ple\|\|₂, dim=-1)` | 全局 | Token 分支信号强度 |
@@ -540,6 +557,12 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 `h_res_logits_grad_max`、`composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、
 `bias_{pre,post,res}_abs_max` 取极大值，`h_res_logits_min`、`h_res_logits_grad_min` 与
 `h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值。
+
+> **范围：仅层内 mHC**。这个 monitor 的 `attn_` / `mlp_` 两套键来自
+> `HyperConnectionTransformerLayer` 上的 `self_attention_hyper_connection` /
+> `mlp_hyper_connection` 两个模块。`HybridStack` 的**层边界 mHC**
+> （`HyperConnectionHybridLayer`）每层只有一个 `HyperConnectionModule`，拆不出这两套键，
+> 该 monitor 在这种结构上是设计内的彻底 no-op（`massive_act` / `grad_health` 等已兼容）。
 
 第 17-29 条对应论文 Eq. (7) 的静态与 pre-sigmoid 部分（`alpha` / `bias` / 门控 logits），
 **目前仅 paddlefleet 后端实现**。megatron 后端只实现其中 **8 条标量**（每 hc 模块）：

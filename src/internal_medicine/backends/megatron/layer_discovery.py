@@ -73,6 +73,8 @@ def resolve_mhc_streams(model: nn.Module) -> tuple[int, int | None]:
     Cold path -- read once at hook-registration time and cached by the caller.
     """
     config = getattr(model, "config", None)
+    if config is None and hasattr(model, "module"):
+        config = getattr(model.module, "config", None)
     if config is None:
         return 1, None
     hidden_size = getattr(config, "hidden_size", None)

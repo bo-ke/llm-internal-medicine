@@ -56,19 +56,16 @@ def _as_expert_onehot(routing_map: torch.Tensor, num_experts: int | None) -> tor
     """routing map 归一化成 bool ``[tokens, num_experts]``, 无法归一化时返回 None.
 
     index 形 ``[tokens, topk]`` 里 ``-1`` 是无效路由 (flex dispatcher 后端的 padding
-    行/未填满的 topk), 按 mcore 自己的写法 (``router.py`` router_diagnostics) 用
-    ``scatter_add_`` + ``valid`` 掩码丢掉它们. bool/uint8 形原样返回.
+    行/未填满的 topk), 导到末尾的倾倒列再切掉, 所以既不会漏进 expert 0 也不会重复计数.
+    bool/uint8 形原样返回.
     """
     if routing_map.dtype in (torch.bool, torch.uint8):
         return routing_map.bool()
     if num_experts is None:
         return None
-    valid = routing_map >= 0
-    return (
-        torch.zeros(routing_map.shape[0], num_experts, device=routing_map.device, dtype=torch.int32)
-        .scatter_add_(1, routing_map.long().masked_fill(~valid, 0), valid.to(torch.int32))
-        .bool()
-    )
+    dump = routing_map.long().masked_fill(routing_map < 0, num_experts)
+    onehot = torch.zeros(routing_map.shape[0], num_experts + 1, device=routing_map.device, dtype=torch.bool)
+    return onehot.scatter_(1, dump, True)[:, :num_experts]
 
 
 def compute_bias_affinity_jaccard(

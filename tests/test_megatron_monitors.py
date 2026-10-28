@@ -24,6 +24,7 @@ MassiveActivationMonitor = importlib.import_module(
 MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megatron.moe_monitor").MoESpecialistMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
 moe_metrics = importlib.import_module("internal_medicine.backends.megatron.moe_metrics")
+QKStatsMonitor = importlib.import_module("internal_medicine.backends.megatron.qk_monitor").QKStatsMonitor
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
 massive_activation_metrics = importlib.import_module("internal_medicine.backends.megatron.massive_activation_metrics")
@@ -1882,8 +1883,11 @@ class FakeHybridAttentionLayer(nn.Module):
         self.self_attention = nn.Linear(hidden_size, hidden_size)
         self.mlp = IdentityOp()
 
+    def _forward_self_attention_output_with_bias(self, hidden_states):
+        return self.self_attention(self.input_layernorm(hidden_states))
+
     def forward(self, hidden_states):
-        return hidden_states + self.self_attention(self.input_layernorm(hidden_states)), None
+        return hidden_states + self._forward_self_attention_output_with_bias(hidden_states), None
 
 
 class FakeHybridMoELayer(nn.Module):
@@ -1897,17 +1901,22 @@ class FakeHybridMoELayer(nn.Module):
         self.self_attention = IdentityOp()
         self.mlp = FakeHybridMoEMLP(hidden_size)
 
+    def _forward_mlp_output_with_bias(self, hidden_states):
+        return self.mlp(self.pre_mlp_layernorm(hidden_states))
+
     def forward(self, hidden_states):
-        return hidden_states + self.mlp(self.pre_mlp_layernorm(hidden_states)), None
+        return hidden_states + self._forward_mlp_output_with_bias(hidden_states), None
 
 
 class FakeMHCWrapper(nn.Module):
     """Layer-boundary mHC wrapper: inner layer under ``inner_layer``, n-stream residual.
 
-    Mirrors HyperConnectionHybridLayer's shape contract — in/out are
-    ``[..., n*H]``, the inner layer only ever sees the aggregated ``[..., H]`` —
-    and, like the real fast path, never calls ``inner_layer.__call__`` attributes
-    through to the wrapper.
+    Mirrors HyperConnectionHybridLayer's two contracts that the monitors depend on:
+    in/out are ``[..., n*H]`` while the inner layer only ever sees the aggregated
+    ``[..., H]``, and the fast path reaches the branch via the inner layer's private
+    forward method rather than ``inner_layer.__call__`` -- so a hook moved onto the
+    inner layer itself would never fire. ``__call__`` is blocked outright to keep that
+    second property under test.
     """
 
     def __init__(self, inner, hidden_size, streams):
@@ -1916,13 +1925,40 @@ class FakeMHCWrapper(nn.Module):
         self.layer_number = inner.layer_number
         self.hidden_size = hidden_size
         self.streams = streams
+        inner.forward = self._inner_call_is_a_bug
+
+    @staticmethod
+    def _inner_call_is_a_bug(*args, **kwargs):
+        raise AssertionError("mHC fast path must not call inner_layer.__call__")
+
+    def _branch_output(self, aggregated):
+        inner = self.inner_layer
+        fn = getattr(inner, "_forward_self_attention_output_with_bias", None) or inner._forward_mlp_output_with_bias
+        return fn(aggregated)
 
     def forward(self, hidden_states):
         lead = hidden_states.shape[:-1]
         aggregated = hidden_states.reshape(*lead, self.streams, self.hidden_size).sum(dim=-2)
-        output, _ = self.inner_layer(hidden_states=aggregated)
-        delta = (output - aggregated).unsqueeze(-2).expand(*lead, self.streams, self.hidden_size)
+        delta = self._branch_output(aggregated).unsqueeze(-2).expand(*lead, self.streams, self.hidden_size)
         return hidden_states + delta.reshape(*lead, self.streams * self.hidden_size), None
+
+
+class FakeHybridNormlessLayer(nn.Module):
+    """A slot whose norm is fused into its TE linear: both norm attributes are IdentityOp."""
+
+    def __init__(self, hidden_size, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+        self.input_layernorm = IdentityOp()
+        self.pre_mlp_layernorm = IdentityOp()
+        self.self_attention = nn.Linear(hidden_size, hidden_size)
+        self.mlp = IdentityOp()
+
+    def _forward_self_attention_output_with_bias(self, hidden_states):
+        return self.self_attention(hidden_states)
+
+    def forward(self, hidden_states):
+        return hidden_states + self._forward_self_attention_output_with_bias(hidden_states), None
 
 
 class FakeMHCHybridModel(nn.Module):
@@ -2035,6 +2071,27 @@ class MegatronHybridMHCMassiveActTest(unittest.TestCase):
         monitor._prepare_layers(model)
         self.assertEqual(monitor._layer_head_info, {})
 
+    def test_norm_less_slot_under_mhc_emits_no_channel_metrics(self):
+        # No real norm means no H-wide view of the residual. Reading channel/scale
+        # metrics off the n*H concatenation would mix two units into one global key,
+        # so the layer is left out rather than merged by hand.
+        model = FakeMHCHybridModel(self.HIDDEN, self.STREAMS)
+        model.decoder.layers[0] = FakeMHCWrapper(FakeHybridNormlessLayer(self.HIDDEN, 1), self.HIDDEN, self.STREAMS)
+        monitor = self._monitor()
+        monitor.register_hooks(model)
+        out = model(torch.randn(6, 1, self.STREAMS * self.HIDDEN, requires_grad=True))
+        out.sum().backward()
+        monitor.step()
+        monitor.remove_hooks()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        for key in ("channel_max", "activation_rms", "post_norm_sparsity", "hidden_spectral_entropy"):
+            self.assertNotIn(f"massive_act/layer_0/{key}", latest)
+            self.assertIn(f"massive_act/layer_1/{key}", latest)
+        # Width-invariant ratios still ride the wrapper, so they survive.
+        for key in ("spectral_norm_max", "lipschitz_max"):
+            self.assertIn(f"massive_act/layer_0/{key}", latest)
+
 
 class MHCStreamResolveTest(unittest.TestCase):
     def test_resolve_reads_the_model_config(self):
@@ -2075,6 +2132,18 @@ class MegatronHybridMHCMoEDiscoveryTest(unittest.TestCase):
         model = FakeGPTModel(2, 6, 10)
         monitor = MoESpecialistMonitor()
         self.assertEqual(monitor._find_moe_layers(model), [])
+
+
+class MegatronHybridMHCQKDiscoveryTest(unittest.TestCase):
+    def test_attention_layers_found_through_the_mhc_wrapper(self):
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=2)
+        monitor = QKStatsMonitor()
+
+        found = monitor._find_attention_layers(model)
+
+        # Only the attention slots: the MoE slots carry an IdentityOp there.
+        layers = model.decoder.layers
+        self.assertEqual(found, [(0, layers[0].inner_layer.self_attention), (2, layers[2].inner_layer.self_attention)])
 
 
 class MegatronHybridMHCGradBranchTest(unittest.TestCase):

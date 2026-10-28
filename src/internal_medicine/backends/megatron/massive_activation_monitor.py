@@ -91,8 +91,9 @@ class MassiveActivationMonitor(TorchProbe):
         self.absolute_thresholds = tuple(absolute_thresholds)
         self.log_post_norm_metrics = log_post_norm_metrics
         # Single knob for the residual-scale/gain group: activation_rms plus the
-        # per-token spectral-norm bounds. activation_rms is derived from the same
-        # per-token pre-RMS the spectral hook computes, so they share one flag.
+        # per-token spectral-norm bounds. Under mHC these read different tensors --
+        # activation_rms the layer's H-wide norm input, the bounds the n*H-wide
+        # residual (a ratio, so width-invariant).
         self.log_activation_rms = log_activation_rms
         # Per-layer Lipschitz constant estimate, captured in the backward pass: the
         # per-token gradient-gain ratio ‖∂L/∂x‖/‖∂L/∂y‖ bounds the layer Jacobian's
@@ -137,10 +138,12 @@ class MassiveActivationMonitor(TorchProbe):
         self._warned_per_channel_aggregate = False
         self._post_norm_failed_layers: set[int] = set()
         # Layer-boundary mHC concatenates n residual streams on the last dim, so the
-        # inter-layer tensor is [s, b, n*H]. Resolved per chunk in _prepare_layers and
-        # used only to disable logit-lens, which needs a single hidden vector.
+        # inter-layer tensor is [s, b, n*H]. Resolved per chunk in _prepare_layers; the
+        # channel/scale family needs a single hidden vector and reads the layer's real
+        # norm input instead, so this only gates the metrics that have no such tensor.
         self._mhc_streams = 1
         self._hidden_size = None
+        self._warned_mhc_recompute = False
 
     def _layer_metric_names(self) -> tuple[str, ...]:
         names = [
@@ -220,16 +223,21 @@ class MassiveActivationMonitor(TorchProbe):
             targets.append((global_idx, layer, self._resolve_input_norm(layer)))
 
         # Without a real norm the channel/post-norm family falls back to the residual
-        # pre-hook, which cannot produce post_norm_* -- say so instead of letting the
-        # keys vanish at flush time.
+        # pre-hook, which cannot produce post_norm_*; under mHC it is dropped entirely
+        # (see _attach_hooks). Say so instead of letting the keys vanish at flush time.
         unnormed = [idx for idx, _, norm in targets if norm is None]
         if unnormed:
+            dropped = (
+                "channel_*, activation_rms*, post_norm_* and hidden_spectral_entropy"
+                if self._is_mhc()
+                else "post_norm_* and hidden_spectral_entropy"
+            )
             logger.warning(
-                "[MassiveActMonitor] %d/%d layers expose no input norm (first: %s); "
-                "post_norm_* and hidden_spectral_entropy will be absent for them.",
+                "[MassiveActMonitor] %d/%d layers expose no input norm (first: %s); %s will be absent for them.",
                 len(unnormed),
                 len(targets),
                 unnormed[:8],
+                dropped,
             )
 
         # Resolve the LM head once per chunk for the logit-lens metrics (entropy and/or
@@ -280,11 +288,15 @@ class MassiveActivationMonitor(TorchProbe):
                 hook = norm_layer.register_forward_hook(
                     self.timed_hook("input_layernorm", self._make_input_layernorm_hook(global_idx)), with_kwargs=True
                 )
-            else:
+                self.hooks.append(hook)
+            elif not self._is_mhc():
                 hook = layer.register_forward_pre_hook(
                     self.timed_hook("residual", self._make_residual_hook(global_idx)), with_kwargs=True
                 )
-            self.hooks.append(hook)
+                self.hooks.append(hook)
+            # Otherwise skipped: the only tensor available is the n-stream concatenation,
+            # and channel/scale metrics read off it would be n*H wide -- a different unit
+            # from the sibling layers that do own a norm, in the same global_* key.
             # Spectral-norm bounds need BOTH the layer input and output, so they
             # ride a dedicated forward hook on the layer itself (the residual/
             # input_layernorm hooks above only see the input).
@@ -326,6 +338,26 @@ class MassiveActivationMonitor(TorchProbe):
     def _resolve_residual_streams(self, model: nn.Module):
         """Read the mHC residual-stream count off the model config (cold path)."""
         self._mhc_streams, self._hidden_size = resolve_mhc_streams(model)
+        self._warn_if_mhc_recompute(model)
+
+    def _warn_if_mhc_recompute(self, model: nn.Module) -> None:
+        """Flag ``recompute_modules: ["mhc"]``, which moves the norm hooks to backward.
+
+        mcore routes a layer's real norms through the mHC recompute manager, so their
+        forward runs under ``no_grad`` (recorded nothing) and the hook that does record
+        fires during ``rebuild()`` in the backward pass -- including the per-channel TP
+        all_reduce, which then contends with gradient reduction.
+        """
+        if self._warned_mhc_recompute or not self._is_mhc():
+            return
+        config = getattr(model, "config", None) or getattr(getattr(model, "module", None), "config", None)
+        if "mhc" not in (getattr(config, "recompute_modules", None) or ()):
+            return
+        self._warned_mhc_recompute = True
+        logger.warning(
+            "[MassiveActMonitor] recompute_modules includes 'mhc': norm-hook metrics are "
+            "recorded during backward, and microbatches that are not replayed record nothing."
+        )
 
     def _is_mhc(self) -> bool:
         return self._mhc_streams > 1 and bool(self._hidden_size)

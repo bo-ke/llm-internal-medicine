@@ -57,7 +57,7 @@ from .grad_metrics import (
     TOKEN_METRICS,
     grad_square_and_stats,
 )
-from .layer_discovery import find_transformer_layers
+from .layer_discovery import find_transformer_layers, is_identity_module, unwrap_layer
 
 logger = logging.getLogger(__name__)
 
@@ -84,15 +84,21 @@ def _branch_modules(layer):
 
     Only positions that exist are returned, and the same list drives both the
     schema and the hooks -- so a layer without an ``mlp`` never declares a key it
-    could not fill. Megatron names the attention ``self_attention`` and the FFN
-    ``mlp`` (an MoE layer's ``mlp`` is the MoE block itself).
+    could not fill. An absent branch may be ``None`` or an ``IdentityOp``
+    placeholder; both are skipped. Megatron names the attention ``self_attention``
+    and the FFN ``mlp`` (an MoE layer's ``mlp`` is the MoE block itself).
+
+    Branches are read off the unwrapped layer -- layer-boundary mHC hides them
+    under ``inner_layer`` and proxies no attributes. ``layer_out`` stays on the
+    wrapper, which is what emits the residual stream leaving the block.
     """
+    inner = unwrap_layer(layer)
     modules = []
-    attn = getattr(layer, "self_attention", None)
-    if attn is not None:
+    attn = getattr(inner, "self_attention", None)
+    if not is_identity_module(attn):
         modules.append(("attn_out", attn))
-    ffn = getattr(layer, "mlp", None)
-    if ffn is not None:
+    ffn = getattr(inner, "mlp", None)
+    if not is_identity_module(ffn):
         modules.append(("ffn_or_moe_out", ffn))
     # The layer itself is the residual stream leaving this block.
     modules.append(("layer_out", layer))

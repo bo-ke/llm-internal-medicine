@@ -164,6 +164,14 @@ setup_internal_medicine()
 > `expert_*_share`）仅 paddlefleet**。megatron 只输出 1–18（router 7 + load 5 + expert 6），paddlefleet 输出
 > 1–13、19–28 以及紧随表后那组 router/负载族。
 
+> **层发现（hybrid / mHC）**：`HybridStack` + 层边界 mHC 下 `decoder.layers[i]` 是
+> `HyperConnectionHybridLayer` 包装器，真层在 `.inner_layer` 且不代理属性。monitor 先
+> `unwrap_layer` 再探测 `mlp.router` / `moe` / `router`，所以 DSv4-Flash 这类 "attention 槽 +
+> MoE 槽" 的混合栈只在 MoE 槽上挂 hook，层号取 wrapper 的 `layer_number`。
+> `bias_affinity_jaccard` 在 bias 前/后 routing map 无法统一成 one-hot 形态时（索引形但拿不到
+> `num_experts`，或两侧 token 数不一致）跳过记录，日志里不会出现这个键，并在首次发生时打一条带
+> 形状/dtype 的 warning。
+
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
 | 1 | `router_entropy` | `moe_health/.../router_entropy` | `-Σ(p × log(p))` | 每层+全局 | 路由分布均匀度 |
@@ -335,6 +343,10 @@ EP 归约批到 `step()` 里做：把各层各微批的本地值 stack 成一个
 监控注意力 QK logit 的数值稳定性、集中度和 sink 现象。基于 Triton Online Softmax 内核高效计算。
 新增 Sink Head 分类指标，基于 Sun et al. (2026) arXiv:2603.05498 的发现。
 
+> **层发现（hybrid / mHC）**：注意力模块取 `unwrap_layer(layer)` 上的 `self_attention` /
+> `attention`（层边界 mHC 的 wrapper 不代理属性）。混合栈里 MLP-only 槽的 `self_attention` 是
+> `IdentityOp` 占位符，会被跳过，不声明填不上的键。
+
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
 | 1 | `max` | `qk_stats/.../max` | `max(sQ·K^T)` | 每层+全局 | Logit 最大值，数值稳定性 |
@@ -455,6 +467,33 @@ PaddleFleet 的 `position` 为 `layer_input`、`attn_out`、`post_attn_residual`
 `ffn_or_moe_out`、`post_ffn_residual`。两个 residual 位置从真实 forward 边界采样，update ratio
 由实际 residual 差分计算，因此包含 bias、dropout、BDA 与 mHC residual mixing 的影响。
 
+> **宽残差挂点（megatron）**：mcore 有两套互斥的宽残差方案会把层间张量变成 `[s, b, n*H]` ——
+> 层边界 mHC（`enable_mhc_connections` + `mhc_num_residual_streams`）和 `wide_residual`
+> （`wide_residual.num_streams`）。两者走同一套判断，下面统称「宽残差」。
+>
+> `channel_*` / `post_norm_*` / `hidden_spectral_entropy` / `activation_rms*`
+> 挂在 `inner_layer` 的真实 norm 上（attention 槽取 `input_layernorm`，MoE 槽取
+> `pre_mlp_layernorm`，另一侧是 `IdentityOp`）。norm 的输入正是模型自己聚合出来的单流
+> `[s, b, H]`（mHC 的 aggregate、`wide_residual` 的 residual read 都在 norm 之前），
+> 所以这些指标的通道口径仍是 hidden_size、绝对尺度也是模型真实看到的那一份，
+> monitor 侧不做任何流合并。`spectral_norm_*` / `lipschitz_*` 挂在 wrapper 上，看到的是 n 路残差
+> 流拼接的 `[s, b, n*H]`，但两者都是 per-token 的比值（`post_rms/pre_rms`、`‖∂L/∂x‖/‖∂L/∂y‖`），
+> 与最后一维宽度无关，读作「这一层对 token 整个残差状态的增益」。
+> `logit_lens_*` 在宽残差下自动关闭（拼接流不能直接过 LM head）。
+>
+> 两侧 norm 都是 `IdentityOp` 的层（norm 被融进 TE linear 的 spec，如 `attention_layer` /
+> `mlp_layer`）没有可读的单流张量：**单流**时退回 wrapper 的残差 pre-hook（`post_norm_*` /
+> `hidden_spectral_entropy` 缺数据），**宽残差**时整组 `channel_*` / `activation_rms*` /
+> `post_norm_*` / `hidden_spectral_entropy` 直接跳过——否则这些层会把 `n*H` 宽的量和兄弟层
+> `H` 宽的量混进同一个 `global_*` 键。两种情况都在注册时打一条带层号的 warning。
+> DSv4-Flash 的 86 个槽全部命中带 `TENorm` 的 spec（`csa_qk_layernorm_layer` /
+> `moe_layer`），不走这条路径。
+>
+> `recompute_granularity: selective` 且 `recompute_modules` 含 `"mhc"` 或
+> `"residual_stream"` 时，层内真实 norm 走 `CheckpointWithoutOutput`：forward 那遍在
+> `no_grad` 下不记录，记录发生在 backward 的 `rebuild()`（含 `_aggregate_per_channel_max` 的
+> TP all-reduce，会和梯度归约抢带宽），且未被重放的 microbatch 不出数。注册时会 warning。
+
 > **注**: 指标 18-20 (`logit_lens_*`) 为**默认关闭**的可选项（熵/logsumexp 由 `log_logit_lens_entropy=True`
 > 开启，交叉熵由 `log_logit_lens_cross_entropy=True` 开启）。
 > 将每层残差经 LM head 投影到 vocab logits，同一次投影求三组量（**仅报告 token 均值**）：softmax 熵
@@ -497,6 +536,9 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 
 监控 Per-Layer Embedding 双分支架构的健康状况。
 
+> **层发现（hybrid / mHC）**：`ple` 子模块取 `unwrap_layer(layer)`，`IdentityOp` 占位符跳过，
+> 与其它 monitor 共用 `layer_discovery` 的那套层布局判断。
+
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
 | 1 | `token_ple_norm` | `ple_health/global_token_ple_norm` | `mean(\|\|token_ple\|\|₂, dim=-1)` | 全局 | Token 分支信号强度 |
@@ -515,12 +557,20 @@ Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于�
 
 监控 mHC (Manifold-Constrained Hyper-Connections) 层的三个 per-token 映射 `h_pre` / `h_post` / `h_res`，
 以及 `x_{l+1} = H_resᵀ x_l + H_postᵀ F(H_pre x_l)` 两项的相对大小。
-只在模型开启 mHC 层时生效，mHC 类无法 import 或模型不含 `HyperConnectionTransformerLayer` 时该 monitor 为
-彻底 no-op。每层含两个 hyper-connection 模块（`attn` / `mlp`），各产出以下 29 个指标，
-指标名以 `attn_` / `mlp_` 前缀区分；`branch_residual_share_max`、`h_res_logits_max`、
+只在模型开启 mHC 层时生效，mHC 类无法 import 或没有任何层携带 `HyperConnectionModule` 时该 monitor 为
+彻底 no-op。每个 hyper-connection 模块产出以下 29 个指标，指标名以 `attn_` / `mlp_` 前缀区分；
+`branch_residual_share_max`、`h_res_logits_max`、
 `h_res_logits_grad_max`、`composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、
 `bias_{pre,post,res}_abs_max` 取极大值，`h_res_logits_min`、`h_res_logits_grad_min` 与
 `h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值。
+
+> **两种 mHC 结构（megatron）**。**层内 mHC**（`HyperConnectionTransformerLayer`）一层带两个
+> hyper-connection 模块，`attn_` / `mlp_` 分别来自 `self_attention_hyper_connection` /
+> `mlp_hyper_connection`。`HybridStack` 的**层边界 mHC**（`HyperConnectionHybridLayer`）每个 slot
+> 只有一个 `hyper_connection`，component 按这个 slot 实际拥有的分支定（`inner_layer.self_attention`
+> 是 `IdentityOp` 占位则记为 `mlp_`，否则记为 `attn_`），因此一个 slot 只出一套键。
+> composite 乘积在一个 PP stage / VPP chunk 内按层序累乘，root 取该 chunk 上最先执行的那个模块，
+> 不要求 chunk 上存在 attention slot。
 
 第 17-29 条对应论文 Eq. (7) 的静态与 pre-sigmoid 部分（`alpha` / `bias` / 门控 logits），
 **目前仅 paddlefleet 后端实现**。megatron 后端只实现其中 **8 条标量**（每 hc 模块）：
@@ -932,6 +982,15 @@ CP 下 query 行是本 rank 的序列切片，而 indexer 的 K 已经 all-gathe
 - `layer_out` —— decoder layer 的输出，也就是残差流本身。**深度方向梯度通路的主指标**
 - `attn_out` —— attention 分支输出
 - `ffn_or_moe_out` —— MLP / MoE 分支输出
+
+> **hybrid / mHC 挂点（megatron）**：`attn_out` / `ffn_or_moe_out` 取 `unwrap_layer(layer)` 上的
+> `self_attention` / `mlp`（wrapper 不代理属性），`layer_out` 仍挂 wrapper —— mHC fast path 不走
+> `inner_layer.__call__`，且 wrapper 才是吐残差的那个。混合栈里每个物理层只拥有一个分支，另一侧是
+> `IdentityOp` 占位符，会被跳过：attention 槽只出 `attn_out_*`，MoE 槽只出 `ffn_or_moe_out_*`，
+> 不会声明填不上的键。因此 `layer_out` 的梯度是 n 路拼接的 `[s, b, n*H]`：`token_norm_*` /
+> `token_rms_*` 这几项是 per-token 跨全部流的量，与扁平模型不同口径。
+> 这里不像 `massive_act` 那样合并流 —— 梯度的流合并（求和 vs 求均值）差一个 n 倍，取哪个取决于
+> mHC 学到的聚合权重，没有无歧义的约定。
 
 | # | 指标 | Key | 公式 | 粒度 | 含义 |
 |---|------|-----|------|------|------|

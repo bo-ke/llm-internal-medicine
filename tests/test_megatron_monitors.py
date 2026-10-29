@@ -23,6 +23,8 @@ MassiveActivationMonitor = importlib.import_module(
 ).MassiveActivationMonitor
 MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megatron.moe_monitor").MoESpecialistMonitor
 moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
+moe_metrics = importlib.import_module("internal_medicine.backends.megatron.moe_metrics")
+QKStatsMonitor = importlib.import_module("internal_medicine.backends.megatron.qk_monitor").QKStatsMonitor
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
 massive_activation_metrics = importlib.import_module("internal_medicine.backends.megatron.massive_activation_metrics")
@@ -36,6 +38,7 @@ megatron_backend = importlib.import_module("internal_medicine.backends.megatron"
 grad_metrics = importlib.import_module("internal_medicine.backends.megatron.grad_metrics")
 grad_monitor = importlib.import_module("internal_medicine.backends.megatron.grad_monitor")
 GradHealthMonitor = grad_monitor.GradHealthMonitor
+layer_discovery = importlib.import_module("internal_medicine.backends.megatron.layer_discovery")
 
 
 class FakePLESublayer:
@@ -464,6 +467,7 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         monitor.allocate_buffers(pre.device)
 
         monitor._compute_spectral_norm(0, pre, post)
+        monitor._compute_residual_metrics(0, pre)
         monitor.step()
 
         latest = training_logs.get_latest(prefix="massive_act")
@@ -472,30 +476,26 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
             self.assertIn(f"massive_act/global_{key}", latest)
         self.assertAlmostEqual(latest["massive_act/layer_0/spectral_norm_max"], 2.0, places=5)
         self.assertAlmostEqual(latest["massive_act/layer_0/spectral_norm_min"], 2.0, places=5)
-        # activation_rms is derived from the shared per-token pre-RMS, not a second
-        # square of the input: it must equal sqrt(mean(pre**2)) over the whole input.
+        # activation_rms rides the residual/norm hook, so it is the RMS of the tensor
+        # that hook sees -- under mHC the model's own merged residual.
         self.assertIn("massive_act/layer_0/activation_rms", latest)
         expected_rms = pre.reshape(-1, pre.shape[-1]).float().square().mean().sqrt().item()
         self.assertAlmostEqual(latest["massive_act/layer_0/activation_rms"], expected_rms, places=5)
-        # activation_rms_std is the std of the per-token pre-RMS (dispersion).
+        # activation_rms_std is the std of the per-token RMS (dispersion).
         self.assertIn("massive_act/layer_0/activation_rms_std", latest)
         expected_rms_std = pre.reshape(-1, pre.shape[-1]).float().square().mean(dim=-1).sqrt().std().item()
         self.assertAlmostEqual(latest["massive_act/layer_0/activation_rms_std"], expected_rms_std, places=5)
 
-    def test_derived_activation_rms_matches_original_formula(self):
-        # Regression guard: the merged/derived activation_rms (from the spectral
-        # hook's per-token pre-RMS) must be numerically identical to the original
-        # standalone compute_activation_scale_stats(h) over the same tensor.
+    def test_activation_scale_stats_match_a_readable_reference(self):
         torch.manual_seed(0)
         hidden_states = torch.randn(7, 3, 5) * 4.0 + 1.5  # [S, B, H], non-trivial scale
 
-        original = massive_activation_metrics.compute_activation_scale_stats(hidden_states)["activation_rms"]
-        # activation_rms depends only on the pre tensor; post is irrelevant to it.
-        derived = massive_activation_metrics.compute_spectral_norm_bounds(
-            hidden_states, torch.zeros_like(hidden_states), include_activation_rms=True
-        )["activation_rms"]
+        stats = massive_activation_metrics.compute_activation_scale_stats(hidden_states)
 
-        self.assertTrue(torch.allclose(original, derived, rtol=0, atol=1e-6), f"{original} != {derived}")
+        rows = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
+        self.assertTrue(torch.allclose(stats["activation_rms"], rows.square().mean().sqrt(), rtol=0, atol=1e-6))
+        token_rms = rows.square().mean(dim=-1).sqrt()
+        self.assertTrue(torch.allclose(stats["activation_rms_std"], token_rms.std(), rtol=0, atol=1e-6))
 
     def test_grad_gain_bounds_equal_scaled_gradients(self):
         # grad_in = 2 * grad_out per token => the per-token ratio ‖dx‖/‖dy‖ is exactly
@@ -1843,6 +1843,406 @@ class GradMonitorEndToEndTest(unittest.TestCase):
 
         latest = training_logs.get_latest(prefix="grad_health")
         self.assertFalse(any("rms_depth_ratio" in key for key in latest))
+
+
+class IdentityOp(nn.Module):
+    """Stands in for mcore's IdentityOp — monitors detect it by class name."""
+
+    def forward(self, x):
+        return x
+
+
+class FakeRouter(nn.Module):
+    def __init__(self, hidden_size, num_experts, topk):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
+        self.num_experts = num_experts
+        self.topk = topk
+        self.expert_bias = None
+
+
+class FakeHybridMoEMLP(nn.Module):
+    def __init__(self, hidden_size, num_experts=4, topk=2):
+        super().__init__()
+        self.router = FakeRouter(hidden_size, num_experts, topk)
+        self.shared_experts = None
+        self.proj = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class FakeHybridAttentionLayer(nn.Module):
+    """Hybrid attention slot: real input_layernorm, IdentityOp in the MLP slot."""
+
+    def __init__(self, hidden_size, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+        self.input_layernorm = nn.LayerNorm(hidden_size)
+        self.pre_mlp_layernorm = IdentityOp()
+        self.self_attention = nn.Linear(hidden_size, hidden_size)
+        self.mlp = IdentityOp()
+
+    def _forward_self_attention_output_with_bias(self, hidden_states):
+        return self.self_attention(self.input_layernorm(hidden_states))
+
+    def forward(self, hidden_states):
+        return hidden_states + self._forward_self_attention_output_with_bias(hidden_states), None
+
+
+class FakeHybridMoELayer(nn.Module):
+    """Hybrid MoE slot: real pre_mlp_layernorm, IdentityOp in the attention slot."""
+
+    def __init__(self, hidden_size, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+        self.input_layernorm = IdentityOp()
+        self.pre_mlp_layernorm = nn.LayerNorm(hidden_size)
+        self.self_attention = IdentityOp()
+        self.mlp = FakeHybridMoEMLP(hidden_size)
+
+    def _forward_mlp_output_with_bias(self, hidden_states):
+        return self.mlp(self.pre_mlp_layernorm(hidden_states))
+
+    def forward(self, hidden_states):
+        return hidden_states + self._forward_mlp_output_with_bias(hidden_states), None
+
+
+class FakeMHCWrapper(nn.Module):
+    """Layer-boundary mHC wrapper: inner layer under ``inner_layer``, n-stream residual.
+
+    Mirrors HyperConnectionHybridLayer's two contracts that the monitors depend on:
+    in/out are ``[..., n*H]`` while the inner layer only ever sees the aggregated
+    ``[..., H]``, and the fast path reaches the branch via the inner layer's private
+    forward method rather than ``inner_layer.__call__`` -- so a hook moved onto the
+    inner layer itself would never fire. ``__call__`` is blocked outright to keep that
+    second property under test.
+    """
+
+    def __init__(self, inner, hidden_size, streams):
+        super().__init__()
+        self.inner_layer = inner
+        self.layer_number = inner.layer_number
+        self.hidden_size = hidden_size
+        self.streams = streams
+        inner.forward = self._inner_call_is_a_bug
+
+    @staticmethod
+    def _inner_call_is_a_bug(*args, **kwargs):
+        raise AssertionError("mHC fast path must not call inner_layer.__call__")
+
+    def _branch_output(self, aggregated):
+        inner = self.inner_layer
+        fn = getattr(inner, "_forward_self_attention_output_with_bias", None) or inner._forward_mlp_output_with_bias
+        return fn(aggregated)
+
+    def forward(self, hidden_states):
+        lead = hidden_states.shape[:-1]
+        aggregated = hidden_states.reshape(*lead, self.streams, self.hidden_size).sum(dim=-2)
+        delta = self._branch_output(aggregated).unsqueeze(-2).expand(*lead, self.streams, self.hidden_size)
+        return hidden_states + delta.reshape(*lead, self.streams * self.hidden_size), None
+
+
+class FakeHybridNormlessLayer(nn.Module):
+    """A slot whose norm is fused into its TE linear: both norm attributes are IdentityOp."""
+
+    def __init__(self, hidden_size, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+        self.input_layernorm = IdentityOp()
+        self.pre_mlp_layernorm = IdentityOp()
+        self.self_attention = nn.Linear(hidden_size, hidden_size)
+        self.mlp = IdentityOp()
+
+    def _forward_self_attention_output_with_bias(self, hidden_states):
+        return self.self_attention(hidden_states)
+
+    def forward(self, hidden_states):
+        return hidden_states + self._forward_self_attention_output_with_bias(hidden_states), None
+
+
+class FakeMHCHybridModel(nn.Module):
+    """mHC + hybrid stack:每个逻辑层 = attention 槽 + MoE 槽, 两槽都被 wrapper 包住."""
+
+    def __init__(self, hidden_size, streams, num_logical_layers=2):
+        super().__init__()
+        self.config = SimpleNamespace(
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=streams,
+            hidden_size=hidden_size,
+        )
+        layers = []
+        for i in range(num_logical_layers):
+            layers.append(FakeMHCWrapper(FakeHybridAttentionLayer(hidden_size, 2 * i + 1), hidden_size, streams))
+            layers.append(FakeMHCWrapper(FakeHybridMoELayer(hidden_size, 2 * i + 2), hidden_size, streams))
+        self.decoder = nn.Module()
+        self.decoder.layers = nn.ModuleList(layers)
+
+    def forward(self, x):
+        for layer in self.decoder.layers:
+            x, _ = layer(hidden_states=x)
+        return x
+
+
+class MegatronHybridMHCMassiveActTest(unittest.TestCase):
+    HIDDEN = 4
+    STREAMS = 4
+
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def _monitor(self, **kwargs):
+        kwargs.setdefault("log_hidden_spectral_entropy", True)
+        kwargs.setdefault("cosine_sample_pairs", 4)
+        return MassiveActivationMonitor(**kwargs)
+
+    def test_input_norm_resolves_to_the_real_norm_on_the_inner_layer(self):
+        model = FakeMHCHybridModel(self.HIDDEN, self.STREAMS)
+        monitor = self._monitor()
+        targets = monitor._prepare_layers(model)
+
+        self.assertEqual([idx for idx, _, _ in targets], [0, 1, 2, 3])
+        self.assertEqual(monitor._residual_streams, self.STREAMS)
+        self.assertEqual(monitor._hidden_size, self.HIDDEN)
+        for _, wrapper, norm in targets:
+            inner = wrapper.inner_layer
+            expected = inner.input_layernorm if isinstance(inner, FakeHybridAttentionLayer) else inner.pre_mlp_layernorm
+            self.assertIs(norm, expected)
+
+    def test_post_norm_metrics_recorded_for_every_hybrid_slot(self):
+        model = FakeMHCHybridModel(self.HIDDEN, self.STREAMS)
+        monitor = self._monitor()
+        monitor.register_hooks(model)
+        out = model(torch.randn(6, 1, self.STREAMS * self.HIDDEN, requires_grad=True))
+        out.sum().backward()
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        for i in range(4):
+            for key in ("post_norm_sparsity", "post_norm_cosine", "hidden_spectral_entropy"):
+                self.assertIn(f"massive_act/layer_{i}/{key}", latest)
+            for key in ("channel_max", "spectral_norm_max", "lipschitz_max"):
+                self.assertIn(f"massive_act/layer_{i}/{key}", latest)
+        monitor.remove_hooks()
+
+    def test_channel_metrics_come_from_the_models_own_merged_residual(self):
+        # The norm hook's input is mHC's aggregated [s, b, H], so channel metrics are
+        # H-wide with no merge on the monitor's side.
+        model = FakeMHCHybridModel(self.HIDDEN, self.STREAMS)
+        monitor = MassiveActivationMonitor(absolute_thresholds=(2.0,), log_post_norm_metrics=False)
+        monitor.register_hooks(model)
+
+        hidden = torch.zeros(2, 1, self.STREAMS * self.HIDDEN)
+        for stream in range(self.STREAMS):
+            hidden[:, 0, stream * self.HIDDEN] = 1.0
+        model(hidden)
+        monitor.step()
+        monitor.remove_hooks()
+
+        # Each stream puts 1.0 in channel 0, so the aggregated residual is [n, 0, ...].
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertAlmostEqual(latest["massive_act/layer_0/channel_max"], float(self.STREAMS), places=5)
+        self.assertEqual(latest["massive_act/layer_0/channel_count_gt_2"], 1.0)
+
+    def test_spectral_norm_bounds_are_a_width_invariant_ratio(self):
+        # The wrapper's in/out are the n-stream concatenation, but the metric is a
+        # per-token RMS ratio, so it reads as the gain on the token's whole residual.
+        monitor = MassiveActivationMonitor(log_post_norm_metrics=False, log_lipschitz=False)
+        for name in monitor._layer_metric_names():
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
+
+        pre = torch.ones(2, 1, 8)
+        post = torch.ones(2, 1, 8)
+        post[0, 0] = 3.0
+        monitor._compute_spectral_norm(0, pre, post)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertAlmostEqual(latest["massive_act/layer_0/spectral_norm_max"], 3.0, places=5)
+        self.assertAlmostEqual(latest["massive_act/layer_0/spectral_norm_min"], 1.0, places=5)
+
+    def test_logit_lens_disabled_under_mhc(self):
+        model = FakeMHCHybridModel(self.HIDDEN, self.STREAMS)
+        monitor = MassiveActivationMonitor(log_logit_lens_entropy=True)
+        monitor._prepare_layers(model)
+        self.assertEqual(monitor._layer_head_info, {})
+
+    def test_norm_less_slot_under_mhc_emits_no_channel_metrics(self):
+        # No real norm means no H-wide view of the residual. Reading channel/scale
+        # metrics off the n*H concatenation would mix two units into one global key,
+        # so the layer is left out rather than merged by hand.
+        model = FakeMHCHybridModel(self.HIDDEN, self.STREAMS)
+        model.decoder.layers[0] = FakeMHCWrapper(FakeHybridNormlessLayer(self.HIDDEN, 1), self.HIDDEN, self.STREAMS)
+        monitor = self._monitor()
+        monitor.register_hooks(model)
+        out = model(torch.randn(6, 1, self.STREAMS * self.HIDDEN, requires_grad=True))
+        out.sum().backward()
+        monitor.step()
+        monitor.remove_hooks()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        for key in ("channel_max", "activation_rms", "post_norm_sparsity", "hidden_spectral_entropy"):
+            self.assertNotIn(f"massive_act/layer_0/{key}", latest)
+            self.assertIn(f"massive_act/layer_1/{key}", latest)
+        # Width-invariant ratios still ride the wrapper, so they survive.
+        for key in ("spectral_norm_max", "lipschitz_max"):
+            self.assertIn(f"massive_act/layer_0/{key}", latest)
+
+
+class ResidualStreamResolveTest(unittest.TestCase):
+    def test_resolve_reads_the_model_config(self):
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=1)
+        self.assertEqual(layer_discovery.resolve_residual_streams(model), (4, 4))
+
+        model.config.enable_mhc_connections = False
+        self.assertEqual(layer_discovery.resolve_residual_streams(model), (1, 4))
+
+        self.assertEqual(layer_discovery.resolve_residual_streams(nn.Linear(2, 2)), (1, None))
+
+    def test_wide_residual_is_the_other_multi_stream_scheme(self):
+        # wide_residual and enable_mhc_connections are mutually exclusive in mcore, and
+        # both widen the inter-layer tensor to n*H -- the guards must engage for either.
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=1)
+        model.config.enable_mhc_connections = False
+        model.config.wide_residual = SimpleNamespace(num_streams=3)
+        self.assertEqual(layer_discovery.resolve_residual_streams(model), (3, 4))
+
+    def test_config_is_read_through_one_wrapper(self):
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=1)
+        wrapper = nn.Module()
+        wrapper.module = model
+        self.assertEqual(layer_discovery.resolve_residual_streams(wrapper), (4, 4))
+
+
+class MegatronHybridMHCMoEDiscoveryTest(unittest.TestCase):
+    def test_moe_layers_found_through_the_mhc_wrapper(self):
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=2)
+        monitor = MoESpecialistMonitor()
+
+        found = monitor._find_moe_layers(model)
+
+        layers = model.decoder.layers
+        self.assertEqual(found, [(1, layers[1].inner_layer.mlp), (3, layers[3].inner_layer.mlp)])
+
+    def test_flat_moe_layers_still_found_without_a_wrapper(self):
+        # unwrap_layer is the identity on a plain layer, so the flat stack still resolves.
+        model = nn.Module()
+        model.decoder = nn.Module()
+        model.decoder.layers = nn.ModuleList(
+            [FakeHybridAttentionLayer(4, 1), FakeHybridMoELayer(4, 2), FakeHybridMoELayer(4, 3)]
+        )
+        monitor = MoESpecialistMonitor()
+
+        found = monitor._find_moe_layers(model)
+
+        layers = model.decoder.layers
+        self.assertEqual(found, [(1, layers[1].mlp), (2, layers[2].mlp)])
+
+    def test_model_without_moe_layers_finds_nothing(self):
+        model = FakeGPTModel(2, 6, 10)
+        monitor = MoESpecialistMonitor()
+        self.assertEqual(monitor._find_moe_layers(model), [])
+
+
+class MegatronHybridMHCQKDiscoveryTest(unittest.TestCase):
+    def test_attention_layers_found_through_the_mhc_wrapper(self):
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=2)
+        monitor = QKStatsMonitor()
+
+        found = monitor._find_attention_layers(model)
+
+        # Only the attention slots: the MoE slots carry an IdentityOp there.
+        layers = model.decoder.layers
+        self.assertEqual(found, [(0, layers[0].inner_layer.self_attention), (2, layers[2].inner_layer.self_attention)])
+
+
+class MegatronHybridMHCGradBranchTest(unittest.TestCase):
+    def test_branches_resolve_through_the_mhc_wrapper(self):
+        model = FakeMHCHybridModel(hidden_size=4, streams=4, num_logical_layers=1)
+        attn_slot, moe_slot = model.decoder.layers
+
+        attn_branches = dict(grad_monitor._branch_modules(attn_slot))
+        moe_branches = dict(grad_monitor._branch_modules(moe_slot))
+
+        # Each hybrid slot owns one branch; the other is an IdentityOp placeholder and
+        # must not declare a key it can never fill.
+        self.assertEqual(list(attn_branches), ["attn_out", "layer_out"])
+        self.assertEqual(list(moe_branches), ["ffn_or_moe_out", "layer_out"])
+
+        self.assertIs(attn_branches["attn_out"], attn_slot.inner_layer.self_attention)
+        self.assertIs(moe_branches["ffn_or_moe_out"], moe_slot.inner_layer.mlp)
+        # layer_out stays on the wrapper -- the fast path never calls inner_layer.__call__,
+        # and the wrapper is what emits the n-stream residual.
+        self.assertIs(attn_branches["layer_out"], attn_slot)
+        self.assertIs(moe_branches["layer_out"], moe_slot)
+
+    def test_flat_layer_with_both_branches_declares_every_position(self):
+        layer = FakeHybridAttentionLayer(4, 1)
+        layer.mlp = nn.Linear(4, 4)
+        self.assertEqual(list(dict(grad_monitor._branch_modules(layer))), list(grad_metrics.POSITIONS))
+
+
+class BiasAffinityJaccardTest(unittest.TestCase):
+    def _jaccard(self, before, after, num_experts=None):
+        return moe_metrics.compute_bias_affinity_jaccard(before, after, num_experts=num_experts)
+
+    def test_both_maps_in_bool_form(self):
+        before = torch.tensor([[True, True, False, False], [True, False, True, False]])
+        after = torch.tensor([[True, False, True, False], [True, False, True, False]])
+        # Row 0: |∩|=1 |∪|=3; row 1: |∩|=2 |∪|=2 -> 3/5.
+        self.assertAlmostEqual(self._jaccard(before, after).item(), 0.6, places=6)
+
+    def test_both_maps_in_index_form(self):
+        before = torch.tensor([[0, 1], [0, 2]])
+        after = torch.tensor([[0, 2], [0, 2]])
+        self.assertAlmostEqual(self._jaccard(before, after, num_experts=4).item(), 0.6, places=6)
+
+    def test_mixed_forms_with_invalid_index_padding(self):
+        before = torch.tensor([[True, True, False, False]])
+        # -1 is an unfilled topk slot; it must not count as expert 0.
+        after = torch.tensor([[1, -1]])
+        self.assertAlmostEqual(self._jaccard(before, after, num_experts=4).item(), 0.5, places=6)
+
+    def test_index_form_without_num_experts_returns_none(self):
+        before = torch.tensor([[True, True, False, False]])
+        self.assertIsNone(self._jaccard(before, torch.tensor([[1, 2]])))
+
+    def test_token_count_mismatch_returns_none(self):
+        before = torch.tensor([[True, True, False, False]])
+        after = torch.tensor([[0, 1], [0, 1]])
+        self.assertIsNone(self._jaccard(before, after, num_experts=4))
+
+    def test_padding_rows_do_not_depress_similarity(self):
+        # Row 1 is a padding row: zeroed in the before map, still routed after bias.
+        before = torch.tensor([[True, True, False, False], [False, False, False, False]])
+        after = torch.tensor([[0, 1], [2, 3]])
+        self.assertAlmostEqual(self._jaccard(before, after, num_experts=4).item(), 1.0, places=6)
+
+    def test_unreconcilable_maps_warn_once_and_record_nothing(self):
+        monitor = MoESpecialistMonitor()
+        monitor.declare_layer_metric(0, "bias_affinity_jaccard")
+        monitor.allocate_buffers(torch.device("cpu"))
+        # Index form with no num_experts -> cannot be reconciled.
+        router = SimpleNamespace(
+            topk=None,
+            expert_bias=None,
+            num_experts=None,
+            num_moe_experts=None,
+            _cached_scores_for_aux_loss=None,
+            _cached_routing_map_for_aux_loss=torch.tensor([[True, True, False, False]]),
+        )
+        outputs = (None, torch.tensor([[1, 2]]))
+
+        with self.assertLogs(moe_monitor_module.logger, level="WARNING") as captured:
+            monitor._compute_router_metrics(0, router, outputs, None)
+            monitor._compute_router_metrics(0, router, outputs, None)
+
+        self.assertEqual(len(captured.output), 1)
+        self.assertNotIn("moe_health/layer_0/bias_affinity_jaccard", training_logs.get_latest(prefix="moe_health"))
 
 
 if __name__ == "__main__":

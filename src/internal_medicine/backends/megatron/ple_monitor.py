@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
+from .layer_discovery import find_transformer_layers, is_identity_module, unwrap_layer
 from .ple_metrics import (
     compute_branch_cosine,
     compute_branch_norms,
@@ -118,24 +119,14 @@ class PLEHealthMonitor(TorchProbe):
         return None
 
     def _find_ple_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
-        from megatron.core.transformer.identity_op import IdentityOp
-
-        if hasattr(model, "module"):
-            model = model.module
-        layers = None
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            layers = model.decoder.layers
-        elif hasattr(model, "language_model"):
-            lm = model.language_model
-            if hasattr(lm, "decoder") and hasattr(lm.decoder, "layers"):
-                layers = lm.decoder.layers
-        if layers is None:
-            return []
         result = []
-        for local_idx, layer in enumerate(layers):
+        layers = find_transformer_layers(model)
+        for local_idx, layer in layers:
             global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
-            if hasattr(layer, "ple") and not isinstance(layer.ple, IdentityOp):
-                result.append((global_idx, layer.ple))
+            # Unwrapped: a layer-boundary mHC wrapper proxies no attributes.
+            ple = getattr(unwrap_layer(layer), "ple", None)
+            if not is_identity_module(ple):
+                result.append((global_idx, ple))
         return result
 
     def _make_token_ple_hook(self):

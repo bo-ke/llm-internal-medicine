@@ -48,6 +48,21 @@ class FakeLayer(nn.Module):
         self.mlp_hyper_connection = mlp
 
 
+class IdentityOp(nn.Module):
+    """Named to match ``layer_discovery.is_identity_module``'s class-name check."""
+
+
+class FakeBoundaryWrapper(nn.Module):
+    """Layer-boundary mHC: a single hc module, the slot reached via ``inner_layer``."""
+
+    def __init__(self, layer_number, hc, has_attention):
+        super().__init__()
+        self.layer_number = layer_number
+        self.hyper_connection = hc
+        self.inner_layer = nn.Module()
+        self.inner_layer.self_attention = nn.Linear(2, 2) if has_attention else IdentityOp()
+
+
 def _mhc_model(layers):
     return SimpleNamespace(decoder=SimpleNamespace(layers=nn.ModuleList(layers)))
 
@@ -86,19 +101,22 @@ class MHCMonitorTest(unittest.TestCase):
         mhc_monitor.HyperConnectionModule = self._orig_mod_cls
         training_logs.reset()
 
-    def _identity_layer(self, n, s, b, layer_number=1):
+    def _identity_hc(self, n, s, b, layer_number=1):
         ident = torch.eye(n).reshape(1, 1, n, n).expand(s, b, n, n).contiguous()
+        return FakeHC(
+            n=n,
+            layer_number=layer_number,
+            h_pre=torch.full((s, b, n), 0.5),
+            h_post=torch.ones(s, b, n),
+            h_res=ident,
+        )
 
-        def make_hc():
-            return FakeHC(
-                n=n,
-                layer_number=layer_number,
-                h_pre=torch.full((s, b, n), 0.5),
-                h_post=torch.ones(s, b, n),
-                h_res=ident,
-            )
-
-        return FakeLayer(layer_number=layer_number, attn=make_hc(), mlp=make_hc())
+    def _identity_layer(self, n, s, b, layer_number=1):
+        return FakeLayer(
+            layer_number=layer_number,
+            attn=self._identity_hc(n, s, b, layer_number),
+            mlp=self._identity_hc(n, s, b, layer_number),
+        )
 
     def _drive(self, targets, x_dim):
         # Fire each wrapped compute_mappings (grad enabled -> _should_monitor passes).
@@ -181,6 +199,39 @@ class MHCMonitorTest(unittest.TestCase):
         self.assertIsNone(stored.grad_fn)
         monitor.step()
         self.assertEqual(monitor._composite, {})  # cleared between steps
+
+    def test_layer_boundary_mhc_labels_each_slot_by_its_branch(self):
+        n, s, b = 4, 2, 3
+        attn_slot = FakeBoundaryWrapper(1, self._identity_hc(n, s, b, 1), has_attention=True)
+        mlp_slot = FakeBoundaryWrapper(2, self._identity_hc(n, s, b, 2), has_attention=False)
+        model = _mhc_model([attn_slot, mlp_slot])
+
+        monitor = MHCHealthMonitor(log_per_layer=True, log_global=True)
+        targets = monitor._prepare_layers(model, chunk_id=0)
+        # One hc module per slot, component taken from the branch the slot owns, and the
+        # first slot on the stage is the composite root.
+        self.assertEqual(
+            [(gi, comp, is_root) for gi, comp, _, _, is_root in targets], [(0, "attn", True), (1, "mlp", False)]
+        )
+
+        monitor.allocate_buffers(torch.device("cpu"))
+        monitor._attach_hooks(targets)
+        self._drive(targets, x_dim=n * 8)
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="mhc_health")
+        self.assertIn("mhc_health/layer_0/attn_amax_gain_fwd", latest)
+        self.assertIn("mhc_health/layer_1/mlp_amax_gain_fwd", latest)
+
+    def test_a_chunk_without_an_attention_slot_still_picks_a_root(self):
+        # A PP stage can own MLP-only slots alone; root selection must not require an
+        # "attn" component to exist.
+        n, s, b = 4, 2, 3
+        model = _mhc_model([FakeBoundaryWrapper(1, self._identity_hc(n, s, b, 1), has_attention=False)])
+
+        targets = MHCHealthMonitor()._prepare_layers(model, chunk_id=0)
+
+        self.assertEqual([(comp, is_root) for _, comp, _, _, is_root in targets], [("mlp", True)])
 
 
 class MHCMonitorNoOpTest(unittest.TestCase):

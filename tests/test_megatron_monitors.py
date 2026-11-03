@@ -1022,6 +1022,93 @@ class MegatronOptimUpdateMonitorTest(unittest.TestCase):
         self.assertNotIn("optim/retract_rms", got)
         self.assertEqual(set(got), {"optim/update_rms", "optim/param_rms", "optim/update_param_ratio"})
 
+    def _run_step_per_param(self, names, shapes, retract_by_name=None, orthogonalize=True):
+        """Drive one step with two orthogonalized 2D matrices and per_param on.
+
+        ``retract_by_name`` maps a name to a list of ``(sum_sq, numel)`` pushed into the
+        inner optimizer's ``_retract_pending`` tagged with that param's ``id(main)``, so the
+        monitor can attribute the correction. ``orthogonalize`` gates the per-param capture.
+        """
+        theta_old = torch.randn(shapes[0]) * 0.02
+        opt = _FakeDistOpt(theta_old)
+        mains = [opt.main_param]
+        models = [opt.model_param]
+        for shape in shapes[1:]:
+            m_old = torch.randn(shape) * 0.02
+            main = m_old.detach().clone().float()
+            model = main.to(torch.bfloat16)
+            opt.shard_fp32_from_float16_groups[0].append(main)
+            opt.shard_float16_groups[0].append(model)
+            mains.append(main)
+            models.append(model)
+        inner = SimpleNamespace(_retract_pending=[])
+        if orthogonalize:
+            inner.orthogonalize = lambda *a, **k: None
+        opt.optimizer = inner
+        if retract_by_name:
+            for name, entries in retract_by_name.items():
+                pid = id(mains[names.index(name)])
+                for ss, numel in entries:
+                    inner._retract_pending.append((ss, numel, False, pid))
+        model_obj = SimpleNamespace(named_parameters=lambda: list(zip(names, models, strict=True)))
+        monitor = OptimUpdateMonitor(retraction=bool(retract_by_name), per_param=True, model=model_obj)
+        self.assertTrue(monitor.attach_optimizer(opt))
+        for main in mains:
+            main.add_(torch.randn_like(main) * 3e-4)
+        opt._copy_main_params_to_model_params()
+        try:
+            return mains, models, monitor.step()
+        finally:
+            monitor.remove_hooks()
+
+    def test_per_param_logs_each_matrix(self):
+        torch.manual_seed(11)
+        names = ["decoder.layers.0.self_attention.linear_qkv.weight", "decoder.layers.0.mlp.experts.linear_fc1.weight"]
+        mains, _, got = self._run_step_per_param(names, shapes=[(64, 32), (48, 24)])
+        for name in names:
+            self.assertIn(f"optim/update_rms/{name}", got)
+            self.assertIn(f"optim/param_rms/{name}", got)
+            self.assertAlmostEqual(
+                got[f"optim/update_param_ratio/{name}"],
+                got[f"optim/update_rms/{name}"] / got[f"optim/param_rms/{name}"],
+                places=9,
+            )
+        # Global metrics stay present alongside the per-param breakdown.
+        self.assertIn("optim/update_rms", got)
+
+    def test_per_param_param_rms_matches_local(self):
+        torch.manual_seed(12)
+        names = ["w.a", "w.b"]
+        mains, _, got = self._run_step_per_param(names, shapes=[(64, 32), (40, 20)])
+        for name, main in zip(names, mains, strict=True):
+            want = float(main.pow(2).mean().sqrt())
+            self.assertAlmostEqual(got[f"optim/param_rms/{name}"] / want, 1.0, places=4)
+
+    def test_per_param_retraction_attributed_by_name(self):
+        torch.manual_seed(13)
+        names = ["w.a", "w.b"]
+        retract = {"w.b": [(torch.tensor(0.5), 100), (torch.tensor(0.3), 300)]}
+        _, _, got = self._run_step_per_param(names, shapes=[(64, 32), (40, 20)], retract_by_name=retract)
+        want = math.sqrt((0.5 + 0.3) / (100 + 300))
+        self.assertAlmostEqual(got["optim/retract_rms/w.b"], want, places=6)
+        self.assertAlmostEqual(
+            got["optim/retract_update_ratio/w.b"],
+            got["optim/retract_rms/w.b"] / got["optim/update_rms/w.b"],
+            places=9,
+        )
+        self.assertNotIn("optim/retract_rms/w.a", got)  # no correction pushed for w.a
+
+    def test_per_param_skipped_when_not_orthogonalized(self):
+        torch.manual_seed(14)
+        names = ["w.a"]
+        _, _, got = self._run_step_per_param(names, shapes=[(64, 32)], orthogonalize=False)
+        self.assertNotIn("optim/update_rms/w.a", got)
+        self.assertIn("optim/update_rms", got)  # global still reported
+
+    def test_per_param_off_by_default(self):
+        _, got = self._run_step(torch.randn(64, 32) * 0.02, torch.randn(64, 32) * 1e-4)
+        self.assertFalse(any("/" in k.removeprefix("optim/") for k in got))
+
     def test_debias_keeps_small_updates_accurate(self):
         """A bf16 theta_old rounds, which inflates the raw difference once the update is
         near the bf16 resolution — 11x at lr 3e-6. Debiasing must hold ~1.0x across the

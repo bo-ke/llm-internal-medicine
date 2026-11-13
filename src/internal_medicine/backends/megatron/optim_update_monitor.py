@@ -15,6 +15,13 @@ optimizer's ``_retract_pending`` and pooled like update_rms:
     optim/retract_param_ratio   retract_rms / param_rms
     optim/retract_update_ratio  retract_rms / update_rms  (fraction of net motion that is snap-back)
 
+With ``radial_cos=True`` (opt-in, SkewonR only) one more is logged — the mean over managed
+matrices of ``cos(M, W)``, the momentum's alignment with the weight's radial axis. It is the
+sign the SkewonR radial rule signs, so it is the direct read on whether the free radius is
+being pushed out or in:
+
+    optim/radial_cos           mean cos(momentum, W)  in [-1, 1]
+
 With ``per_param=True`` (opt-in, default off) the same three ratios (and, with
 ``retraction``, the retraction triplet) are also logged per orthogonalized matrix —
 ``optim/update_rms/<name>`` etc. — where ``<name>`` is the dotted parameter name. Only
@@ -116,6 +123,7 @@ class OptimUpdateMonitor:
         debias_low_precision: bool = True,
         retraction: bool = False,
         per_param: bool = False,
+        radial_cos: bool = False,
         model=None,
     ):
         self.monitor_interval = monitor_interval
@@ -124,6 +132,7 @@ class OptimUpdateMonitor:
         self.debias_low_precision = debias_low_precision
         self.retraction = retraction
         self.per_param = per_param
+        self.radial_cos = radial_cos
         self._model = model
         self._patched: list[tuple[Any, str, Any, bool]] = []
         self._pending_dense: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
@@ -132,10 +141,15 @@ class OptimUpdateMonitor:
         # skewon inner optimizer's ``_retract_pending``; (sum_sq, numel) per shard.
         self._pending_dense_retract: list[tuple[torch.Tensor, int]] = []
         self._pending_expert_retract: list[tuple[torch.Tensor, int]] = []
+        # Optional cos(momentum, W) samples (opt-in via ``radial_cos``), drained from a
+        # skewonR inner optimizer's ``_radial_cos_pending``; (cos 0-dim, count) per shard.
+        self._pending_dense_cos: list[tuple[torch.Tensor, float]] = []
+        self._pending_expert_cos: list[tuple[torch.Tensor, float]] = []
         # Per-param buckets (opt-in via ``per_param``), orthogonalized matrices only.
         # update: (name, ss_update, ss_param, ss_bf16_noise, numel); retract: (name, ss, numel).
         self._pending_per_param: list[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
         self._pending_per_param_retract: list[tuple[str, torch.Tensor, int]] = []
+        self._pending_per_param_cos: list[tuple[str, torch.Tensor, float]] = []
         self._main_id_to_name: dict[int, str] = {}  # id(fp32 main) -> dotted name
         self._model_param_name_by_id: dict[int, str] = {}  # id(model param) -> dotted name
         self._name_map_built = False
@@ -301,6 +315,29 @@ class OptimUpdateMonitor:
 
         if self.retraction:
             self._drain_retraction(opt)
+        if self.radial_cos:
+            self._drain_radial_cos(opt)
+
+    def _drain_radial_cos(self, opt) -> None:
+        """Pull a skewonR inner optimizer's per-block cos(momentum, W) samples into the cos
+        buckets. Each entry is ``(cos 0-dim, count, is_expert[, id(main)])``; bucketed like
+        the update sums so it reduces over the same groups in ``step``. Tensors are carried
+        as-is (no D2H here); the division by count happens after the reduce."""
+        inner = getattr(opt, "optimizer", None)
+        pending = getattr(inner, "_radial_cos_pending", None)
+        if not pending:
+            return
+        for entry in pending:
+            c, n, is_expert = entry[0], entry[1], entry[2]
+            if is_expert:
+                self._pending_expert_cos.append((c, n))
+            else:
+                self._pending_dense_cos.append((c, n))
+            if self.per_param and len(entry) > 3:
+                name = self._main_id_to_name.get(entry[3])
+                if name is not None:
+                    self._pending_per_param_cos.append((name, c, n))
+        inner._radial_cos_pending = []
 
     def _drain_retraction(self, opt) -> None:
         """Pull a skewon inner optimizer's per-step retraction sums into the retract
@@ -429,6 +466,17 @@ class OptimUpdateMonitor:
         self._all_reduce(acc, model_group)
         return acc
 
+    def _pool_cos(self, pending, shard_group, model_group, device) -> torch.Tensor:
+        """Reduce one cos bucket's ``(sum_cos, count)`` globally, mirroring ``_pool``.
+        Always issues both collectives so every rank makes the same number of calls."""
+        acc = torch.zeros(2, dtype=torch.float64, device=device)
+        for c, n in pending:
+            acc[0] += c.to(torch.float64)
+            acc[1] += float(n)
+        self._all_reduce(acc, shard_group)
+        self._all_reduce(acc, model_group)
+        return acc
+
     def _all_reduce_world(self, t: torch.Tensor) -> torch.Tensor:
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -439,7 +487,7 @@ class OptimUpdateMonitor:
             return torch.device("cuda", torch.cuda.current_device())
         return torch.device("cpu")
 
-    def _build_pp_name_index(self, per_param, per_param_retract) -> None:
+    def _build_pp_name_index(self, per_param, per_param_retract, per_param_cos=()) -> None:
         """All-gather the per-rank name sets once and freeze a sorted global order.
 
         Each managed matrix has a globally unique dotted name except expert matrices, which
@@ -452,6 +500,7 @@ class OptimUpdateMonitor:
             return
         local = {name for name, *_ in per_param}
         local.update(name for name, *_ in per_param_retract)
+        local.update(name for name, *_ in per_param_cos)
         gathered: list = [local]
         if dist.is_available() and dist.is_initialized():
             gathered = [None] * dist.get_world_size()
@@ -464,15 +513,16 @@ class OptimUpdateMonitor:
             self._pp_name_order = sorted(names)
             self._pp_name_idx = {name: i for i, name in enumerate(self._pp_name_order)}
 
-    def _publish_per_param(self, per_param, per_param_retract) -> None:
+    def _publish_per_param(self, per_param, per_param_retract, per_param_cos=()) -> None:
         """World-reduce the per-matrix sums against the cached name index and publish
         ``optim/{update,param}_rms/<name>``, their ratio, and (with retraction) the
-        per-matrix retraction triplet. One packed ``[N,4]`` SUM covers update/param; a
-        second ``[N,2]`` SUM covers the retraction correction. Owner-unique for dense,
+        per-matrix retraction triplet, plus (with radial_cos) ``optim/radial_cos/<name>``.
+        One packed ``[N,4]`` SUM covers update/param; a second ``[N,2]`` SUM covers the
+        retraction correction; a third covers the cos samples. Owner-unique for dense,
         expert-pooled for expert — SUM is exactly the per-matrix aggregate either way.
         """
         device = self._collective_device()
-        self._build_pp_name_index(per_param, per_param_retract)
+        self._build_pp_name_index(per_param, per_param_retract, per_param_cos)
         order = self._pp_name_order
         if not order:
             return
@@ -493,8 +543,17 @@ class OptimUpdateMonitor:
                 ret[i, 0] += ss.to(torch.float64)
                 ret[i, 1] += float(numel)
             self._all_reduce_world(ret)
+        cos = None
+        if self.radial_cos:
+            cos = torch.zeros((n, 2), dtype=torch.float64, device=device)
+            for name, c, numel in per_param_cos:
+                i = self._pp_name_idx[name]
+                cos[i, 0] += c.to(torch.float64)
+                cos[i, 1] += float(numel)
+            self._all_reduce_world(cos)
         upd_c = upd.cpu()
         ret_c = ret.cpu() if ret is not None else None
+        cos_c = cos.cpu() if cos is not None else None
         for i, name in enumerate(order):
             cnt = float(upd_c[i, 3])
             if cnt <= 0.0:
@@ -517,8 +576,10 @@ class OptimUpdateMonitor:
                 self.latest[f"{METRIC_PREFIX}/retract_update_ratio/{name}"] = (
                     retract_rms / update_rms if update_rms > 0 else 0.0
                 )
+            if cos_c is not None and float(cos_c[i, 1]) > 0.0:
+                self.latest[f"{METRIC_PREFIX}/radial_cos/{name}"] = float(cos_c[i, 0]) / float(cos_c[i, 1])
 
-    def _publish_global(self, dense, expert, dense_retract, expert_retract) -> None:
+    def _publish_global(self, dense, expert, dense_retract, expert_retract, dense_cos=(), expert_cos=()) -> None:
         """Pool the global update/param (and optional retraction) sums into ``self.latest``.
 
         Mirrors ``calc_params_l2_norm``: dense over (DP+CP, model-parallel), expert over
@@ -568,6 +629,16 @@ class OptimUpdateMonitor:
                 self.latest[f"{METRIC_PREFIX}/retract_update_ratio"] = (
                     retract_rms / update_rms if update_rms > 0 else 0.0
                 )
+        if self.radial_cos:
+            cacc = self._pool_cos(dense_cos, self._dp_cp_group, self._mp_group, device)
+            cacc += self._pool_cos(
+                expert_cos,
+                self._expt_dp_group or self._dp_cp_group,
+                self._expert_group or self._mp_group,
+                device,
+            )
+            if float(cacc[1]) > 0.0:
+                self.latest[f"{METRIC_PREFIX}/radial_cos"] = float(cacc[0] / cacc[1].clamp(min=1.0))
 
     @torch.no_grad()
     def step(self, global_step: int | None = None) -> dict[str, float]:
@@ -595,11 +666,14 @@ class OptimUpdateMonitor:
         expert_retract, self._pending_expert_retract = self._pending_expert_retract, []
         per_param, self._pending_per_param = self._pending_per_param, []
         per_param_retract, self._pending_per_param_retract = self._pending_per_param_retract, []
+        dense_cos, self._pending_dense_cos = self._pending_dense_cos, []
+        expert_cos, self._pending_expert_cos = self._pending_expert_cos, []
+        per_param_cos, self._pending_per_param_cos = self._pending_per_param_cos, []
         self.latest = {}
 
-        self._publish_global(dense, expert, dense_retract, expert_retract)
+        self._publish_global(dense, expert, dense_retract, expert_retract, dense_cos, expert_cos)
         if self.per_param and was_monitor_step:
-            self._publish_per_param(per_param, per_param_retract)
+            self._publish_per_param(per_param, per_param_retract, per_param_cos)
 
         if self.latest:
             training_logs.update(**self.latest)
@@ -621,6 +695,9 @@ class OptimUpdateMonitor:
         self._pending_expert_retract = []
         self._pending_per_param = []
         self._pending_per_param_retract = []
+        self._pending_dense_cos = []
+        self._pending_expert_cos = []
+        self._pending_per_param_cos = []
 
 
 def setup_optim_update_monitor(
@@ -631,6 +708,7 @@ def setup_optim_update_monitor(
     verbose: bool = False,
     retraction: bool = False,
     per_param: bool = False,
+    radial_cos: bool = False,
     **_ignored,
 ):
     """Enable ``optim/update_rms`` + ``param_rms``. Always installed; no opt-in needed.
@@ -645,6 +723,12 @@ def setup_optim_update_monitor(
     ``optim/retract_param_ratio`` + ``optim/retract_update_ratio`` for Skewon: the RMS of
     the per-step polar-retraction correction, drained from the inner optimizer's
     ``_retract_pending`` and pooled like ``update_rms``. Absent on Muon/Adam (no retraction).
+
+    ``radial_cos`` (opt-in, default off) additionally logs ``optim/radial_cos`` — the mean
+    over managed matrices of cos(momentum, W), drained from a SkewonR inner optimizer's
+    ``_radial_cos_pending``. It is the sign SkewonR's radial rule signs, so it reads directly
+    on whether the free weight radius is being pushed out (+) or in (−). Absent on
+    Muon/MuonH/Adam (nothing publishes it).
 
     ``per_param`` (opt-in, default off) additionally logs the per-matrix breakdown
     ``optim/update_rms/<name>``, ``param_rms/<name>``, ``update_param_ratio/<name>`` (and,
@@ -665,6 +749,7 @@ def setup_optim_update_monitor(
         verbose=verbose,
         retraction=retraction,
         per_param=per_param,
+        radial_cos=radial_cos,
         model=model,
     )
     if optimizer is not None:

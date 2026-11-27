@@ -17,7 +17,7 @@
 - **Grad Health** — 反向激活梯度 `dL/d(activation)` 的逐层 L2 健康监控 (每位置 12 指标；paddlefleet + megatron 双后端；`nonfinite_fraction` 与 `rms_depth_ratio` 仅 megatron)
 
 以及一个挂在**优化器**而不是模型上的模块，**始终装上**（无需点名，调用方零改动；上报频率同样受 `monitor_interval` 门控）：
-- **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看
+- **[Optimizer Update](./docs/optim_update.md)** — `optim/update_rms`、`optim/param_rms`、`optim/update_param_ratio`，与 grad norm 并排看；`per_param=True` 时同样三件套按参数逐个出（`optim/param_rms/<name>`，与优化器无关，覆盖 Muon 侧矩阵与 Adam 侧 embedding/LN/bias）
 
 ---
 

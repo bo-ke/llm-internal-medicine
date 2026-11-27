@@ -23,11 +23,18 @@ being pushed out or in:
     optim/radial_cos           mean cos(momentum, W)  in [-1, 1]
 
 With ``per_param=True`` (opt-in, default off) the same three ratios (and, with
-``retraction``, the retraction triplet) are also logged per orthogonalized matrix —
-``optim/update_rms/<name>`` etc. — where ``<name>`` is the dotted parameter name. Only
-Skewon/Muon-managed matrices are broken out (the inner optimizer exposes ``orthogonalize``);
-names are resolved from the model param in the monitor's triple, and a one-time world
-all_gather fixes a global name order so one packed SUM reduces every matrix at once.
+``retraction``, the retraction triplet) are also logged per parameter —
+``optim/update_rms/<name>`` etc. — where ``<name>`` is the dotted parameter name. The
+breakout is optimizer-agnostic: every param the monitored optimizer owns and that the
+model can name is reported, whatever updates it (Muon / MuonH / Skewon / Adam) and
+whatever its rank — expert and dense matrices, embeddings, norm and bias vectors. This
+matters because the pooled values are element-weighted and a handful of norm vectors
+(RMS ~1-2) outweigh billions of matrix elements (RMS ~0.02), so the pooled curve says
+little about any individual tensor. Names are resolved from the model param in the
+monitor's triple, and a one-time world all_gather fixes a global name order so one
+packed SUM reduces every param at once. The per-param ``retraction`` / ``radial_cos``
+channels stay Skewon/MuonH-only by nature — they drain the inner optimizer's own
+pending lists, which no other optimizer produces.
 
 No copy of the parameters is kept. ``MixedPrecisionOptimizer.step_with_ready_grads``
 runs ``self.optimizer.step()`` and then ``self._copy_main_params_to_model_params()``;
@@ -145,7 +152,7 @@ class OptimUpdateMonitor:
         # skewonR inner optimizer's ``_radial_cos_pending``; (cos 0-dim, count) per shard.
         self._pending_dense_cos: list[tuple[torch.Tensor, float]] = []
         self._pending_expert_cos: list[tuple[torch.Tensor, float]] = []
-        # Per-param buckets (opt-in via ``per_param``), orthogonalized matrices only.
+        # Per-param buckets (opt-in via ``per_param``), every named param the optimizer owns.
         # update: (name, ss_update, ss_param, ss_bf16_noise, numel); retract: (name, ss, numel).
         self._pending_per_param: list[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
         self._pending_per_param_retract: list[tuple[str, torch.Tensor, int]] = []
@@ -162,6 +169,8 @@ class OptimUpdateMonitor:
         self._expert_group = None
         self._warned_fp32 = False
         self._warned_no_pairs = False
+        self._pp_unnamed = 0  # params the name map could not resolve; pooled-only
+        self._warned_pp_unnamed = False
         self.latest: dict[str, float] = {}
 
     def _should_monitor(self) -> bool:
@@ -291,27 +300,45 @@ class OptimUpdateMonitor:
                 "they are excluded from update_rms."
             )
         tp_group = getattr(opt, "tp_group", None)
-        inner = getattr(opt, "optimizer", None)
-        capture_pp = self.per_param and inner is not None and hasattr(inner, "orthogonalize")
+        capture_pp = self.per_param
         if capture_pp:
             self._ensure_name_map()
         for main, model_shard, model_param in triples:
             if main is None or model_shard is None or main.numel() != model_shard.numel():
                 continue
             owner = model_param if model_param is not None else model_shard
-            if not _param_is_not_shared(owner) or not _param_is_not_tp_duplicate(owner, tp_group):
+            # The pooled buckets must dedup (a replicated param counted once per rank would
+            # skew the world mean). Per-param must not: ``_publish_per_param`` SUMs ss and
+            # numel into the same name slot, so a replicated param scales both and
+            # ``sqrt(ss/numel)`` is unchanged -- that is what lets embeddings (``shared``)
+            # and TP-replicated params be broken out here while staying out of the pool.
+            keep_pooled = _param_is_not_shared(owner) and _param_is_not_tp_duplicate(owner, tp_group)
+            if not keep_pooled and not capture_pp:
                 continue
+            # One extra sum-of-squares per otherwise-skipped param (on l12: the 205M-element
+            # embedding plus ~67 norm vectors). Measured against the monitor interval this is
+            # noise; no D2H and no collective is added here -- the world SUM stays at flush.
             sums = _pair_sums(main.detach(), model_shard.detach())
-            if getattr(owner, "allreduce", True):
-                self._pending_dense.append(sums)
-            else:
-                self._pending_expert.append(sums)
-            if capture_pp and main.dim() == 2:
+            if keep_pooled:
+                if getattr(owner, "allreduce", True):
+                    self._pending_dense.append(sums)
+                else:
+                    self._pending_expert.append(sums)
+            if capture_pp:
                 name = self._model_param_name_by_id.get(id(owner))
-                if name is not None:
+                if name is None:
+                    self._pp_unnamed += 1
+                else:
                     self._main_id_to_name[id(main)] = name
                     ss_u, ss_p, ss_q, n = sums
                     self._pending_per_param.append((name, ss_u, ss_p, ss_q, n))
+        if capture_pp and self._pp_unnamed and not self._warned_pp_unnamed:
+            self._warned_pp_unnamed = True
+            logger.warning(
+                "[OptimUpdateMonitor] per_param: %d params are missing from the model's "
+                "named_parameters(); they stay pooled-only.",
+                self._pp_unnamed,
+            )
 
         if self.retraction:
             self._drain_retraction(opt)
@@ -730,11 +757,14 @@ def setup_optim_update_monitor(
     on whether the free weight radius is being pushed out (+) or in (−). Absent on
     Muon/MuonH/Adam (nothing publishes it).
 
-    ``per_param`` (opt-in, default off) additionally logs the per-matrix breakdown
+    ``per_param`` (opt-in, default off) additionally logs the per-param breakdown
     ``optim/update_rms/<name>``, ``param_rms/<name>``, ``update_param_ratio/<name>`` (and,
-    with ``retraction``, the per-matrix retraction triplet) for every orthogonalized matrix
-    — the set Skewon/Muon actually act on. Names come from ``model.named_parameters()`` via
-    the monitor's param triple; a one-time world all_gather fixes a global name order.
+    with ``retraction``, the per-matrix retraction triplet) for **every** param the
+    optimizer owns that the model can name — optimizer-agnostic, so Adam-managed
+    embeddings and norm vectors show up next to the Muon-managed matrices. Names come from
+    ``model.named_parameters()`` via the monitor's param triple; a one-time world
+    all_gather fixes a global name order. Params the name map cannot resolve are counted
+    and warned about once, then left pooled-only.
 
     ``monitor_interval`` is honoured exactly like the model-side monitors: these are
     slow-moving scalars, so reporting them every step would only add log noise and two

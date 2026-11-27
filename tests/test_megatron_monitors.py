@@ -1022,12 +1022,14 @@ class MegatronOptimUpdateMonitorTest(unittest.TestCase):
         self.assertNotIn("optim/retract_rms", got)
         self.assertEqual(set(got), {"optim/update_rms", "optim/param_rms", "optim/update_param_ratio"})
 
-    def _run_step_per_param(self, names, shapes, retract_by_name=None, orthogonalize=True):
-        """Drive one step with two orthogonalized 2D matrices and per_param on.
+    def _run_step_per_param(self, names, shapes, retract_by_name=None, orthogonalize=True, shared_names=()):
+        """Drive one step with the given params and per_param on.
 
         ``retract_by_name`` maps a name to a list of ``(sum_sq, numel)`` pushed into the
         inner optimizer's ``_retract_pending`` tagged with that param's ``id(main)``, so the
-        monitor can attribute the correction. ``orthogonalize`` gates the per-param capture.
+        monitor can attribute the correction. ``orthogonalize`` adds that attribute to the
+        inner optimizer (the per-param capture no longer depends on it). ``shared_names``
+        marks model params ``shared=True``, the way Megatron marks word embeddings.
         """
         theta_old = torch.randn(shapes[0]) * 0.02
         opt = _FakeDistOpt(theta_old)
@@ -1041,6 +1043,8 @@ class MegatronOptimUpdateMonitorTest(unittest.TestCase):
             opt.shard_float16_groups[0].append(model)
             mains.append(main)
             models.append(model)
+        for name in shared_names:
+            models[names.index(name)].shared = True
         inner = SimpleNamespace(_retract_pending=[])
         if orthogonalize:
             inner.orthogonalize = lambda *a, **k: None
@@ -1098,12 +1102,64 @@ class MegatronOptimUpdateMonitorTest(unittest.TestCase):
         )
         self.assertNotIn("optim/retract_rms/w.a", got)  # no correction pushed for w.a
 
-    def test_per_param_skipped_when_not_orthogonalized(self):
+    def test_per_param_is_optimizer_agnostic(self):
+        """No ``orthogonalize`` on the inner optimizer (plain Adam) must still break out.
+
+        The breakout used to be gated on the inner optimizer exposing ``orthogonalize``,
+        which silently gave an Adam run zero per-param curves.
+        """
         torch.manual_seed(14)
         names = ["w.a"]
         _, _, got = self._run_step_per_param(names, shapes=[(64, 32)], orthogonalize=False)
-        self.assertNotIn("optim/update_rms/w.a", got)
+        self.assertIn("optim/update_rms/w.a", got)
+        self.assertIn("optim/param_rms/w.a", got)
         self.assertIn("optim/update_rms", got)  # global still reported
+
+    def test_per_param_covers_1d_params(self):
+        """Norm/bias vectors are what dominate the pooled value, so they must be visible."""
+        torch.manual_seed(15)
+        names = ["w.a", "ln.weight"]
+        mains, _, got = self._run_step_per_param(names, shapes=[(64, 32), (1024,)])
+        self.assertIn("optim/param_rms/ln.weight", got)
+        self.assertAlmostEqual(got["optim/param_rms/ln.weight"], float(mains[1].pow(2).mean().sqrt()), places=6)
+
+    def test_per_param_covers_shared_params_without_polluting_the_pool(self):
+        """A ``shared`` param (Megatron marks word embeddings so) gets its own curve, and
+        stays out of the pooled value, which still has to dedup it."""
+        torch.manual_seed(16)
+        names = ["w.a", "embedding.word_embeddings.weight"]
+        mains, _, got = self._run_step_per_param(
+            names, shapes=[(64, 32), (128, 32)], shared_names=["embedding.word_embeddings.weight"]
+        )
+        emb_rms = float(mains[1].pow(2).mean().sqrt())
+        self.assertIn("optim/param_rms/embedding.word_embeddings.weight", got)
+        self.assertAlmostEqual(got["optim/param_rms/embedding.word_embeddings.weight"], emb_rms, places=6)
+        # pooled covers only w.a
+        self.assertAlmostEqual(got["optim/param_rms"], float(mains[0].pow(2).mean().sqrt()), places=6)
+        self.assertNotAlmostEqual(got["optim/param_rms"], emb_rms, places=4)
+
+    def test_per_param_unnamed_params_are_counted_and_warned_once(self):
+        torch.manual_seed(17)
+        theta_old = torch.randn(64, 32) * 0.02
+        opt = _FakeDistOpt(theta_old)
+        opt.optimizer = SimpleNamespace(_retract_pending=[])
+        model_obj = SimpleNamespace(named_parameters=lambda: [])  # nothing resolves
+        monitor = OptimUpdateMonitor(per_param=True, model=model_obj)
+        self.assertTrue(monitor.attach_optimizer(opt))
+        try:
+            with self.assertLogs("internal_medicine", level="WARNING") as logs:
+                opt.main_param.add_(torch.randn_like(opt.main_param) * 3e-4)
+                opt._copy_main_params_to_model_params()
+                got = monitor.step()
+                opt.main_param.add_(torch.randn_like(opt.main_param) * 3e-4)
+                opt._copy_main_params_to_model_params()
+                monitor.step()
+        finally:
+            monitor.remove_hooks()
+        self.assertEqual(monitor._pp_unnamed, 2)
+        self.assertEqual(len([m for m in logs.output if "pooled-only" in m]), 1)
+        self.assertIn("optim/param_rms", got)  # pooled still reported
+        self.assertFalse(any(k.startswith("optim/param_rms/") for k in got))
 
     def test_per_param_off_by_default(self):
         _, got = self._run_step(torch.randn(64, 32) * 0.02, torch.randn(64, 32) * 1e-4)

@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from ...core.training_logs import training_logs
 from .base import TorchProbe
+from .layer_discovery import find_transformer_layers, unwrap_layer
 from .moe_metrics import (
     compute_bias_affinity_jaccard,
     compute_expert_norms,
@@ -106,6 +107,7 @@ class MoESpecialistMonitor(TorchProbe):
         self._global_lb_enabled = False
         self._load_balance_routers: list[tuple[int, weakref.ref]] = []
         self._orig_reset_model_temporary_tensors = None
+        self._warned_jaccard_shape = False
 
     def register_hooks(self, model: nn.Module):
         self._init_parallel_state()
@@ -329,35 +331,28 @@ class MoESpecialistMonitor(TorchProbe):
 
     def _find_moe_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
         moe_layers = []
-        if hasattr(model, "module"):
-            model = model.module
-        layers = None
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            layers = model.decoder.layers
-        elif hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            layers = model.encoder.layers
-        elif hasattr(model, "layers"):
-            layers = model.layers
-        elif hasattr(model, "language_model"):
-            lm = model.language_model
-            if hasattr(lm, "decoder") and hasattr(lm.decoder, "layers"):
-                layers = lm.decoder.layers
-            elif hasattr(lm, "encoder") and hasattr(lm.encoder, "layers"):
-                layers = lm.encoder.layers
-        if layers is None:
+        layers = find_transformer_layers(model)
+        if not layers:
+            # Unknown layout (or a stage that owns no layers, where the scan finds
+            # nothing either): fall back to a name scan with positional indices.
+            if hasattr(model, "module"):
+                model = model.module
             for _, module in model.named_modules():
                 if module.__class__.__name__ in ("MoELayer", "BaseMoELayer"):
                     moe_layers.append((len(moe_layers), module))
             return moe_layers
-        for local_idx, layer in enumerate(layers):
+        for local_idx, layer in layers:
             global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
+            # Probe the unwrapped layer (layer-boundary mHC nests it under
+            # inner_layer and proxies nothing); the wrapper still carries layer_number.
+            probe = unwrap_layer(layer)
             moe_module = None
-            if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
-                moe_module = layer.mlp
-            elif hasattr(layer, "moe"):
-                moe_module = layer.moe
-            elif hasattr(layer, "router"):
-                moe_module = layer
+            if hasattr(probe, "mlp") and hasattr(probe.mlp, "router"):
+                moe_module = probe.mlp
+            elif hasattr(probe, "moe"):
+                moe_module = probe.moe
+            elif hasattr(probe, "router"):
+                moe_module = probe
             if moe_module is not None:
                 moe_layers.append((global_idx, moe_module))
         return moe_layers
@@ -430,7 +425,20 @@ class MoESpecialistMonitor(TorchProbe):
             routing_after = outputs[1]
             num_experts = getattr(router, "num_experts", None) or getattr(router, "num_moe_experts", None)
             jaccard = compute_bias_affinity_jaccard(routing_map_for_aux_loss, routing_after, num_experts=num_experts)
-            self.record_layer_metric(layer_idx, "bias_affinity_jaccard", jaccard)
+            if jaccard is not None:
+                self.record_layer_metric(layer_idx, "bias_affinity_jaccard", jaccard)
+            elif not self._warned_jaccard_shape:
+                # Shapes/dtypes only -- reading a routing-map value here would sync.
+                self._warned_jaccard_shape = True
+                logger.warning(
+                    "[MoEMonitor] bias_affinity_jaccard skipped: cannot reconcile routing maps "
+                    "before=%s/%s after=%s/%s num_experts=%s",
+                    tuple(routing_map_for_aux_loss.shape),
+                    routing_map_for_aux_loss.dtype,
+                    tuple(routing_after.shape),
+                    routing_after.dtype,
+                    num_experts,
+                )
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
         # expert_norm_mean aggregates only this rank's local experts; the

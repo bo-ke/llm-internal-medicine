@@ -12,10 +12,17 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
-from .layer_discovery import find_transformer_layers
+from .layer_discovery import (
+    find_transformer_layers,
+    is_identity_module,
+    resolve_config,
+    resolve_residual_streams,
+    unwrap_layer,
+)
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
+    compute_activation_scale_stats,
     compute_grad_gain_bounds,
     compute_hidden_spectral_entropy,
     compute_logit_lens_entropy,
@@ -90,8 +97,9 @@ class MassiveActivationMonitor(TorchProbe):
         self.absolute_thresholds = tuple(absolute_thresholds)
         self.log_post_norm_metrics = log_post_norm_metrics
         # Single knob for the residual-scale/gain group: activation_rms plus the
-        # per-token spectral-norm bounds. activation_rms is derived from the same
-        # per-token pre-RMS the spectral hook computes, so they share one flag.
+        # per-token spectral-norm bounds. On a wide residual these read different tensors --
+        # activation_rms the layer's H-wide norm input, the bounds the n*H-wide
+        # residual (a ratio, so width-invariant).
         self.log_activation_rms = log_activation_rms
         # Per-layer Lipschitz constant estimate, captured in the backward pass: the
         # per-token gradient-gain ratio ‖∂L/∂x‖/‖∂L/∂y‖ bounds the layer Jacobian's
@@ -135,6 +143,12 @@ class MassiveActivationMonitor(TorchProbe):
         self.tp_group = None
         self._warned_per_channel_aggregate = False
         self._post_norm_failed_layers: set[int] = set()
+        # Layer-boundary mHC and wide_residual both make the inter-layer tensor [s, b, n*H].
+        # Resolved per chunk in _prepare_layers; gates only the metrics that have no
+        # single-stream tensor to read (the channel/scale family uses the real norm input).
+        self._residual_streams = 1
+        self._hidden_size = None
+        self._warned_norm_recompute = False
 
     def _layer_metric_names(self) -> tuple[str, ...]:
         names = [
@@ -199,28 +213,52 @@ class MassiveActivationMonitor(TorchProbe):
         except ImportError:
             pass
 
-    def _prepare_layers(self, model: nn.Module, layer_offset: int = 0) -> list[tuple[int, nn.Module]]:
+    def _prepare_layers(self, model: nn.Module, layer_offset: int = 0) -> list[tuple[int, nn.Module, nn.Module | None]]:
         layers = self._find_transformer_layers(model)
         if not layers:
             logger.warning("[MassiveActMonitor] No transformer layers found!")
             return []
+        self._resolve_residual_streams(model)
 
-        targets: list[tuple[int, nn.Module]] = []
+        targets: list[tuple[int, nn.Module, nn.Module | None]] = []
         for local_idx, layer in layers:
             global_idx = self._resolve_layer_idx(layer, local_idx, len(layers), layer_offset)
             if self.sample_layers and global_idx not in self.sample_layers:
                 continue
-            targets.append((global_idx, layer))
+            targets.append((global_idx, layer, self._resolve_input_norm(layer)))
+
+        # Without a real norm the channel/post-norm family falls back to the residual
+        # pre-hook, which cannot produce post_norm_*; on a wide residual it is dropped
+        # entirely (see _attach_hooks). Say so instead of letting the keys vanish at flush.
+        unnormed = [idx for idx, _, norm in targets if norm is None]
+        if unnormed:
+            dropped = (
+                "channel_*, activation_rms*, post_norm_* and hidden_spectral_entropy"
+                if self._is_wide_residual()
+                else "post_norm_* and hidden_spectral_entropy"
+            )
+            logger.warning(
+                "[MassiveActMonitor] %d/%d layers expose no input norm (first: %s); %s will be absent for them.",
+                len(unnormed),
+                len(targets),
+                unnormed[:8],
+                dropped,
+            )
 
         # Resolve the LM head once per chunk for the logit-lens metrics (entropy and/or
         # cross-entropy share it). Returns (None, None) on PP stages that don't own the
         # head weight, which keeps the metric a clean no-op there (no weight broadcast).
         head_weight, head_norm = (None, None)
         if self._logit_lens_enabled():
-            head_weight, head_norm = self._resolve_lm_head(model)
+            if self._is_wide_residual():
+                # The layer output is the n-stream concatenation, not a hidden vector the
+                # LM head can consume.
+                logger.warning("[MassiveActMonitor] logit-lens disabled: multi-stream residual.")
+            else:
+                head_weight, head_norm = self._resolve_lm_head(model)
 
         head_owned_eligible = False
-        for global_idx, _ in targets:
+        for global_idx, _, _ in targets:
             for name in self._layer_metric_names():
                 self.declare_layer_metric(global_idx, name)
             # Logit-lens keys are declared ONLY on the head-owning chunk, and only for
@@ -241,7 +279,7 @@ class MassiveActivationMonitor(TorchProbe):
             self._label_capture_models.append(model)
         return targets
 
-    def _attach_hooks(self, targets: list[tuple[int, nn.Module]], model: nn.Module | None = None):
+    def _attach_hooks(self, targets: list[tuple[int, nn.Module, nn.Module | None]], model: nn.Module | None = None):
         # Cross-entropy: capture the forward's `labels` kwarg once per head-owning chunk.
         # A model-level pre-hook fires before the layer hooks, so _captured_labels is
         # fresh when the logit-lens hook reads it. Attaches only where CE is enabled and
@@ -250,17 +288,20 @@ class MassiveActivationMonitor(TorchProbe):
             cap_hook = model.register_forward_pre_hook(self._make_label_capture_hook(), with_kwargs=True)
             self.hooks.append(cap_hook)
         registered = 0
-        for global_idx, layer in targets:
-            norm_layer = getattr(layer, "input_layernorm", None)
+        for global_idx, layer, norm_layer in targets:
             if norm_layer is not None:
                 hook = norm_layer.register_forward_hook(
                     self.timed_hook("input_layernorm", self._make_input_layernorm_hook(global_idx)), with_kwargs=True
                 )
-            else:
+                self.hooks.append(hook)
+            elif not self._is_wide_residual():
                 hook = layer.register_forward_pre_hook(
                     self.timed_hook("residual", self._make_residual_hook(global_idx)), with_kwargs=True
                 )
-            self.hooks.append(hook)
+                self.hooks.append(hook)
+            # Otherwise skipped: the only tensor available is the n-stream concatenation,
+            # and channel/scale metrics read off it would be n*H wide -- a different unit
+            # from the sibling layers that do own a norm, in the same global_* key.
             # Spectral-norm bounds need BOTH the layer input and output, so they
             # ride a dedicated forward hook on the layer itself (the residual/
             # input_layernorm hooks above only see the input).
@@ -298,6 +339,54 @@ class MassiveActivationMonitor(TorchProbe):
 
     def _find_transformer_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
         return find_transformer_layers(model)
+
+    def _resolve_residual_streams(self, model: nn.Module):
+        """Read the residual-stream count off the model config (cold path)."""
+        self._residual_streams, self._hidden_size = resolve_residual_streams(model)
+        self._warn_if_norm_recompute(resolve_config(model))
+
+    def _warn_if_norm_recompute(self, config) -> None:
+        """Flag the selective recompute modes that move the norm hooks to backward.
+
+        Both wide-residual schemes route a layer's real norm through a
+        ``CheckpointWithoutOutput``, so its forward runs under ``no_grad`` (records
+        nothing) and the recording happens in ``rebuild()`` -- per-channel TP all-reduce
+        included, where it contends with gradient reduction.
+        """
+        if self._warned_norm_recompute or not self._is_wide_residual() or config is None:
+            return
+        if getattr(config, "recompute_granularity", None) != "selective":
+            return
+        modules = {"mhc", "residual_stream"} & set(getattr(config, "recompute_modules", None) or ())
+        if not modules:
+            return
+        self._warned_norm_recompute = True
+        logger.warning(
+            "[MassiveActMonitor] recompute_modules includes %s: norm-hook metrics are recorded "
+            "during backward, and microbatches that are not replayed record nothing.",
+            sorted(modules),
+        )
+
+    def _is_wide_residual(self) -> bool:
+        return self._residual_streams > 1 and bool(self._hidden_size)
+
+    def _resolve_input_norm(self, layer: nn.Module) -> nn.Module | None:
+        """The norm whose input is this layer's residual, or ``None`` if there is none.
+
+        Hybrid layers are attention-only or MLP-only, so the real norm is
+        ``input_layernorm`` on the former and ``pre_mlp_layernorm`` on the latter (the
+        other slot is an ``IdentityOp``). Both see the layer input, which on a wide residual
+        is the aggregated single-stream ``[s, b, H]`` tensor the model itself computed --
+        hence the classic H-wide channel semantics, with no merge on our side. Looked up
+        on the unwrapped layer; wrappers proxy nothing.
+        """
+        inner = unwrap_layer(layer)
+        for name in ("input_layernorm", "pre_mlp_layernorm"):
+            norm = getattr(inner, name, None)
+            if is_identity_module(norm):
+                continue
+            return norm
+        return None
 
     def _resolve_lm_head(self, model: nn.Module):
         """Return ``(lm_head_weight, final_norm)`` for this model chunk, else ``(None, None)``.
@@ -411,10 +500,7 @@ class MassiveActivationMonitor(TorchProbe):
     def _compute_spectral_norm(self, layer_idx: int, pre: torch.Tensor, post: torch.Tensor):
         if pre.shape[-1] == 0 or pre.numel() == 0 or post.numel() == 0:
             return
-        # pre is the layer input residual — the same tensor the input_layernorm /
-        # residual hook sees — so activation_rms is derived here for free from the
-        # per-token pre-RMS instead of squaring the input a second time.
-        tensor_metrics = compute_spectral_norm_bounds(pre, post, include_activation_rms=True)
+        tensor_metrics = compute_spectral_norm_bounds(pre, post)
         for name, val in tensor_metrics.items():
             self.record_layer_metric(layer_idx, name, val)
 
@@ -547,6 +633,8 @@ class MassiveActivationMonitor(TorchProbe):
             k=self.topk_channels,
             absolute_thresholds=self.absolute_thresholds,
         )
+        if self.log_activation_rms:
+            tensor_metrics.update(compute_activation_scale_stats(hidden_states))
 
         for name, val in tensor_metrics.items():
             self.record_layer_metric(layer_idx, name, val)

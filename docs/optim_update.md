@@ -91,6 +91,37 @@ count 用 fp64：总参数量 × shard 数远超 fp32 的 `2**24` 精确整数�
 即使某个 bucket 本 rank 没有 shard，也照样发起两次 collective —— 一个 rank 可能没有 expert
 shard 而 peer 有，跳过就会挂。
 
+## 逐参数打点（`per_param`，默认关）
+
+三个聚合标量是**按元素加权**的，所以它们回答不了"某个张量的范数动了没有"。实测的反例：
+一个 l12 MoE 上 LN 权重只有 31.9K 个元素但 RMS ~2.5，而 managed 矩阵有 3.73B 个元素、
+RMS ~0.017 —— 平方和里前者和后者量级相当，于是 managed 矩阵涨 3 倍聚合值几乎不动，
+而 LN 动一下聚合值就跟着走。拿聚合值反推单个矩阵，会错一个量级。
+
+`per_param=True` 额外给每个参数出一份同样的三件套（开了 `retraction` 再多一组）：
+
+```
+optim/update_rms/<name>          optim/param_rms/<name>          optim/update_param_ratio/<name>
+```
+
+`<name>` 是 `model.named_parameters()` 里的点分名。覆盖范围**与优化器无关**：只要是被监控
+优化器持有、且模型能给出名字的参数就出曲线 —— Muon/MuonH/Skewon 管的矩阵、Adam 管的
+embedding、LN 与 bias，一视同仁。叫不出名字的参数会被计数并 warning 一次，然后只进聚合值。
+
+两点实现约束值得知道：
+
+- **聚合桶要去重，逐参数不能去重。** 复制的参数（`shared` 的 word embedding、TP 复制的参数）
+  被每个 rank 各算一次会歪掉世界均值，所以聚合桶排掉它们；而逐参数是按名字槽位把 `ss` 和
+  `numel` 一起 SUM，复制 N 份时两者同倍放大，`sqrt(ss/numel)` 不变 —— 这正是 embedding
+  能出曲线却不污染聚合值的原因。TP 分片的矩阵也靠这条把各分片汇成整矩阵范数，expert 同名
+  跨 EP 汇聚同理。
+- **retraction / radial_cos 的逐参数支路仍然只有 Skewon/MuonH 有**：它们排空的是内层优化器
+  自己的 `_retract_pending` / `_radial_cos_pending`，别的优化器不产生这些。
+
+开销：多出来的只是原本被聚合桶跳过的那批参数各算一次平方和（l12 上是 embedding 的 205M
+元素加 67 个范数向量），且不新增 D2H、不新增 hook 期 collective —— 名字序的 all_gather 与
+打包 SUM 都在 flush 时，规模随"有名参数数"增长。
+
 ## 未覆盖的部分
 
 - **纯 fp32 参数**（`shard_fp32_groups`）就地更新，不存在"更新前的副本"，因此不计入

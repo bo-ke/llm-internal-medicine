@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from .base import TorchProbe
+from .layer_discovery import find_transformer_layers, is_identity_module, unwrap_layer
 from .sink_head_metrics import compute_sink_head_classification
 from .triton_kernels import compute_qk_stats, compute_qk_stats_packed
 
@@ -108,26 +109,22 @@ class QKStatsMonitor(TorchProbe):
         logger.info(f"[QKMonitor] Registered {len(self.hooks)} hooks.")
 
     def _find_attention_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
+        """``[(global_idx, attention_module)]`` for the layers that own an attention.
+
+        Read off the unwrapped layer -- layer-boundary mHC nests the real layer under
+        ``inner_layer`` and proxies no attributes. A hybrid MLP-only slot carries an
+        ``IdentityOp`` in the attention position and is skipped, so it declares no key
+        it could never fill.
+        """
         attention_layers = []
-        if hasattr(model, "module"):
-            model = model.module
-        layers = None
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            layers = model.decoder.layers
-        elif hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            layers = model.encoder.layers
-        elif hasattr(model, "layers"):
-            layers = model.layers
-        if layers is None:
-            return []
-        for local_idx, layer in enumerate(layers):
+        layers = find_transformer_layers(model)
+        for local_idx, layer in layers:
             global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
-            attn = None
-            if hasattr(layer, "self_attention"):
-                attn = layer.self_attention
-            elif hasattr(layer, "attention"):
-                attn = layer.attention
-            if attn:
+            inner = unwrap_layer(layer)
+            attn = getattr(inner, "self_attention", None)
+            if is_identity_module(attn):
+                attn = getattr(inner, "attention", None)
+            if not is_identity_module(attn):
                 attention_layers.append((global_idx, attn))
         return attention_layers
 

@@ -12,8 +12,12 @@ x_{l+1} = H_res^T @ x_l + H_post^T · F(H_pre @ x_l)
 - `h_post` `[s, b, n]`     — 多流扩展门（2·sigmoid）
 - `h_res`  `[s, b, n, n]`  — Sinkhorn 双随机（doubly-stochastic）残差混合矩阵
 
-每个 `HyperConnectionTransformerLayer` 含两个 hyper-connection 模块：`self_attention_hyper_connection`
-（`attn`）与 `mlp_hyper_connection`（`mlp`），forward 中 attn 先于 mlp 执行。
+**层内 mHC**（`HyperConnectionTransformerLayer`）一层含两个 hyper-connection 模块：
+`self_attention_hyper_connection`（`attn`）与 `mlp_hyper_connection`（`mlp`），forward 中 attn 先于 mlp 执行。
+
+**层边界 mHC**（`HybridStack` 上的 `HyperConnectionHybridLayer`）每个 slot 只有一个 `hyper_connection`，
+真层在 `.inner_layer`。component 按该 slot 实际拥有的分支定：`inner_layer.self_attention` 是 `IdentityOp`
+占位则记为 `mlp`，否则记为 `attn`，所以一个 slot 只出一套键。
 
 ---
 
@@ -23,9 +27,8 @@ x_{l+1} = H_res^T @ x_l + H_post^T · F(H_pre @ x_l)
 以下任一情况下它彻底 no-op（不 wrap 任何模块、不声明/产生任何指标、不抛异常）：
 
 1. **mHC 类无法 import**：`setup_mhc_monitor` 在 import 失败时将类名绑定为 `None`，直接返回 `model`。
-2. **模型未使用 mHC 层**：discovery 用 `isinstance(layer, HyperConnectionTransformerLayer)` 与
-   `isinstance(mod, HyperConnectionModule)` 精确匹配（不做 duck-typing），普通 `TransformerLayer` 或
-   `IdentityOp` 占位符都不会被匹配。
+2. **模型未使用 mHC 层**：discovery 用 `isinstance(mod, HyperConnectionModule)` 精确匹配
+   （不做 duck-typing），普通 `TransformerLayer` 或 `IdentityOp` 占位符都不会被匹配。
 
 ```yaml
 internal_medicine_monitors:
@@ -63,7 +66,7 @@ wrapper 不保留任何跨调用状态，只有固定的 0 维累加器。规则
 
 ## 监控指标
 
-每个 hc 模块产出 29 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，仍是 16 个），指标名以
+每个 hc 模块产出 29 个指标（本节均为 paddlefleet 后端；megatron 后端未随本次改动调整，每 hc 模块仍是 8 条），指标名以
 `attn_` / `mlp_` 前缀区分。`branch_residual_share_max`、`h_res_logits_max`、`h_res_logits_grad_max`、
 `composite_amax_gain_{fwd,bwd}_max`、`h_{pre,post}_logits_max`、`bias_{pre,post,res}_abs_max` 取极大值，
 `h_res_logits_min`、`h_res_logits_grad_min` 与 `h_{pre,post}_logits_min` 取极小值，其余按 token/batch 求均值
